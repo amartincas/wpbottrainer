@@ -7,6 +7,7 @@ use App\Models\Conversation;
 use App\Jobs\ProcessWhatsAppMessage;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
+use App\Services\Inventory\ProductFinderService;
 use App\Models\Lead;
 use App\Models\WhatsAppTemplate;
 use Illuminate\Http\Request;
@@ -166,6 +167,16 @@ class WhatsAppController extends Controller
         $conversation->update(['last_session_at' => now()]);
     }
 
+    // Si el cliente escribió desde un anuncio de Click-to-WhatsApp, Meta manda
+    // el ID del anuncio en referral.source_id. Lo usamos para identificar el
+    // producto exacto sin depender de que el mensaje prellenado del anuncio
+    // coincida con el nombre del producto; si no hay match, ProcessWhatsAppMessage
+    // cae de vuelta a la búsqueda por texto del mensaje.
+    $adId = $message['referral']['source_id'] ?? null;
+    $productContext = $adId
+        ? (new ProductFinderService())->findProductByAdId($adId, $store->id)?->id
+        : null;
+
     // Dispatch job to process the message asynchronously
     ProcessWhatsAppMessage::dispatch(
         $store,
@@ -173,7 +184,8 @@ class WhatsAppController extends Controller
         $body,
         $phoneId,
         $type,
-        $mediaId
+        $mediaId,
+        $productContext
     );
 
     Log::info('WhatsApp message queued for processing', [

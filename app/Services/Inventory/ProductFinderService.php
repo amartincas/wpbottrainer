@@ -23,6 +23,35 @@ class ProductFinderService
     ];
 
     /**
+     * Resolve the exact product a customer is asking about via the Meta
+     * Click-to-WhatsApp ad ID (referral.source_id in the webhook payload),
+     * scoped to the store already resolved from the phone number.
+     *
+     * More reliable than text search: the store admin tags the ad ID once
+     * per product, so it doesn't depend on the ad's prefilled message
+     * matching the product name.
+     *
+     * @param string $adId
+     * @param int $storeId
+     * @return Product|null
+     */
+    public function findProductByAdId(string $adId, int $storeId): ?Product
+    {
+        $product = Product::where('store_id', $storeId)
+            ->whereJsonContains('meta_ad_ids', $adId)
+            ->with('images')
+            ->first();
+
+        Log::info('PRODUCT_FINDER: Resolución por ad_id de Meta', [
+            'store_id' => $storeId,
+            'ad_id' => $adId,
+            'matched_product_id' => $product?->id,
+        ]);
+
+        return $product;
+    }
+
+    /**
      * Search for products/services by query string in the store.
      * Returns array with formatted context and type information.
      * If generic/short search or no results found, returns full catalog.
@@ -34,6 +63,34 @@ class ProductFinderService
      */
     public function findProductsWithTypes(string $query, int $storeId, int $limit = 3): array
     {
+        // Check whether a product is explicitly named in the message BEFORE
+        // applying the generic-term heuristic below. Without this, a message
+        // like "oferta de precio por el Dispositivo Urinario" gets flagged
+        // generic just because it contains "oferta"/"precio" — even though
+        // it names a specific product — and the AI ends up receiving every
+        // product's (possibly contradictory) sales strategy at once.
+        $mentionedProduct = $this->findProductMentionedInMessage($query, $storeId);
+
+        if ($mentionedProduct) {
+            Log::info("PRODUCT_FINDER: Product mentioned by name in message", [
+                'store_id' => $storeId,
+                'query' => $query,
+                'matched_product_id' => $mentionedProduct->id,
+                'matched_product_name' => $mentionedProduct->name,
+            ]);
+
+            $products = Product::where('id', $mentionedProduct->id)
+                ->with('images')
+                ->get(['id', 'name', 'price', 'description', 'stock', 'type', 'ai_sales_strategy', 'faq_context', 'required_customer_info']);
+
+            return [
+                'context' => $this->formatProducts($products),
+                'products' => $products,
+                'hasServices' => $products->where('type', 'service')->isNotEmpty(),
+                'hasProducts' => $products->where('type', 'product')->isNotEmpty(),
+            ];
+        }
+
         $queryLower = strtolower(trim($query));
         $isGenericQuery = $this->isGenericQuery($queryLower);
 
@@ -125,6 +182,30 @@ class ProductFinderService
             'hasServices' => $hasServices,
             'hasProducts' => $hasProducts,
         ];
+    }
+
+    /**
+     * Find a product whose name is directly contained within the customer's
+     * message. Direction matters: this checks whether the (short) product
+     * name is contained in the (longer) message, the inverse of the LIKE
+     * search below, which requires the entire message to appear inside the
+     * product's name/description and so rarely matches real conversation.
+     *
+     * @param string $message
+     * @param int $storeId
+     * @return Product|null
+     */
+    private function findProductMentionedInMessage(string $message, int $storeId): ?Product
+    {
+        $text = trim($message);
+
+        if ($text === '' || mb_strlen($text) < 3) {
+            return null;
+        }
+
+        return Product::where('store_id', $storeId)
+            ->get(['id', 'name', 'store_id'])
+            ->first(fn (Product $product) => filled($product->name) && mb_stripos($text, $product->name) !== false);
     }
 
     /**
