@@ -16,6 +16,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -41,6 +42,28 @@ class ProcessWhatsAppMessage implements ShouldQueue
         public ?string $mediaId = null,
         public ?int $productContext = null,
     ) {}
+
+    /**
+     * Ensure only one message for a given customer conversation is processed
+     * at a time. Without this, two near-simultaneous messages (e.g. the
+     * customer double-clicking the same Click-to-WhatsApp ad, or a queue
+     * retry racing a still-running attempt) both read the conversation
+     * history before either saves its turn — each one replies as if it were
+     * the first message, producing duplicate/incoherent answers. Serializing
+     * per store+phone makes the second job wait and see the updated history.
+     *
+     * releaseAfter() puts the second job back on the queue to retry shortly
+     * instead of dropping it, so it still gets answered — just after the
+     * first one finishes.
+     */
+    public function middleware(): array
+    {
+        return [
+            (new WithoutOverlapping("whatsapp-message:{$this->store->id}:{$this->from}"))
+                ->releaseAfter(5)
+                ->expireAfter(120),
+        ];
+    }
 
     /**
      * Execute the job.

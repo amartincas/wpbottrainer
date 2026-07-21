@@ -104,17 +104,21 @@ class WhatsAppController extends Controller
     $phoneId = $message['id'] ?? null; // Este es el WAMID único de Meta
 
     // 🔥 CONTROL DE IDEMPOTENCIA: Bloquear reintentos de Meta de inmediato
+    //
+    // IMPORTANTE: Cache::add() es atómico (check-and-set en una sola operación).
+    // Antes esto era un Cache::has() seguido de un Cache::put() por separado —
+    // dos peticiones casi simultáneas para el mismo WAMID (reintento de Meta
+    // procesado por otro worker antes de que el primero alcanzara a escribir
+    // la caché) podían pasar ambas el chequeo y disparar el job dos veces,
+    // generando dos respuestas de IA para el mismo mensaje del cliente.
     if ($phoneId) {
         $cacheKey = "whatsapp_msg_processed:{$phoneId}";
-        
-        // Si el ID ya existe en la caché, es un reintento. Respondemos 200 y salimos.
-        if (Cache::has($cacheKey)) {
+
+        // add() devuelve false si la clave ya existía — ahí sabemos que es un reintento.
+        if (!Cache::add($cacheKey, true, now()->addMinutes(10))) {
             Log::warning('WhatsApp Webhook: Reintento de Meta detectado e ignorado.', ['message_id' => $phoneId]);
             return response('EVENT_RECEIVED', 200);
         }
-        
-        // Guardamos el ID en caché por 10 minutos para evitar duplicados
-        Cache::put($cacheKey, true, now()->addMinutes(10));
     }
 
     // Si pasa los filtros, guardamos el log real del mensaje entrante
