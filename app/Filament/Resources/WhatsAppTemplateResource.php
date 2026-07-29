@@ -2,11 +2,11 @@
 
 namespace App\Filament\Resources;
 
-use App\Filament\Resources\WhatsAppTemplates\Pages\CreateWhatsAppTemplate;
-use App\Filament\Resources\WhatsAppTemplates\Pages\EditWhatsAppTemplate;
-use App\Filament\Resources\WhatsAppTemplates\Pages\ListWhatsAppTemplates;
-use App\Filament\Resources\WhatsAppTemplates\Schemas\WhatsAppTemplateForm;
-use App\Filament\Resources\WhatsAppTemplates\Tables\WhatsAppTemplatesTable;
+use App\Filament\Resources\WhatsAppTemplate\Pages\CreateWhatsAppTemplate;
+use App\Filament\Resources\WhatsAppTemplate\Pages\EditWhatsAppTemplate;
+use App\Filament\Resources\WhatsAppTemplate\Pages\ListWhatsAppTemplates;
+use App\Filament\Resources\WhatsAppTemplate\Schemas\WhatsAppTemplateForm;
+use App\Filament\Resources\WhatsAppTemplate\Tables\WhatsAppTemplatesTable;
 use App\Models\WhatsAppTemplate;
 use BackedEnum;
 use Filament\Resources\Resource;

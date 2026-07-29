@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Resources\WhatsAppTemplates\Tables;
+namespace App\Filament\Resources\WhatsAppTemplate\Tables;
 
 use App\Models\Store;
 use App\Models\WhatsAppTemplate;

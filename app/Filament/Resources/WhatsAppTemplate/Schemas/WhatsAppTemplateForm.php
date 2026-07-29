@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Resources\WhatsAppTemplates\Schemas;
+namespace App\Filament\Resources\WhatsAppTemplate\Schemas;
 
 use App\Models\Store;
 use Filament\Forms\Components\KeyValue;

@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Resources\WhatsAppTemplates\Pages;
+namespace App\Filament\Resources\WhatsAppTemplate\Pages;
 
 use App\Filament\Resources\WhatsAppTemplateResource;
 use Filament\Actions\DeleteAction;
