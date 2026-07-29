@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'store_id',
     'customer_phone',
     'last_session_at',
+    'current_product_id',
 ])]
 class Conversation extends Model
 {
@@ -26,5 +27,10 @@ class Conversation extends Model
     public function store(): BelongsTo
     {
         return $this->belongsTo(Store::class);
+    }
+
+    public function currentProduct(): BelongsTo
+    {
+        return $this->belongsTo(Product::class, 'current_product_id');
     }
 }

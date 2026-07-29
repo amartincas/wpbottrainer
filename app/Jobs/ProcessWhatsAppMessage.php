@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\Store;
 use App\Models\WhatsAppMessage;
 use App\Models\Product;
+use App\Models\Conversation;
 use App\Models\Lead;
 use App\Factories\AIServiceFactory;
 use App\Services\AI\OpenAIService;
@@ -301,24 +302,42 @@ class ProcessWhatsAppMessage implements ShouldQueue
                     'has_lead_token' => $hasLeadToken,
                 ]);
 
-                Lead::create([
-                    'store_id' => $this->store->id,
-                    'customer_phone' => $this->from,
-                    'customer_name' => $leadData['customer_name'] ?? null,
-                    'delivery_address_or_location' => $leadData['delivery_address_or_location'] ?? null,
-                    'product_service_name' => $leadData['product_service_name'] ?? null,
-                    'preferred_date_time' => $leadData['preferred_date_time'] ?? null,
-                    'summary' => $messageToSend,
-                    'is_processed' => false,
-                ]);
+                // Guard against duplicate leads: once an order is confirmed, the AI
+                // keeps summarizing it ("Producto: ... Nombre: ... ¡Gracias por tu
+                // compra!") on unrelated follow-ups like "¿me avisas cuando llegue?" —
+                // and re-emits [LEAD_COMPLETE] each time, since from its perspective
+                // it's still describing a confirmed purchase. Without this check,
+                // every such follow-up created a brand new Lead row for the same order.
+                $recentDuplicateLead = Lead::where('store_id', $this->store->id)
+                    ->where('customer_phone', $this->from)
+                    ->where('created_at', '>=', now()->subHour())
+                    ->exists();
 
-                Log::info('Lead created from WhatsApp conversation', [
-                    'store_id' => $this->store->id,
-                    'customer_phone' => $this->from,
-                    'customer_name' => $leadData['customer_name'] ?? null,
-                    'product_service_name' => $leadData['product_service_name'] ?? null,
-                    'completion_method' => $hasLeadToken ? 'explicit_token' : 'heuristic_fallback',
-                ]);
+                if ($recentDuplicateLead) {
+                    Log::warning('DUPLICATE_LEAD_SKIPPED: Ya existe un lead reciente para esta conversación', [
+                        'store_id' => $this->store->id,
+                        'customer_phone' => $this->from,
+                    ]);
+                } else {
+                    Lead::create([
+                        'store_id' => $this->store->id,
+                        'customer_phone' => $this->from,
+                        'customer_name' => $leadData['customer_name'] ?? null,
+                        'delivery_address_or_location' => $leadData['delivery_address_or_location'] ?? null,
+                        'product_service_name' => $leadData['product_service_name'] ?? null,
+                        'preferred_date_time' => $leadData['preferred_date_time'] ?? null,
+                        'summary' => $messageToSend,
+                        'is_processed' => false,
+                    ]);
+
+                    Log::info('Lead created from WhatsApp conversation', [
+                        'store_id' => $this->store->id,
+                        'customer_phone' => $this->from,
+                        'customer_name' => $leadData['customer_name'] ?? null,
+                        'product_service_name' => $leadData['product_service_name'] ?? null,
+                        'completion_method' => $hasLeadToken ? 'explicit_token' : 'heuristic_fallback',
+                    ]);
+                }
             }
 
             // Process AI response to extract and send images
@@ -427,6 +446,18 @@ class ProcessWhatsAppMessage implements ShouldQueue
                 'has_product_context_param' => $this->productContext !== null,
             ]);
 
+            // Conversation-level memory of which product this customer is
+            // already talking about. Without this, a short reply with no
+            // product name in it (e.g. "sí", "me parece bien", a name, an
+            // address) can't be matched to anything specific, and every such
+            // turn falls back to the FULL catalog — mixing unrelated
+            // products' (possibly contradictory) sales strategies into the
+            // prompt mid-negotiation, which is how the bot ends up pivoting
+            // to a product the customer never asked about.
+            $conversation = Conversation::where('store_id', $this->store->id)
+                ->where('customer_phone', $this->from)
+                ->first();
+
             // If a specific product context was provided, fetch that product
             if ($this->productContext) {
                 $product = Product::with('images')->find($this->productContext);
@@ -435,6 +466,8 @@ class ProcessWhatsAppMessage implements ShouldQueue
                         'product_id' => $this->productContext,
                         'product_name' => $product->name,
                     ]);
+
+                    $conversation?->update(['current_product_id' => $product->id]);
 
                     return [
                         'context' => $this->formatProductData($product),
@@ -462,6 +495,35 @@ class ProcessWhatsAppMessage implements ShouldQueue
                 'has_products' => $result['hasProducts'],
                 'context_preview' => substr($result['context'], 0, 150),
             ]);
+
+            if ($result['products']->count() === 1) {
+                // Confident single-product match this turn (mentioned by name,
+                // or the store simply has one product) — this becomes (or stays)
+                // the conversation's product.
+                $conversation?->update(['current_product_id' => $result['products']->first()->id]);
+            } elseif ($conversation?->current_product_id) {
+                // No confident single match this turn (generic message, empty
+                // search, or the multi-product catalog fallback) — stick to the
+                // product already established for this conversation instead of
+                // mixing in unrelated products on every short reply.
+                $stickyProduct = Product::with('images')->find($conversation->current_product_id);
+
+                if ($stickyProduct) {
+                    Log::info("CONTEXT_RETRIEVAL: Using sticky conversation product", [
+                        'store_id' => $this->store->id,
+                        'customer_phone' => $this->from,
+                        'product_id' => $stickyProduct->id,
+                        'product_name' => $stickyProduct->name,
+                    ]);
+
+                    return [
+                        'context' => $this->formatProductData($stickyProduct),
+                        'hasServices' => $stickyProduct->type === 'service',
+                        'hasProducts' => $stickyProduct->type === 'product',
+                        'products' => collect([$stickyProduct]),
+                    ];
+                }
+            }
 
             // If search returned nothing at all, force fetch full catalog
             if ($result['products']->isEmpty()) {
