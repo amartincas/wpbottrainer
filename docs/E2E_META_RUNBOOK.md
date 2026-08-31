@@ -23,6 +23,7 @@ Para poder ejecutar la prueba real necesito que me proporciones (o que tú mismo
 | `wa_business_account_id` | Meta App → WhatsApp → API Setup → "WhatsApp Business Account ID" | `Tenant.wa_business_account_id` |
 | `wa_verify_token` | Lo eliges tú (cualquier string) — debe coincidir exactamente con lo que pongas en el paso 5 | `Tenant.wa_verify_token` |
 | `ai_provider` + `ai_api_key` | Tu cuenta de OpenAI (u otro proveedor ya soportado) | `Tenant.ai_provider` / `Tenant.ai_api_key` |
+| `openai_transcription_api_key` | Una API key real de OpenAI — **siempre**, sin importar qué `ai_provider` uses para chat (ver D022 en `docs/DECISIONS.md`: Whisper es exclusivamente OpenAI, es un campo independiente de `ai_api_key`) | `Tenant.openai_transcription_api_key` |
 | Un número de teléfono de prueba **agregado como destinatario permitido** en Meta (los números de prueba de Meta exigen registrar explícitamente a quién le pueden llegar mensajes) | Meta App → WhatsApp → API Setup → "To" | — (es el teléfono desde el que enviarás los mensajes) |
 
 > **¿Sirve el número de prueba gratuito que da Meta (no un número de WhatsApp Business verificado)?** Sí — es la forma recomendada para esta validación. La API se comporta exactamente igual (texto, audio y **video** incluidos) con el número de prueba que con uno de producción. Tres particularidades a tener en cuenta:
@@ -61,6 +62,10 @@ Con las credenciales del paso 1, vía `php artisan tinker` (o Filament, `Tenant`
     'ai_provider' => 'openai',
     'ai_model' => 'gpt-4o-mini',
     'ai_api_key' => '<tu API key real>',
+    // Siempre OpenAI, sin importar 'ai_provider' — Whisper no tiene alternativa
+    // multi-proveedor (ver D022). Si el Escenario D (audio) falla con
+    // "Incorrect API key provided", esto es lo primero a revisar.
+    'openai_transcription_api_key' => '<tu API key real de OpenAI>',
     'wa_access_token' => '<token real de Meta>',
     'wa_phone_number_id' => '<phone_number_id real>',
     'wa_business_account_id' => '<business_account_id real>',

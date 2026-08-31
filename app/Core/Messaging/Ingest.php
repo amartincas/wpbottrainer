@@ -102,7 +102,19 @@ class Ingest
             $transcriptionStartedAt = microtime(true);
 
             try {
-                $openAi = new OpenAIService($tenant->ai_api_key, 'whisper-1');
+                // Whisper es siempre OpenAI, sin importar el proveedor de chat
+                // del Tenant (ai_provider/ai_api_key puede ser Grok/Gemini) —
+                // usa exclusivamente openai_transcription_api_key, nunca
+                // ai_api_key (ver migración 2026_08_31_000001 y D022 en
+                // docs/DECISIONS.md). Un Tenant sin esta clave configurada no
+                // debe intentar transcribir con una key ajena a OpenAI: falla
+                // de forma controlada y explícita, cae en el mismo catch/
+                // fallback de abajo.
+                if (empty($tenant->openai_transcription_api_key)) {
+                    throw new \RuntimeException('TRANSCRIPTION_API_KEY_MISSING: openai_transcription_api_key is not configured for this tenant');
+                }
+
+                $openAi = new OpenAIService($tenant->openai_transcription_api_key, 'whisper-1');
                 $transcribedText = $openAi->transcribeAudio(Storage::disk('local')->path($localPath));
                 $messageBody = "🎤 [AUDIO]: " . trim($transcribedText);
 

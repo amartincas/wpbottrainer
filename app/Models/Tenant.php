@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'ai_provider',
     'ai_model',
     'ai_api_key',
+    'openai_transcription_api_key',
     'wa_access_token',
     'wa_phone_number_id',
     'wa_business_account_id',
@@ -29,6 +30,7 @@ class Tenant extends Model
             'personality_type' => 'string',
             'ai_provider' => 'string',
             'ai_api_key' => 'encrypted',
+            'openai_transcription_api_key' => 'encrypted',
             'wa_access_token' => 'encrypted',
             'wa_verify_token' => 'encrypted',
         ];

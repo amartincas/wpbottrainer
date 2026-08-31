@@ -101,3 +101,90 @@ it('returns null when an audio message is missing its media id', function () {
     expect($result)->toBeNull();
     Http::assertNothingSent();
 });
+
+/**
+ * Hito 7: Whisper es siempre OpenAI, sin importar el proveedor de chat del
+ * Tenant. openai_transcription_api_key es un campo independiente de
+ * ai_api_key/ai_provider — estos tests confirman que la transcripción nunca
+ * usa la key de chat, ni cuando esa key es de otro proveedor (Grok) ni
+ * cuando "coincide" con ser también OpenAI.
+ */
+it('transcribes using openai_transcription_api_key when the tenant chat provider is grok', function () {
+    $tenant = Tenant::factory()->create([
+        'ai_provider' => 'grok',
+        'ai_api_key' => 'xai-this-is-the-grok-chat-key',
+        'openai_transcription_api_key' => 'sk-this-is-the-real-openai-whisper-key',
+    ]);
+
+    Http::fake([
+        'graph.facebook.com/*/media123' => Http::response(['url' => 'https://cdn.example.com/audio.ogg'], 200),
+        'cdn.example.com/*' => Http::response('fake-audio-bytes', 200),
+        'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'hola quiero un producto'], 200),
+    ]);
+
+    $ingest = new Ingest();
+    $result = $ingest->process($tenant, '573001112233', null, 'wamid.1', 'audio', 'media123');
+
+    expect($result)->toBeInstanceOf(IngestedMessage::class);
+    expect($result->messageBody)->toContain('hola quiero un producto');
+
+    Http::assertSent(function ($request) {
+        return str_contains($request->url(), 'api.openai.com/v1/audio/transcriptions')
+            && $request->header('Authorization')[0] === 'Bearer sk-this-is-the-real-openai-whisper-key';
+    });
+});
+
+it('transcribes using openai_transcription_api_key even when the chat provider is also openai', function () {
+    // Distinct on purpose from ai_api_key, aunque ambas sean "openai" — el
+    // punto es que nunca deben mezclarse, ni por coincidencia de proveedor.
+    $tenant = Tenant::factory()->create([
+        'ai_provider' => 'openai',
+        'ai_api_key' => 'sk-openai-CHAT-key-never-used-for-whisper',
+        'openai_transcription_api_key' => 'sk-openai-WHISPER-key',
+    ]);
+
+    Http::fake([
+        'graph.facebook.com/*/media123' => Http::response(['url' => 'https://cdn.example.com/audio.ogg'], 200),
+        'cdn.example.com/*' => Http::response('fake-audio-bytes', 200),
+        'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'hola quiero un producto'], 200),
+    ]);
+
+    $ingest = new Ingest();
+    $result = $ingest->process($tenant, '573001112233', null, 'wamid.1', 'audio', 'media123');
+
+    expect($result)->toBeInstanceOf(IngestedMessage::class);
+
+    Http::assertSent(function ($request) {
+        return str_contains($request->url(), 'api.openai.com/v1/audio/transcriptions')
+            && $request->header('Authorization')[0] === 'Bearer sk-openai-WHISPER-key';
+    });
+});
+
+it('fails in a controlled, identifiable way and never calls Whisper when openai_transcription_api_key is missing', function () {
+    $tenant = Tenant::factory()->create([
+        'ai_provider' => 'grok',
+        'ai_api_key' => 'xai-grok-chat-key',
+        'openai_transcription_api_key' => null,
+    ]);
+
+    Http::fake([
+        'graph.facebook.com/*/media123' => Http::response(['url' => 'https://cdn.example.com/audio.ogg'], 200),
+        'cdn.example.com/*' => Http::response('fake-audio-bytes', 200),
+        'graph.facebook.com/*/messages' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    $ingest = new Ingest();
+    $result = $ingest->process($tenant, '573001112233', null, 'wamid.1', 'audio', 'media123');
+
+    expect($result)->toBeNull();
+
+    Http::assertNotSent(function ($request) {
+        return str_contains($request->url(), 'api.openai.com');
+    });
+
+    Http::assertSent(function ($request) {
+        return str_contains($request->url(), 'graph.facebook.com')
+            && str_contains($request->url(), 'messages')
+            && str_contains(data_get($request->data(), 'text.body', ''), 'No pude transcribir tu audio');
+    });
+});

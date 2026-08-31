@@ -271,6 +271,29 @@ Se consultó al usuario antes de proceder (no se decidió unilateralmente cómo 
 
 ---
 
+### D022 — Fix estructural descubierto en la prueba E2E real: transcripción de audio acoplada al proveedor de chat del Tenant
+
+**CONTEXTO**: durante la ejecución real del Escenario D (Hito 7, reporte de ejecución por audio) contra Meta/WhatsApp real, la transcripción falló con un error real de OpenAI: `"Incorrect API key provided: xai-q0gW... invalid_api_key"`. El Tenant de prueba tiene `ai_provider = grok` (con su propia `ai_api_key` de Grok), pero `Ingest::process()` (`app/Core/Messaging/Ingest.php`) llamaba a Whisper —que es exclusivamente de OpenAI, sin alternativa multi-proveedor— reutilizando ese mismo campo `ai_api_key`. El resultado: cualquier Tenant cuyo proveedor de chat no fuera OpenAI tenía la transcripción de audio rota desde antes de este hito; nadie lo había detectado porque ningún Tenant probado hasta ahora usaba un proveedor de chat distinto de OpenAI en un escenario con audio real.
+
+**PROBLEMA**: `ai_api_key` representa la credencial del proveedor de **chat** elegido (`ai_provider`: openai/grok/gemini, ver `AIServiceFactory`). Whisper no participa de esa elección — siempre es OpenAI. Mezclar ambos conceptos en un solo campo rompe la transcripción tan pronto el chat usa un proveedor distinto de OpenAI.
+
+**ALTERNATIVAS**:
+1. Campo dedicado en `Tenant` (`openai_transcription_api_key`), independiente de `ai_provider`/`ai_model`/`ai_api_key` — **elegida**.
+2. Una sola `OPENAI_API_KEY` global en `.env` de la plataforma, no por Tenant — descartada: el proyecto es multi-tenant con credenciales propias por Tenant en todo lo demás (Meta, IA de chat); introducir una excepción global rompe ese patrón y no permite que dos Tenants usen cuentas de OpenAI distintas para transcripción.
+3. No corregir ahora, documentar y seguir con el resto del Hito 7 — descartada por decisión explícita: el hallazgo se dio durante la prueba real y el defecto es concreto y acotado.
+
+**DECISIÓN TOMADA**: nueva columna `tenants.openai_transcription_api_key` (`text`, nullable, cast `encrypted` igual que `ai_api_key`/`wa_access_token`), migración `2026_08_31_000001_add_openai_transcription_api_key_to_tenants_table`. `Ingest::process()` usa exclusivamente este campo para instanciar `OpenAIService` en la ruta de transcripción — `ai_api_key` queda reservado en exclusiva para el proveedor de chat. Si `openai_transcription_api_key` no está configurada, se lanza una excepción con mensaje explícito (`TRANSCRIPTION_API_KEY_MISSING: ...`) capturada por el mismo `catch` que ya existía (mismo log `Audio transcription failed`, mismo mensaje de fallback al usuario, mismo cleanup del archivo temporal) — nunca se intenta usar `ai_api_key` como reemplazo silencioso.
+
+**JUSTIFICACIÓN**: separar por *función* (chat vs. transcripción) en vez de por *proveedor nominal* es más correcto — incluso dos Tenants con `ai_provider = openai` pueden querer usar cuentas de OpenAI distintas para chat y para Whisper (facturación separada, límites distintos), y el fix lo permite sin ningún caso especial.
+
+**IMPACTO**: `database/migrations/2026_08_31_000001_add_openai_transcription_api_key_to_tenants_table.php` (nueva), `app/Models/Tenant.php` (campo agregado a `Fillable` y a `casts()` como `encrypted`), `app/Core/Messaging/Ingest.php` (usa el campo nuevo, con fallo controlado si falta), `database/factories/TenantFactory.php` (valor por defecto para tests). Tests nuevos en `tests/Feature/Core/IngestTest.php`: transcripción con chat=Grok, transcripción con chat=OpenAI (confirmando que igual usa el campo dedicado, no `ai_api_key`, aunque "coincidan" de proveedor), y fallo controlado sin llamar nunca a Whisper cuando la clave de transcripción no está configurada. 3 tests nuevos, cero regresiones (142 passed vs. 139 antes, mismos 22 fallos heredados de Fortify/Vite).
+
+**RIESGOS**:
+- Todo Tenant ya creado con audio habilitado (incluido el de producción del VPS) necesita que se le configure `openai_transcription_api_key` manualmente — no hay backfill automático posible porque no existía ninguna fuente de verdad para ese valor.
+- Si en el futuro se soporta transcripción con otro proveedor (no solo Whisper/OpenAI), este campo tendría que generalizarse (ej. `transcription_provider` + `transcription_api_key`) — se documenta como límite conocido de esta solución mínima, no se sobre-diseña ahora sin un segundo proveedor real que lo justifique.
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

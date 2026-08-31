@@ -27,6 +27,9 @@ class TenantFactory extends Factory
             'ai_provider' => 'openai',
             'ai_model' => 'gpt-4o-mini',
             'ai_api_key' => Str::random(40),
+            // Independiente de ai_api_key a propósito: Whisper siempre usa
+            // OpenAI, sin importar qué proveedor de chat tenga el Tenant.
+            'openai_transcription_api_key' => Str::random(40),
             'wa_access_token' => Str::random(40),
             'wa_phone_number_id' => (string) fake()->unique()->numerify('##########'),
             'wa_business_account_id' => (string) fake()->numerify('##########'),
