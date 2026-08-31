@@ -294,6 +294,33 @@ Se consultó al usuario antes de proceder (no se decidió unilateralmente cómo 
 
 ---
 
+### D023 — Fix estructural descubierto en la prueba E2E real: la seguridad dependía del routing normal
+
+**CONTEXTO**: durante la ejecución real del Escenario E (Hito 7) contra Meta/WhatsApp real, un contacto ya onboardeado, sin `WorkoutSession` pendiente (acababa de completar el reporte del Escenario D), escribió *"Me duele mucho el pecho, no puedo seguir"*. El mensaje se enrutó a `fallback_chat` (el chat genérico de ventas), nunca llegó a `TrainingHandler` ni a `SafetySignalDetector`; `TrainingProfile.safety_status` nunca cambió. La respuesta que el usuario vio (razonable en tono) fue una improvisación del LLM del chat genérico, no un escalamiento garantizado por código.
+
+**PROBLEMA (dos causas independientes, ambas reales)**:
+1. `TrainingIntentClassifier` solo enruta a `training` si el texto contiene una palabra clave de entrenamiento, o el onboarding está incompleto, o hay una `WorkoutSession` en estado `Scheduled`. Una señal de seguridad enviada fuera de esos tres casos nunca activa el Intent `training`, así que `SafetySignalDetector` (que solo se invoca dentro de `TrainingHandler`) nunca se ejecuta.
+2. Incluso si hubiera llegado, `SafetySignalDetector` comparaba frases exactas (`"dolor de pecho"`, `"dolor en el pecho"`, `"opresión en el pecho"`) — `"me duele mucho el pecho"` no es substring de ninguna de ellas.
+
+**ALTERNATIVAS**:
+1. Ampliar `TrainingIntentClassifier` con más palabras clave de seguridad — descartada: acopla el clasificador de *intención de negocio* (¿de qué habla el mensaje?) con una responsabilidad de *seguridad* (¿hay riesgo?) que debe evaluarse siempre, sin importar a qué Intent habría clasificado el mensaje.
+2. Correr `SafetySignalDetector` dentro del propio `Router`/`Dispatcher` (Core) — descartada: `SafetySignalDetector`/`TrainingProfile`/`SafetyStatus` son conceptos de dominio Training; meterlos en Core rompe "Core provee mecanismo, Domain provee contenido" (violaría `CoreIsolationArchTest.php`).
+3. **Elegida**: un mecanismo nuevo en Core, `PreRoutingScreener` (mismo patrón `Container → clase resuelta` que `Router`/`Dispatcher`/`ContextBuilder`), que corre **antes** de `Router::route()`, sobre todo mensaje, sin importar el Intent que resultaría. Core solo conoce la interfaz (`PreRoutingScreenInterface`); el contenido real (`SafetySignalPreRoutingScreen`) vive en `App\Training\Support` y delega en `TrainingHandler::handle()` — que ya tenía la lógica correcta de flagging+escalamiento como su primer paso, solo que nunca se alcanzaba. Cero lógica de negocio duplicada.
+4. Para la detección en sí: en vez de reescribir todo `SafetySignalDetector` a NLP/LLM (fuera de alcance explícito — debe seguir siendo determinista, código decide, LLM nunca autoriza continuar), se agregó una regla de co-ocurrencia (`trigger` + `anchor`) solo para `chest_pain` (la categoría con el fallo demostrado): dispara si el texto contiene alguna palabra de dolor/molestia (`dolor`, `duele`, `duelen`, `molestia`, `opresión`, `presión`, `punzada`) Y la palabra `pecho`, en cualquier orden/conjugación. Las demás categorías conservan sus frases exactas sin cambios — no se generaliza sin un caso de falla concreto para cada una.
+
+**DECISIÓN TOMADA**: `App\Core\Messaging\{PreRoutingScreenInterface,PreRoutingScreener}` (nuevos, Core, cero conocimiento de dominio — verificado por `CoreIsolationArchTest.php` sin modificarlo). `ProcessWhatsAppMessage::handle()` invoca `PreRoutingScreener::screen($context)` entre `Ingest` y `Router`; si devuelve `true`, el pipeline normal se salta por completo (log `JOB_END` con `outcome: pre_routing_screened`). `App\Training\Support\SafetySignalPreRoutingScreen` (nuevo) implementa la interfaz, corre `SafetySignalDetector` sobre el mensaje crudo, y si detecta señal delega en `TrainingHandler::handle()`. `SafetySignalDetector::CO_OCCURRENCE_PATTERNS` (nuevo) generaliza solo `chest_pain`. Registrado en `AppServiceProvider` con el mismo estilo que `Router`/`Dispatcher`.
+
+**JUSTIFICACIÓN**: la seguridad no puede ser una consecuencia accidental de la clasificación de intención de negocio ni del estado de una sesión de entrenamiento — debe evaluarse siempre, primero, de forma determinista. El mecanismo nuevo es mínimo (dos clases genéricas en Core, una clase de dominio) y reutiliza exactamente la lógica de flagging ya probada de `TrainingHandler`, en vez de duplicarla.
+
+**IMPACTO**: `app/Core/Messaging/PreRoutingScreenInterface.php`, `app/Core/Messaging/PreRoutingScreener.php` (nuevos), `app/Jobs/ProcessWhatsAppMessage.php` (invoca el screener), `app/Providers/AppServiceProvider.php` (wiring), `app/Training/Support/SafetySignalPreRoutingScreen.php` (nuevo), `app/Training/Support/SafetySignalDetector.php` (regla de co-ocurrencia para `chest_pain`). Tests nuevos: `tests/Feature/Core/PreRoutingScreenerTest.php` (5, mecanismo genérico), `tests/Feature/Training/SafetySignalPreRoutingScreenTest.php` (4, pipeline real: sin sesión activa —el caso exacto que falló—, contacto nuevo, con sesión activa sin regresión, mensaje normal sin falso positivo), `tests/Feature/Training/SafetySignalDetectorTest.php` (+2: variaciones de frase, no sobre-disparo). 11 tests nuevos netos, cero regresiones (153 passed vs. 142 antes, mismos 22 fallos heredados de Fortify/Vite).
+
+**RIESGOS**:
+- El mensaje pasa por `SafetySignalDetector::detect()` dos veces (una en el screen, otra dentro de `TrainingHandler`) — comparación de substrings determinista y barata, sin llamada a IA; se aceptó la redundancia a cambio de no reescribir la lógica de flagging ya probada.
+- La regla de co-ocurrencia de `chest_pain` sigue siendo una lista cerrada y curada, no NLP real — puede seguir teniendo falsos negativos ante frases suficientemente distintas; el propio `SafetySignalDetector.php` ya advierte que requiere revisión de negocio/salud antes de producción con usuarios reales.
+- `PreRoutingScreener` corre sobre **todo** mensaje de **todo** Tenant, no solo los que usan Training — aceptable porque hoy WpbotTrainer es el único vertical activo; si en el futuro coexistieran verticales no-Training en el mismo despliegue, valdría la pena acotar el screen por tipo de tenant.
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Core\Messaging\Dispatcher;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Ingest;
+use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Models\Conversation;
 use App\Models\Tenant;
@@ -74,7 +75,7 @@ class ProcessWhatsAppMessage implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(Ingest $ingest, Router $router, Dispatcher $dispatcher): void
+    public function handle(Ingest $ingest, PreRoutingScreener $preRoutingScreener, Router $router, Dispatcher $dispatcher): void
     {
         // Observabilidad (Hito 7): tiempo total "webhook → respuesta" — desde
         // que este Job arranca (el webhook ya respondió 200 a Meta de forma
@@ -136,6 +137,22 @@ class ProcessWhatsAppMessage implements ShouldQueue
                 message: $ingested,
                 legacy: ['product_context' => $this->productContext],
             );
+
+            // Screening previo al routing normal (Hito 7 — hallazgo de la
+            // prueba E2E real): una señal de seguridad debe atenderse sin
+            // importar qué Intent habría clasificado el Router, y sin
+            // importar el estado de sesión del contacto. Ver
+            // App\Core\Messaging\PreRoutingScreener y docs/DECISIONS.md.
+            if ($preRoutingScreener->screen($context)) {
+                Log::info('JOB_END', [
+                    'tenant_id' => $this->tenant->id,
+                    'customer_phone' => $this->from,
+                    'outcome' => 'pre_routing_screened',
+                    'elapsed_ms' => (int) round((microtime(true) - $jobStartedAt) * 1000),
+                ]);
+
+                return;
+            }
 
             $routerStartedAt = microtime(true);
             $intent = $router->route($context);

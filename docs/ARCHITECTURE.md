@@ -216,6 +216,10 @@ Ninguno de estos puntos es un defecto de arquitectura — son prerequisitos oper
 
 **Explícitamente NO se hizo en este hito**: ningún envío real a través de Meta; ninguna confirmación visual de reproducción de video; no se contrató ni pagó ningún proveedor de video definitivo; no se modificó la integración Meta existente (`WhatsAppController`/`WhatsAppService`) — se verificó que ya soporta correctamente el payload real sin necesitar cambios.
 
+## 8.4 Pre-routing screening (Hito 7 — hallazgo de la ejecución E2E real)
+
+Además del pipeline `Ingest → Router → Dispatcher → Handler` (sección 6), existe un paso adicional entre `Ingest` y `Router`: `App\Core\Messaging\PreRoutingScreener`. Corre sobre **todo** mensaje, antes de cualquier clasificación de Intent — su único caso de uso hoy es `App\Training\Support\SafetySignalPreRoutingScreen`, que garantiza que una señal de seguridad (ej. dolor de pecho) se atienda sin importar si el Router habría clasificado el mensaje como `training` o no. Ver D023 en `docs/DECISIONS.md` para el hallazgo real que motivó este mecanismo.
+
 ## 9. Exercise Library
 
 **ESTADO ACTUAL**: catálogo mínimo (`Exercise`, ver sección 8) — sin contenido real cargado todavía, solo el esquema y las factories de test. Almacenamiento de video recomendado (no implementado): object storage + CDN (ver `docs/DECISIONS.md`), por compatibilidad con URLs públicas de WhatsApp Cloud API y para no pagar ancho de banda repetido sirviendo el mismo video desde el propio servidor de aplicación.

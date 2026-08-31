@@ -5,11 +5,13 @@ namespace App\Providers;
 use App\Core\Memory\ContextBuilder;
 use App\Core\Messaging\Dispatcher;
 use App\Core\Messaging\Intent;
+use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Handlers\FallbackChatHandler;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
+use App\Training\Support\SafetySignalPreRoutingScreen;
 use App\Training\Support\TrainingIntentClassifier;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
@@ -34,6 +36,16 @@ class AppServiceProvider extends ServiceProvider
         // See App\Core\Messaging\Router and docs/DECISIONS.md (D019).
         $this->app->singleton(Router::class, fn ($app) => new Router($app, [
             TrainingIntentClassifier::class,
+        ]));
+
+        // Core messaging PreRoutingScreener (Hito 7): ordered list of
+        // PreRoutingScreen classes tried BEFORE Router, regardless of what
+        // Intent the message would otherwise classify as. Today only
+        // SafetySignalPreRoutingScreen is registered — a safety signal must
+        // never depend on session state or on the Router's classification.
+        // See App\Core\Messaging\PreRoutingScreener and docs/DECISIONS.md.
+        $this->app->singleton(PreRoutingScreener::class, fn ($app) => new PreRoutingScreener($app, [
+            SafetySignalPreRoutingScreen::class,
         ]));
 
         // Core messaging Dispatcher: maps each Intent to the Handler class
