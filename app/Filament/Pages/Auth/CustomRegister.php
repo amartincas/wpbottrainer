@@ -2,7 +2,7 @@
 
 namespace App\Filament\Pages\Auth;
 
-use App\Models\Store;
+use App\Models\Tenant;
 use App\Models\User;
 use Filament\Auth\Pages\Register;
 use Filament\Forms\Components\TextInput;
@@ -21,17 +21,17 @@ class CustomRegister extends Register
             ->components([
                 $this->getNameFormComponent(),
                 $this->getEmailFormComponent(),
-                $this->getStoreNameFormComponent(),
+                $this->getTenantNameFormComponent(),
                 $this->getPasswordFormComponent(),
                 $this->getPasswordConfirmationFormComponent(),
             ]);
     }
 
-    protected function getStoreNameFormComponent(): Component
+    protected function getTenantNameFormComponent(): Component
     {
-        return TextInput::make('store_name')
-            ->label(__('Nombre de la Tienda'))
-            ->hint(__('The name of your WhatsApp Bot Store'))
+        return TextInput::make('tenant_name')
+            ->label(__('Nombre del negocio'))
+            ->hint(__('El nombre de tu negocio en WpbotTrainer'))
             ->required()
             ->maxLength(255);
     }
@@ -42,9 +42,9 @@ class CustomRegister extends Register
     protected function handleRegistration(array $data): Model
     {
         return $this->wrapInDatabaseTransaction(function () use ($data) {
-            // 1. Create the Store with defaults
-            $store = Store::create([
-                'name' => $data['store_name'],
+            // 1. Create the Tenant with defaults
+            $tenant = Tenant::create([
+                'name' => $data['tenant_name'],
                 'personality_type' => 'asesor',
                 'system_prompt' => 'You are a helpful assistant.',
                 'ai_provider' => 'openai',
@@ -56,14 +56,13 @@ class CustomRegister extends Register
                 'wa_verify_token' => Str::random(32),
             ]);
 
-            // 2. Remove store_name from user data and add store_id
-            unset($data['store_name']);
-            $data['store_id'] = $store->id;
+            // 2. Remove tenant_name from user data and add tenant_id
+            unset($data['tenant_name']);
+            $data['tenant_id'] = $tenant->id;
             $data['is_super_admin'] = false;
 
-            // 3. Create the User and assign to the store
+            // 3. Create the User and assign to the tenant
             return User::create($data);
         });
     }
 }
-

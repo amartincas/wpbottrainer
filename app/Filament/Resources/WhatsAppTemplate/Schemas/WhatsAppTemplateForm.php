@@ -2,7 +2,7 @@
 
 namespace App\Filament\Resources\WhatsAppTemplate\Schemas;
 
-use App\Models\Store;
+use App\Models\Tenant;
 use Filament\Forms\Components\KeyValue;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\Textarea;
@@ -17,18 +17,18 @@ class WhatsAppTemplateForm
     {
         return $schema->schema([
 
-            Select::make('store_id')
-                ->label('Tienda')
+            Select::make('tenant_id')
+                ->label('Tenant')
                 ->relationship(
-                    'store',
+                    'tenant',
                     'name',
                     fn ($query) => $query->when(
                         ! Auth::user()?->is_super_admin,
-                        fn ($q) => $q->where('id', Auth::user()?->store_id)
+                        fn ($q) => $q->where('id', Auth::user()?->tenant_id)
                     )
                 )
                 ->required()
-                ->default(Auth::user()?->store_id)
+                ->default(Auth::user()?->tenant_id)
                 ->searchable()
                 ->preload(),
 
@@ -71,8 +71,8 @@ class WhatsAppTemplateForm
             KeyValue::make('parameters_map')
                 ->label('Mapa de Parametros')
                 ->keyLabel('Numero de Posicion (ej: 1, 2, 3)')
-                ->valueLabel('Campo del Lead o Etiqueta Manual')
-                ->helperText('La clave es el numero del marcador {{N}}. El valor es el campo del lead (ej: customer_name, product_name, customer_phone).')
+                ->valueLabel('Campo del Contacto o Etiqueta Manual')
+                ->helperText('La clave es el numero del marcador {{N}}. El valor es el campo del contacto (ej: customer_name, product_service_name, customer_phone).')
                 ->addActionLabel('+ Agregar parametro')
                 ->reorderable()
                 ->columnSpanFull(),

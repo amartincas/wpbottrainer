@@ -9,7 +9,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
-    'store_id',
+    'tenant_id',
     'name',
     'description',
     'price',
@@ -72,9 +72,9 @@ class Product extends Model
         return 'In Stock';
     }
 
-    public function store(): BelongsTo
+    public function tenant(): BelongsTo
     {
-        return $this->belongsTo(Store::class);
+        return $this->belongsTo(Tenant::class);
     }
 
     /**

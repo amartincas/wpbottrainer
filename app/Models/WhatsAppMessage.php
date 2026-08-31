@@ -9,17 +9,17 @@ class WhatsAppMessage extends Model
     protected $table = 'whatsapp_messages';
 
     protected $fillable = [
-        'store_id',
+        'tenant_id',
         'customer_phone',
         'role',
         'content',
     ];
 
     /**
-     * Get the store that owns this message.
+     * Get the tenant that owns this message.
      */
-    public function store()
+    public function tenant()
     {
-        return $this->belongsTo(Store::class);
+        return $this->belongsTo(Tenant::class);
     }
 }

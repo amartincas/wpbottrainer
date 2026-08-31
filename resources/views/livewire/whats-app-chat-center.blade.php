@@ -80,10 +80,10 @@
 
             @if(Auth::user()->is_super_admin)
                 <div style="padding: 1rem; border-bottom: 1px solid #e5e7eb; background: white; flex-shrink: 0;">
-                    <select wire:model.live="filterStoreId" style="width: 100%; padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.875rem; background: white;">
-                        <option value="">Todas las Tiendas</option>
-                        @foreach($stores as $store)
-                            <option value="{{ $store->id }}">{{ $store->name }}</option>
+                    <select wire:model.live="filterTenantId" style="width: 100%; padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.875rem; background: white;">
+                        <option value="">Todos los Tenants</option>
+                        @foreach($tenants as $tenant)
+                            <option value="{{ $tenant->id }}">{{ $tenant->name }}</option>
                         @endforeach
                     </select>
                 </div>
@@ -222,7 +222,7 @@
 
                 {{-- Template list --}}
                 <div style="display: flex; flex-direction: column; gap: 10px;">
-                    @foreach(\App\Models\WhatsAppTemplate::where('store_id', Auth::user()->store_id)->get() as $tpl)
+                    @foreach(\App\Models\WhatsAppTemplate::where('tenant_id', Auth::user()->tenant_id)->get() as $tpl)
                         <div
                             style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; cursor: pointer; background: white;"
                             @click="selectTemplate('{{ $tpl->id }}', '{{ $tpl->name }}', {{ Js::from($tpl->parameters_map) }}, {{ $tpl->requires_phone_input ? 'true' : 'false' }})"

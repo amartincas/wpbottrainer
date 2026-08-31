@@ -2,7 +2,7 @@
 
 namespace App\Filament\Pages;
 
-use App\Filament\Widgets\UnprocessedLeadsStats;
+use App\Filament\Widgets\UnprocessedContactsStats;
 use BackedEnum;
 use Filament\Pages\Dashboard as BaseDashboard;
 
@@ -15,7 +15,7 @@ class Dashboard extends BaseDashboard
     public function getWidgets(): array
     {
         return [
-            UnprocessedLeadsStats::class,
+            UnprocessedContactsStats::class,
         ];
     }
 }

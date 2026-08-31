@@ -1,0 +1,55 @@
+<?php
+
+use App\Core\Messaging\ExecutionContext;
+use App\Core\Messaging\IngestedMessage;
+use App\Core\Messaging\Intent;
+use App\Models\Contact;
+use App\Models\Tenant;
+use App\Models\TrainingProfile;
+use App\Training\Support\TrainingIntentClassifier;
+
+function makeClassifierContext(Tenant $tenant, ?string $body, string $from = '573001112233'): ExecutionContext
+{
+    return new ExecutionContext(
+        tenant: $tenant,
+        conversation: null,
+        message: new IngestedMessage($from, $body, 'wamid.1', 'text', null),
+    );
+}
+
+it('classifies a message with training keywords as Intent::Training', function () {
+    $tenant = Tenant::factory()->create();
+    $classifier = new TrainingIntentClassifier;
+
+    expect($classifier->classify(makeClassifierContext($tenant, 'Quiero empezar a entrenar')))->toBe(Intent::Training);
+    expect($classifier->classify(makeClassifierContext($tenant, 'dame una rutina de gimnasio')))->toBe(Intent::Training);
+});
+
+it('declines (returns null) for unrelated messages with no training signal', function () {
+    $tenant = Tenant::factory()->create();
+    $classifier = new TrainingIntentClassifier;
+
+    expect($classifier->classify(makeClassifierContext($tenant, 'Hola, ¿cómo estás?')))->toBeNull();
+    expect($classifier->classify(makeClassifierContext($tenant, null)))->toBeNull();
+});
+
+it('keeps classifying as training for a contact mid-onboarding, even without keywords', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    TrainingProfile::factory()->incomplete()->create(['contact_id' => $contact->id]);
+
+    $classifier = new TrainingIntentClassifier;
+
+    // Answering "3 veces por semana" has no training keyword at all.
+    expect($classifier->classify(makeClassifierContext($tenant, '3 veces por semana', '573001112233')))->toBe(Intent::Training);
+});
+
+it('does not force training for a contact whose onboarding is already complete', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $classifier = new TrainingIntentClassifier;
+
+    expect($classifier->classify(makeClassifierContext($tenant, 'Hola', '573001112233')))->toBeNull();
+});

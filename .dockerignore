@@ -1,0 +1,16 @@
+.git
+.gitignore
+node_modules
+vendor
+bootstrap/cache/*.php
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+storage/app/public/*
+database/*.sqlite
+.env
+.env.*
+!.env.example
+docker-compose*.yml
+docs

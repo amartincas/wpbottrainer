@@ -18,18 +18,18 @@ class ProductForm
     {
         return $schema
             ->schema([
-                Select::make('store_id')
+                Select::make('tenant_id')
                     ->relationship(
-                        'store',
+                        'tenant',
                         'name',
                         fn ($query) => $query
                             ->when(
                                 !Auth::user()?->is_super_admin,
-                                fn ($q) => $q->where('id', Auth::user()?->store_id)
+                                fn ($q) => $q->where('id', Auth::user()?->tenant_id)
                             )
                     )
                     ->required()
-                    ->default(Auth::user()?->store_id),
+                    ->default(Auth::user()?->tenant_id),
                 TextInput::make('id')
                     ->label('Product ID (for AI image references)')
                     ->disabled()
@@ -77,7 +77,7 @@ class ProductForm
                     ->placeholder('Rules, cities served, employees, FAQs specific to this product...')
                     ->columnSpanFull(),
                 TextInput::make('required_customer_info')
-                    ->label('Required Lead Data')
+                    ->label('Required Contact Data')
                     ->placeholder('E.g., Full name, phone, delivery address, preferred date...')
                     ->columnSpanFull(),
                 TagsInput::make('meta_ad_ids')

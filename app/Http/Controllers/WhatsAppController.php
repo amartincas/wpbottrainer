@@ -2,13 +2,13 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Store;
+use App\Models\Tenant;
 use App\Models\Conversation;
 use App\Jobs\ProcessWhatsAppMessage;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
 use App\Services\Inventory\ProductFinderService;
-use App\Models\Lead;
+use App\Models\Contact;
 use App\Models\WhatsAppTemplate;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -21,7 +21,7 @@ class WhatsAppController extends Controller
 {
     /**
      * Handle Meta WhatsApp webhook verification challenge.
-     * GET /api/whatsapp/webhook/{store_token}
+     * GET /api/whatsapp/webhook/{tenant_token}
      *
      * Meta sends a GET request with query parameters:
      * - hub.mode=subscribe
@@ -29,21 +29,21 @@ class WhatsAppController extends Controller
      * - hub.verify_token=<verify_token>
      *
      * @param Request $request
-     * @param string $store_token
+     * @param string $tenant_token
      * @return Response
      */
-    public function verify(Request $request, string $store_token)
+    public function verify(Request $request, string $tenant_token)
     {
-        // Find store by decrypted wa_verify_token
-        // Since wa_verify_token is encrypted in DB, we load all stores and compare
-        // (Store table is small, so this is efficient)
-        $store = Store::all()->firstWhere('wa_verify_token', $store_token);
+        // Find tenant by decrypted wa_verify_token
+        // Since wa_verify_token is encrypted in DB, we load all tenants and compare
+        // (Tenant table is small, so this is efficient)
+        $tenant = Tenant::all()->firstWhere('wa_verify_token', $tenant_token);
 
-        if (!$store) {
-            Log::warning('WhatsApp webhook verification failed: store not found', [
-                'token_length' => strlen($store_token),
+        if (!$tenant) {
+            Log::warning('WhatsApp webhook verification failed: tenant not found', [
+                'token_length' => strlen($tenant_token),
             ]);
-            return response('Store Not Found', 404);
+            return response('Tenant Not Found', 404);
         }
 
         // Capturamos los datos que envía Meta
@@ -52,7 +52,7 @@ class WhatsAppController extends Controller
         $verifyToken = $request->input('hub_verify_token');
 
         // Validamos contra el token de la base de datos
-        if ($mode === 'subscribe' && $verifyToken === $store->wa_verify_token) {
+        if ($mode === 'subscribe' && $verifyToken === $tenant->wa_verify_token) {
             // IMPORTANTE: Retornar solo el challenge como texto plano
             return response($challenge, 200)
                     ->header('Content-Type', 'text/plain');
@@ -63,13 +63,13 @@ class WhatsAppController extends Controller
 
     /**
      * Handle incoming WhatsApp messages from Meta webhook.
-     * POST /api/whatsapp/webhook/{store_token}
+     * POST /api/whatsapp/webhook/{tenant_token}
      *
      * @param Request $request
-     * @param string $store_token
+     * @param string $tenant_token
      * @return Response
      */
-    public function handle(Request $request, string $store_token): Response
+    public function handle(Request $request, string $tenant_token): Response
 {
     $payload = $request->json()->all();
 
@@ -124,10 +124,10 @@ class WhatsAppController extends Controller
     // Si pasa los filtros, guardamos el log real del mensaje entrante
     Log::info('Raw WhatsApp Webhook Payload', ['payload' => $payload]);
 
-    $store = $this->resolveStoreFromPayload($payload);
-    if (!$store) {
-        Log::warning('WhatsApp message handling failed: unable to resolve store from webhook metadata', [
-            'store_token' => $store_token,
+    $tenant = $this->resolveTenantFromPayload($payload);
+    if (!$tenant) {
+        Log::warning('WhatsApp message handling failed: unable to resolve tenant from webhook metadata', [
+            'tenant_token' => $tenant_token,
             'payload_metadata' => data_get($payload, 'entry.0.changes.0.value.metadata'),
         ]);
         return response('Not Found', 404);
@@ -148,7 +148,7 @@ class WhatsAppController extends Controller
         $body = null; 
         
         Log::info('WhatsApp audio/voice message received', [
-            'store_id' => $store->id,
+            'tenant_id' => $tenant->id,
             'customer_phone' => $fromPhone,
             'message_id' => $phoneId,
             'media_id' => $mediaId,
@@ -163,7 +163,7 @@ class WhatsAppController extends Controller
 
     // Find or create conversation
     $conversation = Conversation::firstOrCreate(
-        ['store_id' => $store->id, 'customer_phone' => $fromPhone],
+        ['tenant_id' => $tenant->id, 'customer_phone' => $fromPhone],
         ['last_session_at' => now()]
     );
 
@@ -178,12 +178,12 @@ class WhatsAppController extends Controller
     // cae de vuelta a la búsqueda por texto del mensaje.
     $adId = $message['referral']['source_id'] ?? null;
     $productContext = $adId
-        ? (new ProductFinderService())->findProductByAdId($adId, $store->id)?->id
+        ? (new ProductFinderService())->findProductByAdId($adId, $tenant->id)?->id
         : null;
 
     // Dispatch job to process the message asynchronously
     ProcessWhatsAppMessage::dispatch(
-        $store,
+        $tenant,
         $fromPhone,
         $body,
         $phoneId,
@@ -193,7 +193,7 @@ class WhatsAppController extends Controller
     );
 
     Log::info('WhatsApp message queued for processing', [
-        'store_id' => $store->id,
+        'tenant_id' => $tenant->id,
         'message_id' => $phoneId,
     ]);
 
@@ -204,24 +204,24 @@ class WhatsAppController extends Controller
     // -------------------------------------------------------------------------
 
     /**
-     * Send a Meta-approved template message to a lead from the operator dashboard.
+     * Send a Meta-approved template message to a contact from the operator dashboard.
      *
      * POST /api/whatsapp/templates/send
      *
      * Request body:
      * {
-     *   "lead_id":      123,
+     *   "contact_id":   123,
      *   "template_id":  7,
      *   "custom_values": ["value1", "value2"]   // operator-supplied overrides
      * }
      *
      * Flow:
      *  1. Validate request fields.
-     *  2. Load lead and template, enforcing store_id ownership on both.
-     *  3. Auto-prefill variables from lead data using parameters_map,
+     *  2. Load contact and template, enforcing tenant_id ownership on both.
+     *  3. Auto-prefill variables from contact data using parameters_map,
      *     then merge/override with any custom_values supplied by the operator.
      *  4. Call WhatsAppService::sendTemplateMessage().
-     *  5. If template is_reengagement, reset the lead status so the
+     *  5. If template is_reengagement, reset the contact status so the
      *     AIOrchestrator can resume once the customer replies.
      *
      * @param  Request      $request
@@ -238,49 +238,49 @@ class WhatsAppController extends Controller
             ], 401);
         }
 
-        // Derive store from the authenticated user
-        $storeId = $user->store_id;    
+        // Derive tenant from the authenticated user
+        $tenantId = $user->tenant_id;    
 
         // ── 1. Validate ───────────────────────────────────────────────────────
         $validated = $request->validate([
-            'lead_id'        => ['required', 'integer', 'exists:leads,id'],
+            'contact_id'        => ['required', 'integer', 'exists:contacts,id'],
             'template_id'    => ['required', 'integer', 'exists:whatsapp_templates,id'],
             'custom_values'  => ['sometimes', 'array'],
             'custom_values.*' => ['string', 'max:1024'],
         ]);
 
         // ── 2. Load & authorise ───────────────────────────────────────────────
-        // The authenticated user's store_id gates both records, ensuring a store
-        // operator can never send a template or contact a lead from another tenant.
-        $lead = Lead::findOrFail($validated['lead_id']);
+        // The authenticated user's tenant_id gates both records, ensuring a tenant
+        // operator can never send a template to a contact from another tenant.
+        $contact = Contact::findOrFail($validated['contact_id']);
 
-        /** @var \App\Models\Store $store */
-        $store = $lead->store;   // eager via relationship
+        /** @var \App\Models\Tenant $tenant */
+        $tenant = $contact->tenant;   // eager via relationship
 
-        // Verify the template belongs to the same store as the lead.
+        // Verify the template belongs to the same tenant as the contact.
         $template = WhatsAppTemplate::where('id', $validated['template_id'])
-            ->where('store_id', $store->id)
+            ->where('tenant_id', $tenant->id)
             ->first();
 
         if (!$template) {
-            Log::warning('WhatsApp template send unauthorised: template does not belong to lead store', [
-                'store_id'    => $store->id,
-                'lead_id'     => $lead->id,
+            Log::warning('WhatsApp template send unauthorised: template does not belong to contact tenant', [
+                'tenant_id'    => $tenant->id,
+                'contact_id'     => $contact->id,
                 'template_id' => $validated['template_id'],
             ]);
 
             return response()->json([
                 'success' => false,
-                'message' => 'Template not found or does not belong to this store.',
+                'message' => 'Template not found or does not belong to this tenant.',
             ], 403);
         }
 
         // ── 3. Build variables array ──────────────────────────────────────────
-        // parameters_map defines which lead/product fields auto-fill each position.
-        // Example map: {"1": "customer_name", "2": "product_name", "3": "tracking_number"}
+        // parameters_map defines which contact/product fields auto-fill each position.
+        // Example map: {"1": "customer_name", "2": "product_service_name", "3": "tracking_number"}
         //
-        // Supported auto-fill keys (extend as your Lead / Product models grow):
-        //   customer_name, customer_phone, product_name, lead_status
+        // Supported auto-fill keys (extend as your Contact / Product models grow):
+        //   customer_name, customer_phone, product_service_name, contact_status
         //
         // custom_values supplied by the operator act as an indexed override list:
         //   position 1 → custom_values[0], position 2 → custom_values[1], …
@@ -292,11 +292,11 @@ class WhatsAppController extends Controller
         $resolvedValues = [];
 
         // Auto-fill lookup table — add more mappings here as needed
-        $leadData = [
-            'customer_name'  => $lead->customer_name  ?? '',
-            'customer_phone' => $lead->customer_phone ?? '',
-            'product_name'   => $lead->product_name   ?? '',
-            'lead_status'    => $lead->status         ?? '',
+        $contactData = [
+            'customer_name'        => $contact->customer_name        ?? '',
+            'customer_phone'       => $contact->customer_phone       ?? '',
+            'product_service_name' => $contact->product_service_name ?? '',
+            'contact_status'       => $contact->status                ?? '',
         ];
 
         // Walk through each positional slot defined in the map
@@ -308,7 +308,7 @@ class WhatsAppController extends Controller
 
             $resolvedValues[$positionIndex] = (is_string($operatorValue) && $operatorValue !== '')
                 ? $operatorValue
-                : ($leadData[$fieldKey] ?? '');
+                : ($contactData[$fieldKey] ?? '');
         }
 
         // Fill any extra positions the operator added beyond the map definition
@@ -323,8 +323,8 @@ class WhatsAppController extends Controller
         $finalVariables = array_values($resolvedValues);
 
         Log::info('WhatsApp manual template send initiated', [
-            'store_id'      => $store->id,
-            'lead_id'       => $lead->id,
+            'tenant_id'      => $tenant->id,
+            'contact_id'       => $contact->id,
             'template_id'   => $template->id,
             'template_name' => $template->name,
             'is_reengagement' => $template->is_reengagement,
@@ -333,17 +333,17 @@ class WhatsAppController extends Controller
 
         // ── 4. Send via WhatsAppService ───────────────────────────────────────
         $sent = WhatsAppService::sendTemplateMessage(
-            to:           $lead->customer_phone,
+            to:           $contact->customer_phone,
             templateName: $template->name,
             languageCode: $template->language,
             variables:    $finalVariables,
-            store:        $store,
+            tenant:       $tenant,
         );
 
         if (!$sent) {
             Log::error('WhatsApp manual template send failed', [
-                'store_id'      => $store->id,
-                'lead_id'       => $lead->id,
+                'tenant_id'      => $tenant->id,
+                'contact_id'       => $contact->id,
                 'template_name' => $template->name,
             ]);
 
@@ -353,31 +353,31 @@ class WhatsAppController extends Controller
             ], 502);
         }
 
-        // ── 5. Re-engagement: reset lead status ───────────────────────────────
+        // ── 5. Re-engagement: reset contact status ───────────────────────────────
         // When an operator sends a re-engagement template (is_reengagement = true),
         // the 24-hour WhatsApp conversation window will reopen once the customer
-        // replies. We pre-emptively set the lead back to an active state so the
+        // replies. We pre-emptively set the contact back to an active state so the
         // AIOrchestrator (via ProcessWhatsAppMessage) will resume AI processing
         // as soon as that reply arrives — without requiring manual intervention.
         if ($template->is_reengagement) {
-            $lead->update(['status' => 'waiting_customer']);
+            $contact->update(['status' => 'waiting_customer']);
 
             // Also re-enable the bot for this phone in case it was paused
             // (bot_active flag lives on the leads table per ARCHITECTURE.md §2.2 Step 2)
-            $lead->update(['bot_active' => true]);
+            $contact->update(['bot_active' => true]);
 
-            Log::info('WhatsApp re-engagement template sent: lead status reset', [
-                'store_id'    => $store->id,
-                'lead_id'     => $lead->id,
-                'customer'    => $lead->customer_phone,
+            Log::info('WhatsApp re-engagement template sent: contact status reset', [
+                'tenant_id'    => $tenant->id,
+                'contact_id'     => $contact->id,
+                'customer'    => $contact->customer_phone,
                 'new_status'  => 'waiting_customer',
                 'bot_active'  => true,
             ]);
         }
 
         Log::info('WhatsApp manual template send completed successfully', [
-            'store_id'        => $store->id,
-            'lead_id'         => $lead->id,
+            'tenant_id'        => $tenant->id,
+            'contact_id'         => $contact->id,
             'template_name'   => $template->name,
             'is_reengagement' => $template->is_reengagement,
         ]);
@@ -386,11 +386,11 @@ class WhatsAppController extends Controller
             'success'         => true,
             'message'         => 'Template message sent successfully.',
             'is_reengagement' => $template->is_reengagement,
-            'lead_status'     => $template->is_reengagement ? 'waiting_customer' : $lead->status,
+            'lead_status'     => $template->is_reengagement ? 'waiting_customer' : $contact->status,
         ]);
     }
 
-    private function resolveStoreFromPayload(array $payload): ?Store
+    private function resolveTenantFromPayload(array $payload): ?Tenant
     {
         $metadata = data_get($payload, 'entry.0.changes.0.value.metadata', []);
         $phoneNumberId = $metadata['phone_number_id'] ?? $metadata['phoneNumberId'] ?? null;
@@ -399,6 +399,6 @@ class WhatsAppController extends Controller
             return null;
         }
 
-        return Store::where('wa_phone_number_id', (string) $phoneNumberId)->first();
+        return Tenant::where('wa_phone_number_id', (string) $phoneNumberId)->first();
     }
 }

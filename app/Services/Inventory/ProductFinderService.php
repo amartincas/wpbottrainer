@@ -25,25 +25,25 @@ class ProductFinderService
     /**
      * Resolve the exact product a customer is asking about via the Meta
      * Click-to-WhatsApp ad ID (referral.source_id in the webhook payload),
-     * scoped to the store already resolved from the phone number.
+     * scoped to the tenant already resolved from the phone number.
      *
-     * More reliable than text search: the store admin tags the ad ID once
+     * More reliable than text search: the tenant admin tags the ad ID once
      * per product, so it doesn't depend on the ad's prefilled message
      * matching the product name.
      *
      * @param string $adId
-     * @param int $storeId
+     * @param int $tenantId
      * @return Product|null
      */
-    public function findProductByAdId(string $adId, int $storeId): ?Product
+    public function findProductByAdId(string $adId, int $tenantId): ?Product
     {
-        $product = Product::where('store_id', $storeId)
+        $product = Product::where('tenant_id', $tenantId)
             ->whereJsonContains('meta_ad_ids', $adId)
             ->with('images')
             ->first();
 
         Log::info('PRODUCT_FINDER: Resolución por ad_id de Meta', [
-            'store_id' => $storeId,
+            'tenant_id' => $tenantId,
             'ad_id' => $adId,
             'matched_product_id' => $product?->id,
         ]);
@@ -52,16 +52,16 @@ class ProductFinderService
     }
 
     /**
-     * Search for products/services by query string in the store.
+     * Search for products/services by query string in the tenant catalog.
      * Returns array with formatted context and type information.
      * If generic/short search or no results found, returns full catalog.
      *
      * @param string $query
-     * @param int $storeId
+     * @param int $tenantId
      * @param int $limit
      * @return array ['context' => string, 'products' => Collection, 'hasServices' => bool, 'hasProducts' => bool]
      */
-    public function findProductsWithTypes(string $query, int $storeId, int $limit = 3): array
+    public function findProductsWithTypes(string $query, int $tenantId, int $limit = 3): array
     {
         // Check whether a product is explicitly named in the message BEFORE
         // applying the generic-term heuristic below. Without this, a message
@@ -69,11 +69,11 @@ class ProductFinderService
         // generic just because it contains "oferta"/"precio" — even though
         // it names a specific product — and the AI ends up receiving every
         // product's (possibly contradictory) sales strategy at once.
-        $mentionedProduct = $this->findProductMentionedInMessage($query, $storeId);
+        $mentionedProduct = $this->findProductMentionedInMessage($query, $tenantId);
 
         if ($mentionedProduct) {
             Log::info("PRODUCT_FINDER: Product mentioned by name in message", [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'query' => $query,
                 'matched_product_id' => $mentionedProduct->id,
                 'matched_product_name' => $mentionedProduct->name,
@@ -95,7 +95,7 @@ class ProductFinderService
         $isGenericQuery = $this->isGenericQuery($queryLower);
 
         Log::info("PRODUCT_FINDER: Search Parameters", [
-            'store_id' => $storeId,
+            'tenant_id' => $tenantId,
             'query' => $query,
             'query_length' => strlen($queryLower),
             'is_generic' => $isGenericQuery,
@@ -104,11 +104,11 @@ class ProductFinderService
         // If generic or very short query, return full catalog
         if ($isGenericQuery) {
             Log::info("PRODUCT_FINDER: Generic query detected, fetching full catalog", [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'query' => $query,
             ]);
 
-            $products = Product::where('store_id', $storeId)
+            $products = Product::where('tenant_id', $tenantId)
                 ->with('images')
                 ->limit($limit)
                 ->get(['id', 'name', 'price', 'description', 'stock', 'type', 'ai_sales_strategy', 'faq_context', 'required_customer_info']);
@@ -116,23 +116,23 @@ class ProductFinderService
             // Specific search query - use LIKE with wildcards
             $searchTerm = "%{$query}%";
             
-            // Debug: Log all available products in this store for mismatch detection
-            $allProductsInStore = Product::where('store_id', $storeId)->get(['id', 'name', 'type']);
-            $availableNames = $allProductsInStore->pluck('name')->toArray();
+            // Debug: Log all available products in this tenant for mismatch detection
+            $allProductsInTenant = Product::where('tenant_id', $tenantId)->get(['id', 'name', 'type']);
+            $availableNames = $allProductsInTenant->pluck('name')->toArray();
             
-            Log::info("PRODUCT_FINDER: Database inventory for store", [
-                'store_id' => $storeId,
-                'total_products_in_store' => $allProductsInStore->count(),
+            Log::info("PRODUCT_FINDER: Database inventory for tenant", [
+                'tenant_id' => $tenantId,
+                'total_products_in_tenant' => $allProductsInTenant->count(),
                 'available_product_names' => $availableNames,
             ]);
             
             Log::info("PRODUCT_FINDER: Executing specific search", [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'search_pattern' => $searchTerm,
-                'sql_preview' => "SELECT * FROM products WHERE store_id = {$storeId} AND (name LIKE '{$searchTerm}' OR description LIKE '{$searchTerm}')",
+                'sql_preview' => "SELECT * FROM products WHERE tenant_id = {$tenantId} AND (name LIKE '{$searchTerm}' OR description LIKE '{$searchTerm}')",
             ]);
 
-            $products = Product::where('store_id', $storeId)
+            $products = Product::where('tenant_id', $tenantId)
                 ->where(function (Builder $builder) use ($searchTerm) {
                     $builder->where('name', 'LIKE', $searchTerm)
                         ->orWhere('description', 'LIKE', $searchTerm);
@@ -142,7 +142,7 @@ class ProductFinderService
                 ->get(['id', 'name', 'price', 'description', 'stock', 'type', 'ai_sales_strategy', 'faq_context', 'required_customer_info']);
 
             Log::info("PRODUCT_FINDER: Search result count", [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'query' => $query,
                 'results_found' => $products->count(),
             ]);
@@ -150,17 +150,17 @@ class ProductFinderService
             // If specific search returned nothing, fall back to full catalog
             if ($products->isEmpty()) {
                 Log::warning("PRODUCT_FINDER: Specific search returned no results, falling back to full catalog", [
-                    'store_id' => $storeId,
+                    'tenant_id' => $tenantId,
                     'original_query' => $query,
                 ]);
 
-                $products = Product::where('store_id', $storeId)
+                $products = Product::where('tenant_id', $tenantId)
                     ->with('images')
                     ->limit($limit)
                     ->get(['id', 'name', 'price', 'description', 'stock', 'type', 'ai_sales_strategy', 'faq_context', 'required_customer_info']);
 
                 Log::info("PRODUCT_FINDER: Fallback catalog result", [
-                    'store_id' => $storeId,
+                    'tenant_id' => $tenantId,
                     'fallback_results' => $products->count(),
                 ]);
             }
@@ -170,7 +170,7 @@ class ProductFinderService
         $hasProducts = $products->where('type', 'product')->isNotEmpty();
 
         Log::info("PRODUCT_FINDER: Final result", [
-            'store_id' => $storeId,
+            'tenant_id' => $tenantId,
             'total_products' => $products->count(),
             'has_services' => $hasServices,
             'has_products' => $hasProducts,
@@ -192,10 +192,10 @@ class ProductFinderService
      * product's name/description and so rarely matches real conversation.
      *
      * @param string $message
-     * @param int $storeId
+     * @param int $tenantId
      * @return Product|null
      */
-    private function findProductMentionedInMessage(string $message, int $storeId): ?Product
+    private function findProductMentionedInMessage(string $message, int $tenantId): ?Product
     {
         $text = trim($message);
 
@@ -203,8 +203,8 @@ class ProductFinderService
             return null;
         }
 
-        return Product::where('store_id', $storeId)
-            ->get(['id', 'name', 'store_id'])
+        return Product::where('tenant_id', $tenantId)
+            ->get(['id', 'name', 'tenant_id'])
             ->first(fn (Product $product) => filled($product->name) && mb_stripos($text, $product->name) !== false);
     }
 
@@ -232,17 +232,17 @@ class ProductFinderService
     }
 
     /**
-     * Search for products by query string in the store.
+     * Search for products by query string in the tenant catalog.
      * Legacy method for backward compatibility.
      *
      * @param string $query
-     * @param int $storeId
+     * @param int $tenantId
      * @param int $limit
      * @return string Formatted product results
      */
-    public function findProducts(string $query, int $storeId, int $limit = 3): string
+    public function findProducts(string $query, int $tenantId, int $limit = 3): string
     {
-        $result = $this->findProductsWithTypes($query, $storeId, $limit);
+        $result = $this->findProductsWithTypes($query, $tenantId, $limit);
         return $result['context'];
     }
 

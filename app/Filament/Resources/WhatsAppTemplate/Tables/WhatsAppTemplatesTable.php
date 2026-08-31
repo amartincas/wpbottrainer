@@ -2,7 +2,7 @@
 
 namespace App\Filament\Resources\WhatsAppTemplate\Tables;
 
-use App\Models\Store;
+use App\Models\Tenant;
 use App\Models\WhatsAppTemplate;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteBulkAction;
@@ -34,8 +34,8 @@ class WhatsAppTemplatesTable
                     ->fontFamily('mono')
                     ->weight(FontWeight::Medium),
 
-                TextColumn::make('store.name')
-                    ->label('Tienda')
+                TextColumn::make('tenant.name')
+                    ->label('Tenant')
                     ->sortable()
                     ->badge()
                     ->color('info'),
@@ -103,17 +103,17 @@ class WhatsAppTemplatesTable
                             : null;
                     }),
 
-                SelectFilter::make('store_id')
-                    ->label('Tienda')
+                SelectFilter::make('tenant_id')
+                    ->label('Tenant')
                     ->options(function (): array {
                         if (Auth::user()?->is_super_admin) {
-                            return Store::orderBy('name')->pluck('name', 'id')->toArray();
+                            return Tenant::orderBy('name')->pluck('name', 'id')->toArray();
                         }
-                        return Store::where('id', Auth::user()?->store_id)
+                        return Tenant::where('id', Auth::user()?->tenant_id)
                             ->pluck('name', 'id')
                             ->toArray();
                     })
-                    ->placeholder('Todas las tiendas'),
+                    ->placeholder('Todos los tenants'),
 
                 SelectFilter::make('type')
                     ->label('Categoria')

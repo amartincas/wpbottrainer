@@ -17,8 +17,8 @@ class ProductsTable
     {
         return $table
             ->columns([
-                TextColumn::make('store.name')
-                    ->label('Store Name')
+                TextColumn::make('tenant.name')
+                    ->label('Tenant Name')
                     ->searchable()
                     ->visible(Auth::user()?->is_super_admin),
                 TextColumn::make('name')
@@ -39,9 +39,9 @@ class ProductsTable
                     ->toggleable(isToggledHiddenByDefault: true),
             ])
             ->filters([
-                SelectFilter::make('store_id')
-                    ->relationship('store', 'name')
-                    ->label('Store'),
+                SelectFilter::make('tenant_id')
+                    ->relationship('tenant', 'name')
+                    ->label('Tenant'),
             ])
             ->recordActions([
                 ViewAction::make(),

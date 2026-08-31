@@ -2,7 +2,7 @@
 
 namespace App\Services;
 
-use App\Models\Store;
+use App\Models\Tenant;
 use App\Models\ProductImage;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -14,15 +14,15 @@ class WhatsAppService
      *
      * @param string $to Phone number in format: countrycode[phonenumber]
      * @param string $message Message text to send
-     * @param Store $store Store with WhatsApp credentials
+     * @param Tenant $tenant Tenant with WhatsApp credentials
      * @return string|null WAMID (Meta's message ID) on success, null on failure
      */
-    public static function sendMessage(string $to, string $message, Store $store): ?string
+    public static function sendMessage(string $to, string $message, Tenant $tenant): ?string
     {
         try {
-            $url = "https://graph.facebook.com/v20.0/{$store->wa_phone_number_id}/messages";
+            $url = "https://graph.facebook.com/v20.0/{$tenant->wa_phone_number_id}/messages";
 
-            $response = Http::withToken($store->wa_access_token)
+            $response = Http::withToken($tenant->wa_access_token)
                 ->post($url, [
                     'messaging_product' => 'whatsapp',
                     'recipient_type' => 'individual',
@@ -33,14 +33,14 @@ class WhatsAppService
             
             if ($response->failed()) {
                 Log::error("Error de Meta API", [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'status' => $response->status(),
                     'body' => $response->json()
                 ]);
             }    
 
             Log::debug('WhatsApp message sent', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'to' => $to,
                 'status' => $response->status(),
                 'success' => $response->successful(),
@@ -48,7 +48,7 @@ class WhatsAppService
 
             if (!$response->successful()) {
                 Log::warning('WhatsApp message send failed', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'to' => $to,
                     'status' => $response->status(),
                     'error' => $response->json(),
@@ -60,7 +60,7 @@ class WhatsAppService
             $wamid = data_get($response->json(), 'messages.0.id');
             
             Log::info('WhatsApp message sent successfully', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'to' => $to,
                 'wamid' => $wamid,
             ]);
@@ -68,7 +68,7 @@ class WhatsAppService
             return $wamid;
         } catch (\Exception $e) {
             Log::error('WhatsApp message send error', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'to' => $to,
                 'error' => $e->getMessage(),
             ]);
@@ -107,7 +107,7 @@ class WhatsAppService
      * @param string  $templateName Technical name registered in Meta Business Manager
      * @param string  $languageCode BCP-47 code, e.g. "es_CO", "en_US"
      * @param array   $variables    Ordered list of replacement values for {{1}}, {{2}}, …
-     * @param Store   $store        Store instance carrying wa_access_token & wa_phone_number_id
+     * @param Tenant   $tenant        Tenant instance carrying wa_access_token & wa_phone_number_id
      * @return string|null          WAMID (Meta's message ID) on success, null on failure
      */
     public static function sendTemplateMessage(
@@ -115,10 +115,10 @@ class WhatsAppService
         string $templateName,
         string $languageCode,
         array  $variables,
-        Store  $store
+        Tenant  $tenant
     ): ?string {
         try {
-            $url = "https://graph.facebook.com/v20.0/{$store->wa_phone_number_id}/messages";
+            $url = "https://graph.facebook.com/v20.0/{$tenant->wa_phone_number_id}/messages";
 
             // Build the ordered parameter objects required by the Meta Cloud API.
             // Each entry in $variables maps to one positional placeholder: {{1}}, {{2}}, …
@@ -152,7 +152,7 @@ class WhatsAppService
             ];
 
             Log::info('WhatsApp template message dispatching', [
-                'store_id'      => $store->id,
+                'tenant_id'      => $tenant->id,
                 'to'            => $to,
                 'template_name' => $templateName,
                 'language'      => $languageCode,
@@ -164,7 +164,7 @@ class WhatsAppService
                 'payload' => $payload
             ]);
 
-            $response = Http::withToken($store->wa_access_token)
+            $response = Http::withToken($tenant->wa_access_token)
                 ->timeout(15)
                 ->post($url, $payload);
 
@@ -172,7 +172,7 @@ class WhatsAppService
             // mirroring the pattern used in sendMessage().
             if ($response->failed()) {
                 Log::error('WhatsApp template message Meta API error', [
-                    'store_id'      => $store->id,
+                    'tenant_id'      => $tenant->id,
                     'to'            => $to,
                     'template_name' => $templateName,
                     'status'        => $response->status(),
@@ -182,7 +182,7 @@ class WhatsAppService
 
             if (!$response->successful()) {
                 Log::warning('WhatsApp template message send failed', [
-                    'store_id'      => $store->id,
+                    'tenant_id'      => $tenant->id,
                     'to'            => $to,
                     'template_name' => $templateName,
                     'status'        => $response->status(),
@@ -195,7 +195,7 @@ class WhatsAppService
             $wamid = data_get($response->json(), 'messages.0.id');
 
             Log::info('WhatsApp template message sent successfully', [
-                'store_id'      => $store->id,
+                'tenant_id'      => $tenant->id,
                 'to'            => $to,
                 'template_name' => $templateName,
                 'wamid'         => $wamid,
@@ -205,7 +205,7 @@ class WhatsAppService
 
         } catch (\Exception $e) {
             Log::error('WhatsApp template message send exception', [
-                'store_id'      => $store->id,
+                'tenant_id'      => $tenant->id,
                 'to'            => $to,
                 'template_name' => $templateName,
                 'error'         => $e->getMessage(),
@@ -261,20 +261,20 @@ class WhatsAppService
      * Download WhatsApp media for transcription.
      *
      * @param string $mediaId WhatsApp media ID
-     * @param Store $store Store with WhatsApp credentials
+     * @param Tenant $tenant Tenant with WhatsApp credentials
      * @param string|null $mimeType Optional mime type to help with extension
      * @return string|null Relative disk path of downloaded file or null on failure
      */
-    public static function downloadMedia(string $mediaId, Store $store, ?string $mimeType = null): ?string
+    public static function downloadMedia(string $mediaId, Tenant $tenant, ?string $mimeType = null): ?string
     {
         try {
-            $urlResponse = Http::withToken($store->wa_access_token)
+            $urlResponse = Http::withToken($tenant->wa_access_token)
                 ->timeout(30)
                 ->get("https://graph.facebook.com/v20.0/{$mediaId}");
 
             if ($urlResponse->failed()) {
                 Log::error('Failed to retrieve WhatsApp media URL', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'media_id' => $mediaId,
                     'status' => $urlResponse->status(),
                     'body' => $urlResponse->body(),
@@ -287,20 +287,20 @@ class WhatsAppService
 
             if (!$downloadUrl) {
                 Log::error('WhatsApp media URL missing from response', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'media_id' => $mediaId,
                     'response' => $urlData,
                 ]);
                 return null;
             }
 
-            $mediaResponse = Http::withToken($store->wa_access_token)
+            $mediaResponse = Http::withToken($tenant->wa_access_token)
                 ->timeout(60)
                 ->get($downloadUrl);
 
             if ($mediaResponse->failed()) {
                 Log::error('Failed to download WhatsApp media content', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'media_id' => $mediaId,
                     'status' => $mediaResponse->status(),
                     'body' => $mediaResponse->body(),
@@ -325,7 +325,7 @@ class WhatsAppService
 
             if (!$stored) {
                 Log::error('Failed to save WhatsApp media to disk', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'media_id' => $mediaId,
                     'relative_path' => $relativePath,
                 ]);
@@ -333,7 +333,7 @@ class WhatsAppService
             }
 
             Log::info('WhatsApp media downloaded successfully', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'media_id' => $mediaId,
                 'relative_path' => $relativePath,
             ]);
@@ -341,7 +341,7 @@ class WhatsAppService
             return $relativePath;
         } catch (\Exception $e) {
             Log::error('Error downloading WhatsApp media', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'media_id' => $mediaId,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
@@ -353,34 +353,34 @@ class WhatsAppService
     /**
      * Send a welcome message after successful setup
      *
-     * @param Store $store Store with WhatsApp credentials
+     * @param Tenant $tenant Tenant with WhatsApp credentials
      * @param string|null $toNumber Optional target phone number (if null, just logs)
      * @return bool True if message was sent or logged successfully
      */
-    public static function sendWelcomeMessage(Store $store, ?string $toNumber = null): bool
+    public static function sendWelcomeMessage(Tenant $tenant, ?string $toNumber = null): bool
     {
         try {
             $message = sprintf(
                 "¡Hola! 🚀 Soy el asistente de %s. Estoy configurado correctamente y listo para atender a tus clientes. ¡Hagamos crecer tu negocio!",
-                $store->name
+                $tenant->name
             );
 
             // If target number is provided, send the message
             if ($toNumber) {
-                return self::sendMessage($toNumber, $message, $store);
+                return self::sendMessage($toNumber, $message, $tenant);
             }
 
             // Otherwise, just log it for the store owner to see
-            Log::info('Store setup completed - Welcome message ready', [
-                'store_id' => $store->id,
-                'store_name' => $store->name,
+            Log::info('Tenant setup completed - Welcome message ready', [
+                'tenant_id' => $tenant->id,
+                'store_name' => $tenant->name,
                 'message' => $message,
             ]);
 
             return true;
         } catch (\Exception $e) {
             Log::error('Error preparing welcome message', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'error' => $e->getMessage(),
             ]);
             return false;
@@ -392,18 +392,18 @@ class WhatsAppService
      *
      * @param string $toNumber Phone number in format: countrycode[phonenumber]
      * @param string $imageUrl Full URL to the image (public accessible)
-     * @param Store $store Store with WhatsApp credentials
+     * @param Tenant $tenant Tenant with WhatsApp credentials
      * @param string|null $caption Optional caption for the image
      * @return bool True if image was sent successfully
      */
     public static function sendWhatsAppImage(
         string $toNumber,
         string $imageUrl,
-        Store $store,
+        Tenant $tenant,
         ?string $caption = null
     ): bool {
         try {
-            $url = "https://graph.facebook.com/v20.0/{$store->wa_phone_number_id}/messages";
+            $url = "https://graph.facebook.com/v20.0/{$tenant->wa_phone_number_id}/messages";
 
             $imagePayload = [
                 'link' => $imageUrl,
@@ -422,11 +422,11 @@ class WhatsAppService
                 $payload['image']['caption'] = $caption;
             }
 
-            $response = Http::withToken($store->wa_access_token)->post($url, $payload);
+            $response = Http::withToken($tenant->wa_access_token)->post($url, $payload);
 
             if (!$response->successful()) {
                 Log::warning('WhatsApp image send failed', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'to' => $toNumber,
                     'image_url' => $imageUrl,
                     'status' => $response->status(),
@@ -436,7 +436,7 @@ class WhatsAppService
             }
 
             Log::debug('WhatsApp image sent', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'to' => $toNumber,
                 'image_url' => $imageUrl,
             ]);
@@ -444,7 +444,77 @@ class WhatsAppService
             return true;
         } catch (\Exception $e) {
             Log::error('WhatsApp image send error', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
+                'to' => $toNumber,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Send a video via WhatsApp Business API.
+     *
+     * Mirrors sendWhatsAppImage() exactly — same payload shape, `type: 'video'`
+     * instead of `'image'`. Added in Hito 5 for Training's exercise videos
+     * (Exercise.video_url) — no assumption is made about where that URL is
+     * ultimately hosted (see docs/DECISIONS.md), only that WhatsApp Cloud API
+     * needs a publicly reachable HTTPS URL, same requirement as images.
+     *
+     * @param string $toNumber Phone number in format: countrycode[phonenumber]
+     * @param string $videoUrl Full URL to the video (public accessible)
+     * @param Tenant $tenant Tenant with WhatsApp credentials
+     * @param string|null $caption Optional caption for the video
+     * @return bool True if the video was sent successfully
+     */
+    public static function sendWhatsAppVideo(
+        string $toNumber,
+        string $videoUrl,
+        Tenant $tenant,
+        ?string $caption = null
+    ): bool {
+        try {
+            $url = "https://graph.facebook.com/v20.0/{$tenant->wa_phone_number_id}/messages";
+
+            $videoPayload = [
+                'link' => $videoUrl,
+            ];
+
+            if ($caption) {
+                $videoPayload['caption'] = $caption;
+            }
+
+            $payload = [
+                'messaging_product' => 'whatsapp',
+                'recipient_type' => 'individual',
+                'to' => $toNumber,
+                'type' => 'video',
+                'video' => $videoPayload,
+            ];
+
+            $response = Http::withToken($tenant->wa_access_token)->post($url, $payload);
+
+            if (!$response->successful()) {
+                Log::warning('WhatsApp video send failed', [
+                    'tenant_id' => $tenant->id,
+                    'to' => $toNumber,
+                    'video_url' => $videoUrl,
+                    'status' => $response->status(),
+                    'error' => $response->json(),
+                ]);
+                return false;
+            }
+
+            Log::debug('WhatsApp video sent', [
+                'tenant_id' => $tenant->id,
+                'to' => $toNumber,
+                'video_url' => $videoUrl,
+            ]);
+
+            return true;
+        } catch (\Exception $e) {
+            Log::error('WhatsApp video send error', [
+                'tenant_id' => $tenant->id,
                 'to' => $toNumber,
                 'error' => $e->getMessage(),
             ]);
@@ -459,13 +529,13 @@ class WhatsAppService
      * sends the corresponding images via WhatsApp, and returns the cleaned text.
      *
      * @param string $responseText Raw AI response containing potential [IMG: id] tags
-     * @param Store $store Store with WhatsApp credentials and products
+     * @param Tenant $tenant Tenant with WhatsApp credentials and products
      * @param string $customerNumber Customer's phone number to send images to
      * @return string Cleaned response text without [IMG: ...] tags
      */
     public static function processAIResponse(
         string $responseText,
-        Store $store,
+        Tenant $tenant,
         string $customerNumber
     ): string {
         try {
@@ -474,7 +544,7 @@ class WhatsAppService
             preg_match_all($pattern, $responseText, $matches);
 
             Log::info('AI Response Image Processing', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'customer_number' => $customerNumber,
                 'response_text' => $responseText,
                 'found_img_tags' => $matches[1] ?? [],
@@ -483,7 +553,7 @@ class WhatsAppService
             if (!empty($matches[1])) {
                 foreach ($matches[1] as $imageId) {
                     Log::info('Processing image tag', [
-                        'store_id' => $store->id,
+                        'tenant_id' => $tenant->id,
                         'image_id' => $imageId,
                         'customer_number' => $customerNumber,
                     ]);
@@ -492,7 +562,7 @@ class WhatsAppService
 
                     if ($image) {
                         Log::info('ProductImage found', [
-                            'store_id' => $store->id,
+                            'tenant_id' => $tenant->id,
                             'image_id' => $imageId,
                             'image_path' => $image->image_path,
                             'public_url' => $image->public_url,
@@ -503,7 +573,7 @@ class WhatsAppService
                         $productName = $image->product ? $image->product->name : 'Product Image';
 
                         Log::info('Sending image', [
-                            'store_id' => $store->id,
+                            'tenant_id' => $tenant->id,
                             'image_id' => $imageId,
                             'public_url' => $image->public_url,
                             'customer_number' => $customerNumber,
@@ -514,26 +584,26 @@ class WhatsAppService
                         $imageSent = self::sendWhatsAppImage(
                             $customerNumber,
                             $image->public_url,
-                            $store,
+                            $tenant,
                             $productName
                         );
 
                         Log::info('Image send result', [
-                            'store_id' => $store->id,
+                            'tenant_id' => $tenant->id,
                             'image_id' => $imageId,
                             'image_sent' => $imageSent,
                             'customer_number' => $customerNumber,
                         ]);
                     } else {
                         Log::warning('ProductImage not found for AI response', [
-                            'store_id' => $store->id,
+                            'tenant_id' => $tenant->id,
                             'image_id' => $imageId,
                         ]);
                     }
                 }
             } else {
                 Log::info('No image tags found in AI response', [
-                    'store_id' => $store->id,
+                    'tenant_id' => $tenant->id,
                     'customer_number' => $customerNumber,
                 ]);
             }
@@ -545,7 +615,7 @@ class WhatsAppService
             $cleanText = trim(preg_replace('/\s+/', ' ', $cleanText));
 
             Log::info('AI Response processing completed', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'customer_number' => $customerNumber,
                 'original_length' => strlen($responseText),
                 'cleaned_length' => strlen($cleanText),
@@ -554,7 +624,7 @@ class WhatsAppService
             return $cleanText;
         } catch (\Exception $e) {
             Log::error('Error processing AI response images', [
-                'store_id' => $store->id,
+                'tenant_id' => $tenant->id,
                 'customer_number' => $customerNumber,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),

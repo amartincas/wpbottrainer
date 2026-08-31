@@ -1,6 +1,6 @@
 <x-layouts::app :title="__('Dashboard')">
     {{-- Setup Incomplete Banner --}}
-    @if (session('store_setup_incomplete') && auth()->user()->store)
+    @if (session('tenant_setup_incomplete') && auth()->user()->tenant)
         <div class="mb-4 bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded">
             <div class="flex">
                 <div class="flex-shrink-0">
@@ -10,13 +10,13 @@
                 </div>
                 <div class="ml-3">
                     <p class="text-sm font-medium text-yellow-800">
-                        ⚠️ <strong>Store Configuration Required</strong>
+                        ⚠️ <strong>Tenant Configuration Required</strong>
                     </p>
                     <p class="text-sm text-yellow-700 mt-1">
-                        Your store needs WhatsApp integration to start receiving messages. Please configure your store settings.
+                        Your tenant needs WhatsApp integration to start receiving messages. Please configure your tenant settings.
                     </p>
                     <a href="{{ route('filament.yes.pages.dashboard') }}" class="inline-block mt-2 bg-yellow-600 text-white px-4 py-2 rounded text-sm font-medium hover:bg-yellow-700">
-                        Go to Store Settings
+                        Go to Tenant Settings
                     </a>
                 </div>
             </div>

@@ -33,7 +33,7 @@ class WhatsAppTemplateResource extends Resource
         $query = parent::getEloquentQuery();
 
         if (! Auth::user()?->is_super_admin) {
-            $query->where('store_id', Auth::user()?->store_id);
+            $query->where('tenant_id', Auth::user()?->tenant_id);
         }
 
         return $query;

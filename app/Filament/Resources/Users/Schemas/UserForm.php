@@ -27,17 +27,17 @@ class UserForm
                     ->required(fn (string $operation) => $operation === 'create')
                     ->hidden(fn (string $operation) => $operation === 'edit')
                     ->helperText('Password for the user account'),
-                Select::make('store_id')
-                    ->relationship('store', 'name')
+                Select::make('tenant_id')
+                    ->relationship('tenant', 'name')
                     ->required()
-                    ->label('Assign Store')
+                    ->label('Assign Tenant')
                     ->searchable()
                     ->preload()
                     ->native(false)
                     ->disabled(fn (string $operation) => $operation === 'edit'),
                 Checkbox::make('is_super_admin')
                     ->label('Grant Superuser Access')
-                    ->helperText('Superusers can manage all stores, users, products, and leads.'),
+                    ->helperText('Superusers can manage all tenants, users, products, and contacts.'),
             ]);
     }
 }

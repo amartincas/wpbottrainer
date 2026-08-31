@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 #[Fillable([
-    'store_id',
+    'tenant_id',
     'customer_phone',
     'last_session_at',
     'current_product_id',
@@ -24,9 +24,9 @@ class Conversation extends Model
         ];
     }
 
-    public function store(): BelongsTo
+    public function tenant(): BelongsTo
     {
-        return $this->belongsTo(Store::class);
+        return $this->belongsTo(Tenant::class);
     }
 
     public function currentProduct(): BelongsTo

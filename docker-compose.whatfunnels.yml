@@ -1,0 +1,25 @@
+# Overlay específico del VPS compartido de whatfunnels (server1.whatfunnels.com)
+# — NO es parte de un despliegue genérico. Ese VPS ya corre Nginx Proxy
+# Manager como único punto de entrada en los puertos 80/443/81 (compartido
+# con otras apps, ej. wpbotreserva), así que el nginx de este proyecto no se
+# expone directamente al público: se une a la red compartida
+# whatfunnels-edge para que NPM pueda alcanzarlo por nombre de contenedor
+# (wpbottrainer-nginx-1, puerto 80 interno) y enrutarlo por dominio con su
+# propio certificado TLS — configurado en NPM, no acá.
+#
+# Solo "nginx" se une a la red compartida. app/queue/mariadb permanecen
+# aislados en la red por defecto de este proyecto (wpbottrainer_default),
+# sin ninguna conexión a whatfunnels-edge ni a otros proyectos del VPS.
+#
+# Uso: docker compose -f docker-compose.yml -f docker-compose.whatfunnels.yml up -d --build
+
+services:
+  nginx:
+    networks:
+      - default
+      - whatfunnels-edge
+
+networks:
+  default: {}
+  whatfunnels-edge:
+    external: true

@@ -28,9 +28,9 @@ class ProductResource extends Resource
     {
         $query = parent::getEloquentQuery();
 
-        // Superusers see all products, regular users only see products from their store
+        // Superusers see all products, regular users only see products from their tenant
         if (!Auth::user()?->is_super_admin) {
-            $query->where('store_id', Auth::user()?->store_id);
+            $query->where('tenant_id', Auth::user()?->tenant_id);
         }
 
         return $query;

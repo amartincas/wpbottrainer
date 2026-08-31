@@ -13,7 +13,7 @@ use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Illuminate\Support\Str;
 
-#[Fillable(['name', 'email', 'password', 'store_id', 'is_super_admin'])]
+#[Fillable(['name', 'email', 'password', 'tenant_id', 'is_super_admin'])]
 #[Hidden(['password', 'remember_token'])]
 
 class User extends Authenticatable implements FilamentUser
@@ -53,10 +53,10 @@ class User extends Authenticatable implements FilamentUser
     }
 
     /**
-     * Get the store this user belongs to
+     * Get the tenant this user belongs to
      */
-    public function store(): BelongsTo
+    public function tenant(): BelongsTo
     {
-        return $this->belongsTo(Store::class);
+        return $this->belongsTo(Tenant::class);
     }
 }

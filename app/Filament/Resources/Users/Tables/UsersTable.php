@@ -23,8 +23,8 @@ class UsersTable
                     ->searchable()
                     ->sortable()
                     ->copyable(),
-                TextColumn::make('store.name')
-                    ->label('Store Name')
+                TextColumn::make('tenant.name')
+                    ->label('Tenant Name')
                     ->searchable()
                     ->sortable(),
                 TextColumn::make('created_at')
@@ -36,9 +36,9 @@ class UsersTable
                     ->sortable(),
             ])
             ->filters([
-                SelectFilter::make('store_id')
-                    ->relationship('store', 'name')
-                    ->label('Store'),
+                SelectFilter::make('tenant_id')
+                    ->relationship('tenant', 'name')
+                    ->label('Tenant'),
                 SelectFilter::make('is_super_admin')
                     ->options([
                         1 => 'Super Admins',

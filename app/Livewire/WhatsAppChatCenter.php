@@ -2,9 +2,9 @@
 
 namespace App\Livewire;
 
-use App\Models\Lead;
+use App\Models\Contact;
 use App\Models\Conversation;
-use App\Models\Store;
+use App\Models\Tenant;
 use App\Models\WhatsAppMessage;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
@@ -24,9 +24,9 @@ class WhatsAppChatCenter extends Component
     public ?int $selectedConversationId = null;
     public bool $botActive = true;
     public string $newMessage = ''; // For text input field
-    public ?int $filterStoreId = null; // For superuser store filtering
-    public $stores = []; // Available stores for superuser filter
-    public ?int $selectedLeadId = null; // For JS modal
+    public ?int $filterTenantId = null; // For superuser tenant filtering
+    public $tenants = []; // Available tenants for superuser filter
+    public ?int $selectedContactId = null; // For JS modal
     public $whatsappTemplates = [];    // List templates
     public $messageStatuses = [];      // Message delivery statuses from cache
 
@@ -34,9 +34,9 @@ class WhatsAppChatCenter extends Component
     {
         $this->loadConversations();
         
-        // If superuser, load all stores for the filter dropdown
+        // If superuser, load all tenants for the filter dropdown
         if (Auth::user()?->is_super_admin) {
-            $this->stores = Store::all();
+            $this->tenants = Tenant::all();
         }
     }
 
@@ -50,8 +50,8 @@ class WhatsAppChatCenter extends Component
 
     /**
      * Load all conversations (unique customer phones) and messages for selected conversation
-     * CRITICAL: Must filter by store_id for multi-tenant safety
-     * EXCEPTION: Superusers see all stores (or filtered by $filterStoreId)
+     * CRITICAL: Must filter by tenant_id for multi-tenant safety
+     * EXCEPTION: Superusers see all tenants (or filtered by $filterTenantId)
      * ORDERS by most recent message for each conversation (newest first)
      */
     public function loadConversations()
@@ -59,16 +59,16 @@ class WhatsAppChatCenter extends Component
         try {
             $isSuperAdmin = Auth::user()?->is_super_admin ?? false;
             
-            // Determine which store(s) to query
-            if ($isSuperAdmin && $this->filterStoreId) {
+            // Determine which tenant(s) to query
+            if ($isSuperAdmin && $this->filterTenantId) {
                 // Superuser with filter applied
-                $storeId = $this->filterStoreId;
+                $tenantId = $this->filterTenantId;
             } elseif (!$isSuperAdmin) {
-                // Regular user - must use their store_id
-                $storeId = Auth::user()?->store_id;
+                // Regular user - must use their tenant_id
+                $tenantId = Auth::user()?->tenant_id;
                 
-                if (!$storeId) {
-                    Log::warning('loadConversations: store_id is null for non-admin user', [
+                if (!$tenantId) {
+                    Log::warning('loadConversations: tenant_id is null for non-admin user', [
                         'user_id' => Auth::id(),
                         'user_email' => Auth::user()?->email,
                     ]);
@@ -77,15 +77,15 @@ class WhatsAppChatCenter extends Component
                 }
             } else {
                 // Superuser without filter - see all
-                $storeId = null;
+                $tenantId = null;
             }
 
             // 1. Load conversations with the date of the last message
             $query = WhatsAppMessage::query();
             
-            // Apply store filter if needed
-            if ($storeId) {
-                $query->where('store_id', $storeId);
+            // Apply tenant filter if needed
+            if ($tenantId) {
+                $query->where('tenant_id', $tenantId);
             }
             
             $this->conversations = $query
@@ -97,8 +97,8 @@ class WhatsAppChatCenter extends Component
 
             Log::debug('loadConversations: Retrieved conversations', [
                 'is_super_admin' => $isSuperAdmin,
-                'store_id' => $storeId,
-                'filter_store_id' => $this->filterStoreId,
+                'tenant_id' => $tenantId,
+                'filter_tenant_id' => $this->filterTenantId,
                 'count' => count($this->conversations),
             ]);
 
@@ -107,9 +107,9 @@ class WhatsAppChatCenter extends Component
                 $messageQuery = WhatsAppMessage::query()
                     ->where('customer_phone', (string) $this->selectedPhone);
                 
-                // Apply store filter if needed
-                if ($storeId) {
-                    $messageQuery->where('store_id', $storeId);
+                // Apply tenant filter if needed
+                if ($tenantId) {
+                    $messageQuery->where('tenant_id', $tenantId);
                 }
                 
                 $queryMessages = $messageQuery
@@ -131,8 +131,8 @@ class WhatsAppChatCenter extends Component
             Log::error('loadConversations Error: ' . $e->getMessage(), [
                 'user_id' => Auth::id(),
                 'is_super_admin' => Auth::user()?->is_super_admin,
-                'store_id' => Auth::user()?->store_id,
-                'filter_store_id' => $this->filterStoreId,
+                'tenant_id' => Auth::user()?->tenant_id,
+                'filter_tenant_id' => $this->filterTenantId,
                 'selected_phone' => $this->selectedPhone,
                 'trace' => $e->getTraceAsString(),
             ]);
@@ -141,8 +141,8 @@ class WhatsAppChatCenter extends Component
 
     /**
      * Select a conversation and load its details
-     * Fetches bot_active status from leads table (works for both control records and marketing leads)
-     * For superusers, determine the store_id of the conversation
+     * Fetches bot_active status from contacts table (works for both control records and marketing leads)
+     * For superusers, determine the tenant_id of the conversation
      */
     public function selectConversation(string $phone): void
     {
@@ -154,43 +154,43 @@ class WhatsAppChatCenter extends Component
 
         $isSuperAdmin = Auth::user()?->is_super_admin ?? false;
         
-        if ($isSuperAdmin && !$this->filterStoreId) {
-            // Superuser without filter - need to find the store this conversation belongs to
+        if ($isSuperAdmin && !$this->filterTenantId) {
+            // Superuser without filter - need to find the tenant this conversation belongs to
             $firstMessage = WhatsAppMessage::query()
                 ->where('customer_phone', (string) $phone)
                 ->first();
             
             if ($firstMessage) {
-                $storeId = $firstMessage->store_id;
+                $tenantId = $firstMessage->tenant_id;
             }
-        } elseif ($this->filterStoreId) {
-            // Using filtered store
-            $storeId = $this->filterStoreId;
+        } elseif ($this->filterTenantId) {
+            // Using filtered tenant
+            $tenantId = $this->filterTenantId;
         } else {
             // Regular user
-            $storeId = Auth::user()?->store_id;
+            $tenantId = Auth::user()?->tenant_id;
         }
 
-        if ($storeId ?? false) {
+        if ($tenantId ?? false) {
             // Check if a control record or marketing lead exists for this phone
-            $lead = Lead::query()
-                ->where('store_id', $storeId)
+            $contact = Contact::query()
+                ->where('tenant_id', $tenantId)
                 ->where('customer_phone', (string) $phone)
                 ->first();
 
             // Store selected conversation id if one exists
             $conversation = Conversation::query()
-                ->where('store_id', $storeId)
+                ->where('tenant_id', $tenantId)
                 ->where('customer_phone', (string) $phone)
                 ->first();
 
             $this->selectedConversationId = $conversation?->id;
             // Fetch bot_active status, default to true if no record exists yet
-            $this->botActive = $lead?->bot_active ?? true;
-            // Store selected lead ID for JS modal (can be null if no lead record exists yet)
-            $this->selectedLeadId = $lead?->id;
-            // Load WhatsApp templates for this store (for manual template sending)
-            $this->whatsappTemplates = \App\Models\WhatsAppTemplate::where('store_id', $storeId)->get();
+            $this->botActive = $contact?->bot_active ?? true;
+            // Store selected contact ID for JS modal (can be null if no contact record exists yet)
+            $this->selectedContactId = $contact?->id;
+            // Load WhatsApp templates for this tenant (for manual template sending)
+            $this->whatsappTemplates = \App\Models\WhatsAppTemplate::where('tenant_id', $tenantId)->get();
         } else {
             $this->selectedConversationId = null;
         }
@@ -224,29 +224,29 @@ class WhatsAppChatCenter extends Component
 
         $isSuperAdmin = Auth::user()?->is_super_admin ?? false;
         
-        // Determine store_id for this message
-        if ($isSuperAdmin && !$this->filterStoreId) {
-            // Superuser without filter - find the store this conversation belongs to
+        // Determine tenant_id for this message
+        if ($isSuperAdmin && !$this->filterTenantId) {
+            // Superuser without filter - find the tenant this conversation belongs to
             $firstMessage = WhatsAppMessage::query()
                 ->where('customer_phone', $this->selectedPhone)
                 ->first();
             
             if ($firstMessage) {
-                $storeId = $firstMessage->store_id;
+                $tenantId = $firstMessage->tenant_id;
             } else {
-                Log::warning('sendMessage: Cannot determine store for superuser without existing messages');
+                Log::warning('sendMessage: Cannot determine tenant for superuser without existing messages');
                 return;
             }
-        } elseif ($this->filterStoreId) {
-            // Using filtered store
-            $storeId = $this->filterStoreId;
+        } elseif ($this->filterTenantId) {
+            // Using filtered tenant
+            $tenantId = $this->filterTenantId;
         } else {
             // Regular user
-            $storeId = Auth::user()?->store_id;
+            $tenantId = Auth::user()?->tenant_id;
         }
         
-        if (!$storeId) {
-            Log::warning('sendMessage: No store_id available');
+        if (!$tenantId) {
+            Log::warning('sendMessage: No tenant_id available');
             return;
         }
 
@@ -254,16 +254,16 @@ class WhatsAppChatCenter extends Component
             // 1. Save message to database (sent by operator)
             // CRITICAL: role='assistant' ensures bot maintains context when re-enabled
             $message = WhatsAppMessage::create([
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'customer_phone' => $this->selectedPhone,
                 'content' => $this->newMessage,
                 'role' => 'assistant', // ← Operator message treated as 'assistant' for AI context
             ]);
 
             // 2. Send via WhatsApp API
-            $store = Store::find($storeId);
-            if ($store) {
-                $wamid = WhatsAppService::sendMessage($this->selectedPhone, $this->newMessage, $store);
+            $tenant = Tenant::find($tenantId);
+            if ($tenant) {
+                $wamid = WhatsAppService::sendMessage($this->selectedPhone, $this->newMessage, $tenant);
                 
                 // 3. Track message status if WAMID was returned
                 if ($wamid) {
@@ -276,14 +276,14 @@ class WhatsAppChatCenter extends Component
                 }
                 
                 Log::info('Manual message sent via WhatsApp', [
-                    'store_id' => $storeId,
+                    'tenant_id' => $tenantId,
                     'customer_phone' => $this->selectedPhone,
                     'message_length' => strlen($this->newMessage),
                     'role' => 'assistant',  // Log that this will be in AI context
                     'wamid' => $wamid,
                 ]);
             } else {
-                Log::warning('sendMessage: Store not found', ['store_id' => $storeId]);
+                Log::warning('sendMessage: Tenant not found', ['tenant_id' => $tenantId]);
             }
 
             // 4. Clear input and refresh
@@ -294,7 +294,7 @@ class WhatsAppChatCenter extends Component
             $this->dispatch('scroll-down');
         } catch (\Exception $e) {
             Log::error('sendMessage: Failed to send message', [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'customer_phone' => $this->selectedPhone,
                 'error' => $e->getMessage(),
             ]);
@@ -303,9 +303,9 @@ class WhatsAppChatCenter extends Component
 
     /**
      * Handle bot_active toggle changes
-     * Creates bot control records in the leads table to decouple bot control from marketing leads
+     * Creates bot control records in the contacts table to decouple bot control from marketing leads
      * 
-     * IMPORTANT: The "leads" table serves TWO purposes:
+     * IMPORTANT: The "contacts" table serves TWO purposes:
      * 1. Bot Control Records: Any phone where operator toggled bot on/off (customer_name = 'Unknown')
      * 2. Marketing Leads: Completed conversations with customer data (customer_name = actual name)
      * 
@@ -314,31 +314,31 @@ class WhatsAppChatCenter extends Component
      */
     public function updatedBotActive(bool $value): void
     {
-        if (!$this->selectedPhone || !Auth::user()?->store_id) {
-            Log::warning('updatedBotActive: Missing phone or store_id');
+        if (!$this->selectedPhone || !Auth::user()?->tenant_id) {
+            Log::warning('updatedBotActive: Missing phone or tenant_id');
             return;
         }
 
         try {
-            $storeId = Auth::user()->store_id;
+            $tenantId = Auth::user()->tenant_id;
             
             // IMPORTANT: Cast value to boolean and log exactly what we're saving
             $botActiveValue = (bool) $value;
             
             Log::info('updatedBotActive: Toggle switch changed', [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'customer_phone' => $this->selectedPhone,
                 'raw_value' => $value,
                 'cast_value' => $botActiveValue,
                 'value_type' => gettype($value),
             ]);
             
-            // Create or update control record in leads table
+            // Create or update control record in contacts table
             // If this phone doesn't have a record yet, this creates a "bot control record"
             // identified by customer_name = 'Unknown'
-            $lead = Lead::updateOrCreate(
+            $contact = Contact::updateOrCreate(
                 [
-                    'store_id' => $storeId,
+                    'tenant_id' => $tenantId,
                     'customer_phone' => (string) $this->selectedPhone,
                 ],
                 [
@@ -349,10 +349,10 @@ class WhatsAppChatCenter extends Component
             );
 
             Log::info('Bot Active status toggled (control record)', [
-                'store_id' => $storeId,
+                'tenant_id' => $tenantId,
                 'customer_phone' => $this->selectedPhone,
-                'bot_active_saved' => $lead->bot_active,
-                'database_value' => (bool) $lead->bot_active,
+                'bot_active_saved' => $contact->bot_active,
+                'database_value' => (bool) $contact->bot_active,
             ]);
         } catch (\Exception $e) {
             Log::error('updatedBotActive: Failed to update status', [
@@ -364,23 +364,23 @@ class WhatsAppChatCenter extends Component
     }
 
     /**
-     * Handle store filter change for superusers
-     * Clears selected phone and reloads conversations with new store filter
+     * Handle tenant filter change for superusers
+     * Clears selected phone and reloads conversations with new tenant filter
      */
-    public function updatedFilterStoreId($value): void
+    public function updatedFilterTenantId($value): void
     {
         if (!Auth::user()?->is_super_admin) {
             return;
         }
 
-        $this->filterStoreId = (int) $value ?: null;
+        $this->filterTenantId = (int) $value ?: null;
         $this->selectedPhone = null;
         $this->messages = [];
         $this->loadConversations();
         
-        Log::info('Store filter changed by superuser', [
+        Log::info('Tenant filter changed by superuser', [
             'user_id' => Auth::id(),
-            'filter_store_id' => $this->filterStoreId,
+            'filter_tenant_id' => $this->filterTenantId,
         ]);
     }
 
@@ -402,30 +402,30 @@ class WhatsAppChatCenter extends Component
             $isExternalSend = true;
         }
 
-        if ($isSuperAdmin && !$this->filterStoreId) {
-            $storeId = $targetPhone
-                ? WhatsAppMessage::query()->where('customer_phone', $targetPhone)->value('store_id')
+        if ($isSuperAdmin && !$this->filterTenantId) {
+            $tenantId = $targetPhone
+                ? WhatsAppMessage::query()->where('customer_phone', $targetPhone)->value('tenant_id')
                 : null;
-        } elseif ($this->filterStoreId) {
-            $storeId = $this->filterStoreId;
+        } elseif ($this->filterTenantId) {
+            $tenantId = $this->filterTenantId;
         } else {
-            $storeId = Auth::user()?->store_id;
+            $tenantId = Auth::user()?->tenant_id;
         }
 
-        if (!$storeId) {
-            Log::warning('sendTemplate: store_id could not be resolved', ['selected_phone' => $this->selectedPhone, 'external_phone' => $externalPhone]);
+        if (!$tenantId) {
+            Log::warning('sendTemplate: tenant_id could not be resolved', ['selected_phone' => $this->selectedPhone, 'external_phone' => $externalPhone]);
             $this->dispatch('template-sent-error');
             return;
         }
 
-        $store = Store::find($storeId);
-        if (!$store) {
+        $tenant = Tenant::find($tenantId);
+        if (!$tenant) {
             $this->dispatch('template-sent-error');
             return;
         }
 
         $template = \App\Models\WhatsAppTemplate::where('id', $templateId)
-            ->where('store_id', $storeId)
+            ->where('tenant_id', $tenantId)
             ->firstOrFail();
 
         if ($template->requires_phone_input && !$isExternalSend) {
@@ -441,22 +441,22 @@ class WhatsAppChatCenter extends Component
             return;
         }
 
-        $lead = Lead::where('customer_phone', $targetPhone)
-            ->where('store_id', $storeId)
+        $contact = Contact::where('customer_phone', $targetPhone)
+            ->where('tenant_id', $tenantId)
             ->first();
 
         if ($isExternalSend) {
-            $lead = Lead::firstOrCreate(
-                ['store_id' => $storeId, 'customer_phone' => $targetPhone],
+            $contact = Contact::firstOrCreate(
+                ['tenant_id' => $tenantId, 'customer_phone' => $targetPhone],
                 ['customer_name' => 'Unknown', 'summary' => 'Proactive message', 'bot_active' => false]
             );
         }
 
         $parametersMap = $template->parameters_map ?? [];
         $leadData = [
-            'customer_name'  => $lead?->customer_name  ?? '',
-            'customer_phone' => $lead?->customer_phone ?? '',
-            'product_service_name'   => $lead?->product_service_name   ?? '',
+            'customer_name'  => $contact?->customer_name  ?? '',
+            'customer_phone' => $contact?->customer_phone ?? '',
+            'product_service_name'   => $contact?->product_service_name   ?? '',
         ];
 
         Log::info('DEBUG sendTemplate', [
@@ -481,7 +481,7 @@ class WhatsAppChatCenter extends Component
         Log::info('DEBUG resolvedValues', ['resolvedValues' => array_values($resolvedValues)]);
 
         $conversation = Conversation::firstOrCreate([
-            'store_id' => $storeId,
+            'tenant_id' => $tenantId,
             'customer_phone' => $targetPhone,
         ], [
             'last_session_at' => now(),
@@ -495,7 +495,7 @@ class WhatsAppChatCenter extends Component
             templateName: $template->name,
             languageCode: $template->language,
             variables:    array_values($resolvedValues),
-            store:        $store,
+            tenant:       $tenant,
         );
 
         if ($sent) {
@@ -506,7 +506,7 @@ class WhatsAppChatCenter extends Component
             }
 
             $message = WhatsAppMessage::create([
-                'store_id'       => $storeId,
+                'tenant_id'       => $tenantId,
                 'customer_phone' => $targetPhone,
                 'content'        => $renderedBody,
                 'role'           => 'assistant',
@@ -528,8 +528,8 @@ class WhatsAppChatCenter extends Component
                 ->success()
                 ->send();
 
-            if ($template->is_reengagement && $lead) {
-                $lead->update(['status' => 'waiting_customer', 'bot_active' => true]);
+            if ($template->is_reengagement && $contact) {
+                $contact->update(['status' => 'waiting_customer', 'bot_active' => true]);
             }
 
             $this->selectConversation($targetPhone);

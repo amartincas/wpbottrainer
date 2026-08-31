@@ -21,9 +21,9 @@ return new class extends Migration
         Schema::create('whatsapp_templates', function (Blueprint $table) {
             $table->id();
 
-            // Multi-tenant: every template belongs to exactly one store
-            $table->foreignId('store_id')
-                  ->constrained('stores')
+            // Multi-tenant: every template belongs to exactly one tenant
+            $table->foreignId('tenant_id')
+                  ->constrained('tenants')
                   ->cascadeOnDelete();
 
             // Technical name registered in Meta Business Manager
@@ -54,13 +54,13 @@ return new class extends Migration
 
             $table->timestamps();
 
-            // A store cannot register two templates with the same Meta name.
+            // A tenant cannot register two templates with the same Meta name.
             // Meta itself enforces uniqueness per WABA, but we mirror it here
             // for data integrity and to simplify lookup queries.
-            $table->unique(['store_id', 'name']);
+            $table->unique(['tenant_id', 'name']);
 
-            // Index for frequent query: fetch all templates for a given store
-            $table->index('store_id');
+            // Index for frequent query: fetch all templates for a given tenant
+            $table->index('tenant_id');
         });
     }
 

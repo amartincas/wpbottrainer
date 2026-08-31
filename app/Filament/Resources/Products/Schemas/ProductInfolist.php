@@ -11,8 +11,8 @@ class ProductInfolist
     {
         return $schema
             ->components([
-                TextEntry::make('store.name')
-                    ->label('Store'),
+                TextEntry::make('tenant.name')
+                    ->label('Tenant'),
                 TextEntry::make('name'),
                 TextEntry::make('description')
                     ->columnSpanFull(),

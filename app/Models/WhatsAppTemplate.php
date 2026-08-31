@@ -10,7 +10,7 @@ class WhatsAppTemplate extends Model
     protected $table = 'whatsapp_templates';
     
     protected $fillable = [
-        'store_id',
+        'tenant_id',
         'name',
         'body_preview',
         'parameters_map',
@@ -26,8 +26,8 @@ class WhatsAppTemplate extends Model
         'requires_phone_input' => 'boolean',
     ];
 
-    public function store(): BelongsTo
+    public function tenant(): BelongsTo
     {
-        return $this->belongsTo(Store::class);
+        return $this->belongsTo(Tenant::class);
     }
 }

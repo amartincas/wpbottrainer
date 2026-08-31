@@ -13,14 +13,14 @@ return new class extends Migration
     {
         Schema::create('whatsapp_messages', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('store_id')->constrained()->onDelete('cascade');
+            $table->foreignId('tenant_id')->constrained()->onDelete('cascade');
             $table->string('customer_phone');
             $table->enum('role', ['user', 'assistant']);
             $table->text('content');
             $table->timestamps();
 
             // Index for fast history lookups
-            $table->index(['store_id', 'customer_phone']);
+            $table->index(['tenant_id', 'customer_phone']);
         });
     }
 

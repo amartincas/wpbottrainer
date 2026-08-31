@@ -1,0 +1,128 @@
+name: wpbottrainer
+
+services:
+  # Job de arranque, no un servicio permanente: corre "migrate --force" una
+  # sola vez y termina (exit 0). No tiene "restart" ni healthcheck — su
+  # única señal es su código de salida. "app" y "queue" dependen de que
+  # termine con éxito (service_completed_successfully) antes de arrancar,
+  # así el esquema (incluida la tabla "cache" que exige QUEUE_CONNECTION=
+  # database) ya existe cuando ellos hacen su primera consulta. Elimina el
+  # crash-loop de "queue" sin introducir Redis ni ningún servicio nuevo:
+  # reutiliza la misma imagen "app", solo con otro comando.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: wpbottrainer-app:latest
+    env_file: .env
+    volumes:
+      - ./.env:/var/www/html/.env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    command: ["php", "artisan", "migrate", "--force"]
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: wpbottrainer-app:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Solo "app" la necesita: es la única que sirve el disco "public"
+      # (imágenes subidas desde el panel Filament, ej. Products). El disco
+      # "local" que usa Ingest para audio (descarga → transcribe → borra)
+      # es estrictamente transitorio dentro de un mismo job de "queue" —
+      # no se comparte entre contenedores ni necesita persistir.
+      - storage_data:/var/www/html/storage/app
+      - ./.env:/var/www/html/.env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: nginx
+    image: wpbottrainer-nginx:latest
+    restart: unless-stopped
+    ports:
+      # Mapeo directo al host solo para poder verificar el sitio (curl
+      # localhost:${APP_PORT}) sin depender de que NPM/DNS ya estén
+      # configurados. Puerto por defecto 8082 (wpbotreserva ya usa 8081 en
+      # este mismo VPS) — cambiar si choca con algo más.
+      - "${APP_PORT:-8082}:80"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/up"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE:-wpbottrainer}
+      MARIADB_USER: ${DB_USERNAME:-wpbottrainer}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-wpbottrainer}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-wpbottrainer_root}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # No hay contenedor "redis": QUEUE_CONNECTION y CACHE_STORE son "database"
+  # por defecto (ver .env.example) y no existe ningún uso de Redis::/
+  # Cache::store('redis') en el código. Agregarlo hoy sería un contenedor sin
+  # consumidor real. Si en el futuro se introduce un caso de uso que lo
+  # justifique (colas de alto volumen, cache compartido, etc.), se añade
+  # entonces como su propio cambio documentado.
+
+  queue:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: wpbottrainer-app:latest
+    restart: unless-stopped
+    env_file: .env
+    command: ["php", "artisan", "queue:work", "--tries=3", "--timeout=120", "--sleep=1"]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'queue:work' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # No hay contenedor "scheduler": routes/console.php no define ningún
+  # Schedule::command(); el único comando registrado es "inspire" (el de
+  # ejemplo de Laravel). Un `schedule:work` hoy no tendría nada que
+  # ejecutar. Se añade en el momento en que exista una tarea programada real.
+
+volumes:
+  mariadb_data:
+  storage_data:

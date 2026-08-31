@@ -16,8 +16,8 @@ use Illuminate\Support\Facades\Route;
 
 // ── Public webhook routes (no auth — Meta calls these directly) ─────────────
 Route::prefix('whatsapp')->group(function () {
-    Route::get('/webhook/{store_token}',  [WhatsAppController::class, 'verify']);
-    Route::post('/webhook/{store_token}', [WhatsAppController::class, 'handle']);
+    Route::get('/webhook/{tenant_token}',  [WhatsAppController::class, 'verify']);
+    Route::post('/webhook/{tenant_token}', [WhatsAppController::class, 'handle']);
 });
 
 
