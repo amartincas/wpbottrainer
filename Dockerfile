@@ -43,15 +43,18 @@ RUN npm run build
 #                 (ext-intl en composer.lock)
 #   - zip       : requerida por phpoffice/phpspreadsheet u otra dependencia
 #                 con "ext-zip" como require duro (composer.lock)
+#   - bcmath    : requerida por App\Payments\Support\PaymentValidationService
+#                 (bccomp() para comparar montos monetarios con precisión
+#                 decimal exacta, sin errores de redondeo de float) — Hito 8.
+#                 Declarada como "ext-bcmath" en composer.json (require duro).
 # NO se instala "redis": no hay ningún consumidor real (QUEUE_CONNECTION y
 # CACHE_STORE son "database" por defecto; sin Redis::/Cache::store('redis')
-# en el código). NO se instala "bcmath": no aparece como require duro de
-# ningún paquete en composer.lock para este proyecto.
+# en el código).
 FROM php:8.4-fpm-alpine AS php-base
 RUN apk add --no-cache \
         icu-dev libzip-dev oniguruma-dev fcgi \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
-    && docker-php-ext-install pdo_mysql intl zip \
+    && docker-php-ext-install pdo_mysql intl zip bcmath \
     && apk del .build-deps
 
 COPY docker/php/fpm-healthcheck.conf /usr/local/etc/php-fpm.d/zz-healthcheck.conf
