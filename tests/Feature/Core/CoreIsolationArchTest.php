@@ -24,6 +24,10 @@ arch('App\Core does not depend on the Training domain (Hito 4)')
     ->expect('App\Core')
     ->not->toUse('App\Training');
 
+arch('App\Core does not depend on the Payments domain (Hito 8) — CustomerNotifier stays event-agnostic')
+    ->expect('App\Core')
+    ->not->toUse('App\Payments');
+
 arch('App\Core does not depend on the legacy ecommerce catalog')
     ->expect('App\Core')
     ->not->toUse([

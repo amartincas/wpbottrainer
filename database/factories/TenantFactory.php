@@ -34,6 +34,14 @@ class TenantFactory extends Factory
             'wa_phone_number_id' => (string) fake()->unique()->numerify('##########'),
             'wa_business_account_id' => (string) fake()->numerify('##########'),
             'wa_verify_token' => Str::random(32),
+            'currency' => 'COP',
+            'country' => 'CO',
+            'monthly_price' => 50000,
+            'payment_instructions' => 'Incluye tu número de WhatsApp como referencia.',
+            'nequi_number' => (string) fake()->numerify('3##-###-####'),
+            'daviplata_number' => null,
+            'gateway_provider' => null,
+            'gateway_config' => null,
         ];
     }
 }

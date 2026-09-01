@@ -2,9 +2,15 @@
 
 namespace App\Filament\Resources\Contacts\Tables;
 
+use App\Models\Contact;
+use App\Models\User;
+use App\Training\Enums\SafetyStatus;
+use Filament\Actions\Action;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
+use Filament\Forms\Components\Textarea;
+use Filament\Notifications\Notification;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\ToggleColumn;
 use Filament\Tables\Filters\SelectFilter;
@@ -59,6 +65,30 @@ class ContactsTable
             ->defaultSort('created_at', 'desc')
             ->recordActions([
                 EditAction::make(),
+
+                // Hito 7.1 (propuesto) / Hito 8 (implementado): única forma
+                // de desbloquear un TrainingProfile flagged_for_review —
+                // siempre un humano autorizado, con nota obligatoria, nunca
+                // el LLM ni automático. Ver TrainingProfile::clearSafetyFlag().
+                Action::make('reviewSafety')
+                    ->label('Revisar seguridad')
+                    ->color('warning')
+                    ->icon('heroicon-o-shield-exclamation')
+                    ->visible(fn (Contact $record): bool => Auth::user()?->is_super_admin
+                        && $record->trainingProfile?->safety_status === SafetyStatus::FlaggedForReview)
+                    ->requiresConfirmation()
+                    ->schema([
+                        Textarea::make('note')
+                            ->label('Observación (obligatoria) — por qué es seguro que continúe')
+                            ->required(),
+                    ])
+                    ->action(function (Contact $record, array $data): void {
+                        /** @var User $user */
+                        $user = Auth::user();
+                        $record->trainingProfile?->clearSafetyFlag($user, $data['note']);
+
+                        Notification::make()->title('Perfil desbloqueado')->success()->send();
+                    }),
             ])
             ->toolbarActions([
                 BulkActionGroup::make([

@@ -321,6 +321,169 @@ Se consultó al usuario antes de proceder (no se decidió unilateralmente cómo 
 
 ---
 
+### D024 — AlertService (Hito 7.1): infraestructura transversal de Core para notificar eventos operativos, desacoplada del canal de entrega
+
+**CONTEXTO**: el cierre del Hito 7 dejó documentada la necesidad de un mecanismo para avisar a un humano (superadmin) ante eventos críticos — inicialmente para Safety, y pensado explícitamente para reutilizarse en Payments (Hito 8: "Pago #23 pendiente de verificación") y en futuros errores operativos de Meta/IA/Queue/Infraestructura. El requisito explícito: `PaymentHandler` (y cualquier otro dominio) nunca debe saber que existe WhatsApp ni a qué número mandar — solo describe *qué pasó*; algo más resuelve *cómo* y *a quién* llega.
+
+**PROBLEMA**: sin este mecanismo, cada dominio que necesite alertar tendría que acoplarse directamente a `WhatsAppService` y conocer el destinatario — el mismo tipo de acoplamiento que el patrón Router/Dispatcher/ContextBuilder/PreRoutingScreener ya evita para clasificación de intents, memoria y screening de seguridad.
+
+**ALTERNATIVAS**:
+1. Cada dominio llama a `WhatsAppService` directamente — descartada explícitamente por el requisito de origen.
+2. Usar `Event::dispatch()` de Laravel — descartada: perdería la resolución explícita de canal por severidad/categoría y añadiría un segundo patrón de extensibilidad paralelo al ya establecido en el proyecto (Container-resuelto vía `AppServiceProvider`), sin necesidad real.
+3. **Elegida**: `App\Core\Alerts\{Alert,AlertSeverity,AlertChannelInterface,AlertService}` — mismo patrón Container-resuelto que `Router`/`Dispatcher`/`ContextBuilder`/`PreRoutingScreener`, pero con **fan-out** (todos los canales que "soportan" la alerta la reciben, no solo el primero — a diferencia de los otros cuatro mecanismos, que se detienen en el primer resultado, porque una alerta sí puede tener sentido en varios canales a la vez: WhatsApp **y** un registro persistido).
+
+**Destinatario y emisor** (dos decisiones explícitas, consultadas antes de implementar):
+- **Destinatario**: `User.is_super_admin = true` con `User.phone` configurado (campo nuevo, mínimo necesario — `users` no tenía ningún teléfono). `is_super_admin` ya era, por diseño previo, un rol **global** de plataforma (confirmado por auditoría: no depende de `tenant_id`) — el destinatario no se filtra por tenant.
+- **Emisor**: el número de WhatsApp Business del **Tenant que originó la alerta** (`Alert::context['tenant_id']`) — reutiliza la infraestructura Meta ya configurada por tenant, sin crear un número de "operaciones" dedicado (decisión explícita: no agregar costo/infraestructura nueva para esto). **Límite conocido y documentado**: una alerta sin `tenant_id` resoluble (ej. un futuro error de Queue/Infraestructura sin tenant asociado) no se entrega por WhatsApp en este primer corte — solo queda persistida.
+
+**Canales implementados** (solo 2, explícitamente sin email/push todavía):
+- `PersistedAlertChannel`: siempre persiste en `alert_logs` (tabla nueva, durable — resuelve además la deuda de "logs efímeros" del cierre del Hito 7, sin convertirse en un log general de toda la aplicación).
+- `WhatsAppAdminAlertChannel`: solo severidad `Warning`/`Critical` (una `Info` no justifica interrumpir a un humano), con throttling básico (cache con TTL de 5 minutos por combinación categoría+severidad+mensaje — explícitamente **no** un sistema de deduplicación global, solo evitar tormentas de alertas idénticas).
+
+**Seguridad del contexto**: `Alert` sanea su propio `context` en el constructor — cualquier clave cuyo nombre contenga `key`/`token`/`password`/`secret`/`credential` (insensible a mayúsculas) se reemplaza por `'[REDACTED]'` antes de que **cualquier** canal la vea. Es una defensa sistémica (a nivel del DTO, no solo disciplina en cada punto de emisión) — un dominio no puede filtrar un secreto por accidente aunque lo incluya en el contexto.
+
+**Garantía de aislamiento de fallos** (explícitamente pedida): `AlertService::send()` envuelve cada canal en su propio `try/catch` — un canal roto nunca se propaga ni a otros canales ni al proceso que originó la alerta. Adicionalmente, `TrainingHandler::emitSafetyAlert()` envuelve la llamada a `AlertService` en un segundo `try/catch` como defensa en profundidad: el bloqueo de seguridad (`flagForSafetyReview()` + mensaje de escalamiento al usuario) se ejecuta siempre, incluso si `AlertService` fallara de una forma totalmente inesperada.
+
+**Integración con Safety** (único dominio conectado en este hito, cambio mínimo): los dos puntos donde `TrainingHandler` ya llamaba `flagForSafetyReview()` ahora también llaman a `emitSafetyAlert()` inmediatamente después — `category: 'safety'`, `severity: Critical`, contexto con `tenant_id`/`contact_id`/`customer_phone`/`reason`. Ningún otro archivo de Training fue tocado.
+
+**DECISIÓN TOMADA**: implementación completa de `AlertService` + los 2 canales + integración con Safety, según el detalle anterior. Payments, email/push, y un sistema genérico de notificaciones de usuario quedan **explícitamente fuera de alcance** de este hito.
+
+**JUSTIFICACIÓN**: el mecanismo replica exactamente el patrón arquitectónico ya validado 4 veces en este proyecto, minimizando la superficie nueva de aprendizaje/mantenimiento. Resolver el emisor/destinatario sin inventar infraestructura nueva (número de operaciones, sistema de roles) mantiene el cambio mínimo, coherente con "cambio acotado" pedido explícitamente.
+
+**IMPACTO**: `app/Core/Alerts/{Alert,AlertSeverity,AlertChannelInterface,AlertService}.php` (nuevos), `app/Core/Alerts/Channels/{PersistedAlertChannel,WhatsAppAdminAlertChannel}.php` (nuevos), `app/Models/AlertLog.php` (nuevo), `database/migrations/2026_08_31_000002_add_phone_to_users_table.php` y `..._000003_create_alert_logs_table.php` (nuevas), `app/Models/User.php` (campo `phone`), `app/Providers/AppServiceProvider.php` (wiring), `app/Training/Handlers/TrainingHandler.php` (`emitSafetyAlert()` + dependencia `AlertService`). 20 tests nuevos (`AlertTest`, `AlertServiceTest`, `PersistedAlertChannelTest`, `WhatsAppAdminAlertChannelTest`, `SafetyAlertIntegrationTest`). Cero regresiones: 173 passed vs. 153 antes, mismos 22 fallos heredados de Fortify/Vite. `CoreIsolationArchTest.php` sigue en verde sin modificarlo — su expectativa genérica (`App\Core` no depende de `App\Training`/`App\Handlers`) ya cubre el nuevo namespace `App\Core\Alerts` automáticamente.
+
+**RIESGOS**:
+- Alertas sin `tenant_id` resoluble en su contexto no se entregan por WhatsApp — cuando se conecten Queue/Infraestructura (fuera de este hito), habrá que decidir qué hacer con alertas verdaderamente sin tenant (ej. un tenant "de plataforma" ficticio, o aceptar que esas solo queden persistidas).
+- El throttling es deliberadamente básico (cache con TTL, sin persistencia propia) — se pierde si el cache se limpia, y no coordina entre distintos procesos/workers más allá de lo que ya ofrece el driver de cache configurado.
+- `PersistedAlertChannel` no registra si `WhatsAppAdminAlertChannel` realmente entregó el mensaje (los canales son independientes, sin coordinación) — `delivery_status` en `alert_logs` hoy solo significa "esta fila se guardó", no "un humano fue notificado". Documentado como límite explícito, no un descuido.
+
+---
+
+### D025 — Hito 8: Payments (flujo manual Nequi/Daviplata) + Safety Review, sin tocar TrainingAccessGate/TrainingEngine
+
+**CONTEXTO**: primer hito de monetización. Alcance aprobado explícitamente: solo el camino manual (comprobante por WhatsApp → IA extrae → código valida → humano confirma/rechaza), preparando la estructura para que una pasarela futura reutilice el mismo punto de decisión sin un sistema paralelo. Se implementó también, en el mismo hito, el Safety Review/Desbloqueo propuesto en el Hito 7.1 (nunca antes construido), para compartir una única convención de "revisión humana".
+
+**Verificación de visión, antes de escribir código** (punto explícitamente pedido): se probó empíricamente, con una imagen de prueba real (monto/referencia/fecha generados con GD) y las keys reales ya configuradas, si algún proveedor YA soportado podía leerla — sin asumir nada:
+- **OpenAI (`gpt-4o-mini`, ya el default de chat)**: HTTP 200, leyó monto y referencia correctamente.
+- **Grok (`grok-4.20-0309-non-reasoning`, distinto del default de chat `grok-build-0.1`)**: HTTP 200, leyó monto y referencia correctamente.
+- **Gemini**: sin key real disponible en ningún Tenant existente — implementado siguiendo el formato documentado de su API (mismo endpoint `generateContent` ya usado por `getResponse()`), pero **no verificado empíricamente**. Documentado así explícitamente en el código (`GeminiService::analyzeImage()`) y en los tests.
+
+Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar uno sin comprobar que hiciera falta.
+
+**Conflicto identificado en la auditoría, antes de tocar código**: `WhatsAppService::downloadMedia()` solo reconocía extensiones de audio (mpeg/mp3/mp4/ogg) — una imagen se habría guardado con extensión `.ogg` por el fallback por defecto (el contenido seguía siendo correcto, la extensión engañaba). Corregido con una extensión mínima y aditiva (jpeg/png/webp), sin cambiar el comportamiento para audio.
+
+**Corrección a la propuesta de diseño original**: el diseño previo (ver conversación previa a este hito) proponía extender `Ingest` (Core) para "reconocer" mensajes tipo `image`. La auditoría real mostró que **no hace falta ningún cambio en `Ingest`**: `IngestedMessage` ya transporta `messageType`/`mediaId` genéricamente para cualquier tipo de mensaje (el audio es el único caso que Core intercepta activamente, porque necesita convertirlo a texto ANTES de que el Router pueda clasificar). Para imágenes, el Router ya recibe el mensaje sin problema; es `PaymentHandler` quien decide descargar el media cuando le corresponde — exactamente la frontera Core-mecanismo/Domain-contenido ya establecida. Se documenta esta corrección explícitamente para no repetir la asunción.
+
+**Modelo de datos — decisiones**:
+- `Payment` sin `tenant_id` propio (se alcanza vía `Contact`, mismo precedente de `TrainingProfile`/`WorkoutSession`/`TrainingAccess`).
+- `PaymentReceipt` separada de `Payment` (aprobado) — un intento por fila, mismo motivo de granularidad que separó `ExerciseLog`/`ExerciseSet` en el Hito 4.
+- `TrainingAccess` solo gana `payment_id` (nullable) — `TrainingAccessGate`/`TrainingEngine` no se tocaron en absoluto. El propio código de `SafetySignalDetector` (Hito 4) ya anticipaba este momento: *"cuando el hito de Payments llegue, solo cambia lo que hay dentro de este método"* — se cumplió literalmente.
+- `TrainingProfile` gana `safety_reviewed_by`/`safety_reviewed_at`/`safety_review_note` — mismo shape que `Payment.reviewed_by/reviewed_at/review_note`, una sola convención de revisión humana en todo el proyecto. `flagForSafetyReview()` ahora resetea esos tres campos al volver a marcar (una señal nueva invalida cualquier revisión anterior). `clearSafetyFlag()` pasa a exigir `(User $reviewer, string $note)` — ya no puede llamarse sin un humano identificado.
+- `Tenant` gana la configuración de pagos (`currency`, `country`, `monthly_price`, `payment_instructions`, `nequi_number`, `daviplata_number`, `gateway_provider`, `gateway_config` cifrado) — nada hardcodeado a Colombia en el dominio Payments.
+- `PaymentMethodType` (enum cerrado: `ManualTransfer`|`Gateway`) + `Payment.method_label` (string libre) — mismo patrón ya usado en `AlertSeverity`/`Alert.category`.
+
+**Router/Handler**: `Intent::Payment` (nuevo, mismo tratamiento que `Intent::Training` en Hito 5) + `PaymentIntentClassifier` (palabras clave + "hay un Payment abierto", igual patrón que `hasPendingWorkoutSession()`) + `PaymentHandler` único con 4 subflujos internos (`payment_options`/`payment_instructions`/`receipt_submission`/`payment_status`) — nunca un Handler por método de pago.
+
+**El único camino a `TrainingAccess`**: `App\Payments\Support\PaymentConfirmationService::confirm()`, invocado exclusivamente desde la acción "Confirmar" de `PaymentResource` (Filament, `is_super_admin`-gated). `PaymentHandler` no importa `TrainingAccess` en absoluto — verificado con un arch test dedicado (`PaymentIsolationArchTest.php`), no solo por revisión manual. `confirm()` acepta un `?User $reviewer` (nullable) a propósito: hoy siempre es un humano, pero la misma firma debe servir sin cambios el día que un webhook de pasarela real sea la autoridad automática (Hito futuro, no implementado aquí).
+
+**Renovación sin `Subscription`**: cada `Payment` confirmado extiende `TrainingAccess.expires_at` en 1 mes, desde el vencimiento actual si sigue vigente (no se pierden días ya pagados) o desde `now()` si ya venció — sin ninguna entidad nueva, reutilizando campos que `TrainingAccess` ya tenía desde el Hito 4.
+
+**Seguridad de la extracción**: `ReceiptExtractionService` (Extract) solo puede devolver valores presentes en el comprobante o `null` — nunca decide si el pago es válido. `PaymentValidationService` (Decide, determinista, sin IA) solo produce `validation_flags` (`amount_mismatch`, `amount_unreadable`, `reference_missing`, `reference_already_used` —control global de duplicados contra pagos ya `Confirmed`—, `stale_receipt`, `date_unreadable`, `uncertain_extraction`) — nunca confirma ni rechaza. La decisión final es siempre humana.
+
+**DECISIÓN TOMADA**: implementación completa según el detalle anterior — `Payment`, `PaymentReceipt`, `PaymentIntentClassifier`, `PaymentHandler`, `ReceiptExtractionService`, `PaymentValidationService`, `PaymentConfirmationService`, `PaymentResource` (Filament, sin páginas de crear/editar — un Payment nunca se edita a mano), configuración de Payments en `Tenant`, `TrainingAccess.payment_id`, Safety Review (`TrainingProfile` + acción en `ContactsTable`), integración con `AlertService` (`severity: Warning` para pagos, sin cambios en `AlertService`/canales).
+
+**JUSTIFICACIÓN**: cada pieza reutiliza un patrón ya validado en este proyecto (Extract→Decide→Narrate, Container-resuelto para Router/Dispatcher, `TrainingAccess` como única frontera, `AlertService` para notificación desacoplada) — el riesgo del hito es bajo precisamente porque no introduce ningún mecanismo nuevo, solo aplica los existentes a un dominio nuevo.
+
+**IMPACTO**: 5 migraciones nuevas, `App\Payments\{Enums,Support,Handlers}\*` (dominio nuevo), `App\Models\{Payment,PaymentReceipt}` (nuevos), `App\Models\{Tenant,Contact,TrainingAccess,TrainingProfile,User}` (extendidos), `App\Contracts\AiServiceInterface`+3 implementaciones (`analyzeImage()`), `WhatsAppService::downloadMedia()` (extensión de imagen), `App\Filament\Resources\Payments\*` (nuevo), `App\Filament\Resources\Contacts\Tables\ContactsTable.php` (acción Safety Review), `AppServiceProvider` (wiring). 44 tests nuevos netos. Cero regresiones (217 passed vs. 173 antes, mismos 22 fallos heredados) — 1 test existente (`TrainingAccessTest`, guardrail de columnas exactas) actualizado deliberadamente para reflejar `payment_id`, no una regresión real.
+
+**RIESGOS**:
+- Gemini vision no verificado con key real — no activar `ai_provider: gemini` para un Tenant que reciba comprobantes de imagen sin probarlo primero.
+- No se automatizó ningún test de la capa Filament (Resources/Actions) — sin precedente en este proyecto para ese tipo de test; la lógica real (`PaymentConfirmationService`, `TrainingProfile::clearSafetyFlag()`) sí está cubierta a nivel de servicio/modelo, pero la UI en sí (visibilidad condicional de los botones, el modal, el guard `is_super_admin` en el navegador real) solo se verificó por revisión manual del código, no por un test automatizado ni por un click-through real todavía.
+- Antifraude deliberadamente mínimo (ver alcance aprobado) — un comprobante manipulado con Photoshop pasaría la validación determinista; el único control real es que el humano siempre ve el comprobante original.
+- El emisor de las alertas de WhatsApp (Tenant del contexto) significa que una alerta sin `tenant_id` resoluble no se entrega por WhatsApp — mismo límite ya documentado en D024, ahora también aplica a Payments si alguna vez se emitiera una alerta de pago sin contexto de tenant (no debería ocurrir en el flujo actual, donde siempre hay un Payment con Contact real).
+
+---
+
+### D026 — Hito 5.1: Extract + Narrate del onboarding fusionados en una sola llamada de IA
+
+**CONTEXTO**: durante el E2E real del Hito 8, se observó que cada turno de onboarding incompleto tardaba 30-45 segundos — causa raíz identificada: `TrainingHandler` hacía 2 llamadas secuenciales a IA por turno (`OnboardingConversationService::extractFields()` luego, condicionalmente, `nextQuestion()`). En la misma prueba se encontró un segundo defecto real: el prompt de extracción pedía llenar `safety_signal_text` ante *"dolor, lesión, síntoma o condición médica"* — demasiado amplio, causando que respuestas normales como *"dolor en las rodillas"* no completaran `restrictions` (probablemente el modelo las clasificaba solo como señal de seguridad, sin llenar también el arreglo de restricciones).
+
+**PROBLEMA**: latencia mala para WhatsApp (dos round-trips HTTP completos por turno) y una separación ambigua entre "limitación física normal" y "señal de alarma" en el prompt.
+
+**ALTERNATIVAS**: ver el diseño previo a esta decisión (propuesta Hito 5.1) — se evaluaron mantener 2 llamadas, confiar ciegamente en la fusión, y un banco de frases fijas sin IA para narrar. Se eligió fusionar con verificación determinista de una señal de estado (opción C del diseño).
+
+**DECISIÓN TOMADA**:
+1. `OnboardingConversationService::extractFields()` + `nextQuestion()` se fusionan en `extractAndRespond()` — una sola llamada de IA que devuelve `{extracted: {...}, next_action, response}`. `extracted.*` conserva EXACTAMENTE las mismas reglas de validación de antes (enum whitelist, array de strings, rango 1-14) — cero cambios ahí.
+2. El prompt de extracción se corrige a la vez (mismo cambio, un solo prompt nuevo): `restrictions` y `safety_signal_text` quedan explícitamente declarados como independientes, con un ejemplo concreto (*"tengo dolor en las rodillas"* → `restrictions: [...]`, `safety_signal_text: null`), y `safety_signal_text` se acota a las mismas categorías reales que ya reconoce `SafetySignalDetector` (dolor de pecho, dificultad para respirar, desmayo, cirugía reciente, entumecimiento severo, lesión grave repentina, embarazo de riesgo) en vez de "cualquier mención de dolor".
+3. `next_action` (uno de 5 valores `ask_*` + `complete_onboarding`) es **una señal, nunca una autoridad**: `OnboardingConversationService::resolveQuestion(string $realMissingField, ?string $aiNextAction, ?string $aiResponse): string` compara `$aiNextAction` contra `NEXT_ACTION_MAP[$realMissingField]` (tabla fija, código) — si coinciden Y `$aiResponse` es utilizable (no vacío, ≤300 caracteres), se usa la redacción de la IA; en cualquier otro caso (incluida una IA que devuelva `complete_onboarding` cuando en realidad falta algo) se usa `FALLBACK_QUESTIONS` (ya existente, sin cambios). `TrainingProfile::firstMissingOnboardingField()`/`isOnboardingComplete()` siguen siendo la única autoridad real — sin cambios.
+4. `TrainingHandler::handle()`: el bloque de onboarding pasa de 2 llamadas al servicio a 1, más la verificación determinista de `next_action` vía `resolveQuestion()`. Ninguna otra responsabilidad del Handler cambió — Router, TrainingEngine, ContextBuilder, `SafetySignalDetector` sin tocar.
+5. Métricas nuevas (`Log::info('ONBOARDING_TURN_METRICS', ...)`): `ai_call_elapsed_ms`, `ai_calls_count` (siempre 1 ahora), `used_ai_response` (bool) — para comparar objetivamente contra la línea base de 2 llamadas/30-45s.
+
+**JUSTIFICACIÓN**: reduce a la mitad las llamadas de IA por turno sin ceder ninguna autoridad de decisión al modelo — el mecanismo de verificación (`next_action` como clave exacta contra una tabla fija) es simple, determinista, y sigue el mismo patrón defensivo ya usado en todo el proyecto (una IA que falla o se equivoca degrada a un comportamiento seguro conocido, nunca rompe el flujo).
+
+**IMPACTO**: `app/Training/Support/OnboardingConversationService.php` (reescrito), `app/Training/Handlers/TrainingHandler.php` (bloque de onboarding actualizado + métricas). Tests: `OnboardingConversationServiceTest.php` reescrito (13 tests) + `TrainingConversationFlowTest.php` extendido (+1 test de flujo completo con conteo exacto de llamadas HTTP). Ver el informe del hito para latencia/costo antes-después medidos en un E2E real.
+
+**RIESGOS**:
+- Un modelo barato podría acertar con menos frecuencia 3 cosas a la vez (extracción + next_action + redacción) que 1 sola — mitigado en seguridad al 100% por `resolveQuestion()`, pero puede significar más turnos cayendo al fallback canned de lo esperado (menos variedad conversacional real).
+- No se cambió de proveedor/modelo ni se optimizó nada más en este hito, a propósito, para aislar el efecto de esta fusión — ver el informe del hito para la recomendación de la siguiente comparación (Grok vs. OpenAI).
+
+---
+
+### D027 — Fix estructural descubierto en el E2E real de Payments: el webhook no reconocía mensajes `image`
+
+**CONTEXTO**: durante el E2E real del Hito 8, el usuario envió el comprobante de pago como imagen tras elegir Nequi. El bot no respondió nada. Los logs del contenedor `app` mostraban el payload crudo de Meta recibido, pero ninguna línea posterior ("CONTENIDO REAL", "queued for processing") — ni excepción, ni entrada en `queue`, ni en `failed_jobs`.
+
+**CAUSA RAÍZ**: `WhatsAppController::handle()` solo tenía ramas explícitas para `type === 'text'` y `type` en `['audio','voice']` al extraer `$body`/`$mediaId` del mensaje. Un mensaje `type === 'image'` no encajaba en ninguna, dejando ambas variables en `null`; el guard `if (!$fromPhone || (!$body && !$mediaId)) return response('OK', 200)` descartaba el mensaje en silencio **antes** de loguear nada más y antes de despachar el Job — comportamiento indistinguible de "Meta no envió nada", sin ningún rastro de error. Nunca se había ejercitado una imagen entrante real en producción hasta este punto (Training solo usa audio/texto).
+
+**DECISIÓN TOMADA**: rama nueva `elseif ($type === 'image')`, mecánica, replicando exactamente el patrón ya existente de `audio`/`voice` — extrae `$message['image']['id']` como `mediaId` y, si existe, `$message['image']['caption']` como `body` (opcional, por si el usuario agrega texto a la imagen). No se tocó `Ingest`/`Router`/`Dispatcher`/ningún Handler — `IngestedMessage` ya transportaba `messageType`/`mediaId` de forma genérica desde el Hito 2/8.
+
+**IMPACTO**: `app/Http/Controllers/WhatsAppController.php` (+8 líneas). Tests: `tests/Feature/WhatsAppWebhookTest.php` (+3: imagen sin caption, con caption, sin `mediaId`/sin caption → se ignora). Cero regresiones (226 passed vs. 223 antes).
+
+**RIESGOS**: ningún otro `type` de mensaje de Meta (`document`, `sticker`, `location`, etc.) tiene rama propia todavía — caerían en el mismo silencio hasta que un caso real lo exija, igual que ocurrió con `image`.
+
+---
+
+### D028 — Fix estructural descubierto en el E2E real de Payments: extensión `bcmath` faltante en la imagen Docker de producción
+
+**CONTEXTO**: tras corregir D027, el mismo comprobante de imagen llegó hasta `PaymentHandler`, se descargó correctamente, pero el Job falló tras reintentos con `Call to undefined function App\Payments\Support\bccomp()`.
+
+**CAUSA RAÍZ**: `PaymentValidationService::validate()` usa `bccomp()` (extensión BCMath) para comparar montos monetarios con precisión decimal exacta. El `Dockerfile` documentaba explícitamente, desde antes del Hito 8: *"NO se instala bcmath: no aparece como require duro de ningún paquete en composer.lock"* — cierto en su momento, falso desde que el Hito 8 introdujo este servicio sin actualizar el Dockerfile ni declarar la dependencia real en `composer.json`. El entorno local (Herd) trae `bcmath` habilitado por defecto, así que los 43 tests de Payments (incluido `PaymentValidationServiceTest`) pasaron en local sin detectar el hueco — solo se manifestó en el contenedor real de producción (Alpine, extensiones mínimas explícitas).
+
+**DECISIÓN TOMADA**: `Dockerfile` agrega `bcmath` a `docker-php-ext-install`; `composer.json` declara `"ext-bcmath": "*"` en `require` (para que el platform-check de Composer detecte esta dependencia si volviera a faltar); `composer.lock` actualizado vía `composer update --lock` (solo `content-hash`, sin cambios de versión de ningún paquete). No se reemplazó `bccomp()` por comparación de floats — tratándose de dinero, se mantiene la comparación decimal exacta.
+
+**IMPACTO**: `Dockerfile`, `composer.json`, `composer.lock`. Test nuevo: `tests/Feature/Payments/PaymentValidationServiceTest.php` (+1, guarda `extension_loaded('bcmath')`, documentado explícitamente como una verificación que solo detecta el hueco si se ejecuta dentro del contenedor real, no en local). Verificado con un build limpio (`--no-cache`) del stage `php-base`: `php -m` confirma `bcmath` cargado.
+
+**RIESGOS**: cualquier extensión PHP nueva que un futuro dominio necesite corre el mismo riesgo si no se declara explícitamente en `composer.json` — el hábito correcto (declarar `ext-*` como `require` real) queda establecido aquí como precedente, no aplicado retroactivamente a extensiones ya usadas.
+
+---
+
+### D029 — Ajuste de Hito 8: `CustomerNotifier` (notificación proactiva al cliente) + idempotencia de `PaymentConfirmationService`
+
+**CONTEXTO**: durante el E2E real, tras confirmar un Payment desde Filament, el usuario señaló que el cliente nunca se enteraba — `PaymentConfirmationService::confirm()`/`reject()` nunca enviaban ningún mensaje de WhatsApp; la única forma de que el cliente supiera el resultado era preguntar proactivamente ("¿cómo va mi pago?", ya soportado por `PaymentHandler::handlePaymentStatus()`). Además, la confirmación puede ocurrir horas o días después del último mensaje del cliente — fuera de la ventana de 24h de WhatsApp, donde un mensaje libre simplemente falla.
+
+**PROBLEMA**: hacía falta (a) notificar proactivamente al cliente el resultado real de su Payment, (b) resolver correctamente el envío fuera de ventana conversacional sin que `PaymentConfirmationService` conociera Graph API/nombres de plantilla/reglas de Meta, y (c) corregir un hallazgo colateral real: `confirm()`/`reject()` no tenían ninguna guarda de idempotencia propia — una segunda invocación sobre un Payment ya confirmado volvía a extender `TrainingAccess.expires_at` un mes adicional indebido (la única protección existente era ocultar el botón en Filament una vez `!isOpen()`, una guarda de UI, no de servicio).
+
+**AUDITORÍA PREVIA** (ver informe del hito): `WhatsAppTemplate`/`WhatsAppTemplateResource`/`WhatsAppService::sendTemplateMessage()` ya existían, completos y genéricos (por tenant, sin conocimiento de dominio) — solo usados hasta ahora por `WhatsAppController::sendManualTemplate()` (envío manual de operador). `Conversation.last_session_at` ya se actualiza correctamente en cada mensaje **entrante** del cliente (nunca en salientes) — señal ya disponible, sin necesidad de consultar ninguna API de Meta para saber si la ventana de 24h sigue abierta.
+
+**DECISIÓN TOMADA**:
+1. **`App\Core\Notifications\CustomerNotifier`** (nuevo, Core): `notify(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText): void`. Decide únicamente el mecanismo de entrega — nunca cuándo ni por qué notificar (eso sigue siendo decisión exclusiva del dominio que llama; un futuro Proactivity reutiliza el mismo método sin que este componente contenga ninguna de sus reglas). Ventana: `Conversation.last_session_at` con margen conservador de **23h30m** (aprobado explícitamente) — `< 23h30m` desde el último mensaje entrante → mensaje libre (`WhatsAppService::sendMessage`); `>= 23h30m`, o sin `Conversation` registrada → `WhatsAppTemplate` resuelta por `(tenant_id, event_key)` (`WhatsAppService::sendTemplateMessage`, variables resueltas contra `parameters_map` ya existente). Sin plantilla configurada para ese evento/tenant, o cualquier fallo de Meta/red/excepción inesperada: se loguea (`CUSTOMER_NOTIFIER_TEMPLATE_NOT_CONFIGURED` / `CUSTOMER_NOTIFIER_FAILED`) y **nunca se propaga** — mismo contrato que `AlertService::send()`. Explícitamente separado de `AlertService` (ese es admin/operador; este es transaccional con el cliente) — no se fusionan.
+2. **`whatsapp_templates.event_key`** (migración nueva, nullable, único por `(tenant_id, event_key)`): permite que un operador etiquete una plantilla ya registrada con el evento de sistema que resuelve, sin que ningún dominio hardcodee un nombre técnico de Meta. Solo 2 valores usados hoy (`payment_confirmed`, `payment_rejected`), como `Select` en `WhatsAppTemplateForm` — sin restricción de base de datos, mismo criterio que `Alert::category`.
+3. **Idempotencia en `PaymentConfirmationService`**: `confirm()`/`reject()` verifican `$payment->status` antes de escribir nada — si ya está en ese estado terminal, no-op completo (log `PAYMENT_CONFIRM_IDEMPOTENT_NOOP`/`PAYMENT_REJECT_IDEMPOTENT_NOOP`, sin re-extender `TrainingAccess`, sin re-notificar). La guarda vive en el servicio, no en Filament — cualquier canal futuro (ej. un comando de WhatsApp del superadmin, explícitamente **no implementado en este ajuste**) la hereda gratis.
+4. `PaymentConfirmationService::confirm()`/`reject()` llaman a `CustomerNotifier::notify()` **después** de que el cambio de estado (y `TrainingAccess`, si aplica) ya quedó persistido — un fallo de notificación nunca revierte ni bloquea la confirmación/rechazo.
+
+**DECISIÓN EXPLÍCITAMENTE DIFERIDA**: confirmación/rechazo de Payments por comando de WhatsApp del superadmin (`CONFIRMAR <id>` / `RECHAZAR <id> <motivo>`) — auditado en este mismo ciclo (0% implementado: no existe ningún `PreRoutingScreen` de comandos administrativos, ninguna verificación de teléfono autorizado, ningún parser de sintaxis), pero explícitamente no construido todavía. `PreRoutingScreener` (D023) es el mecanismo natural para implementarlo cuando se apruebe, y ya heredaría la idempotencia de este ajuste sin cambios adicionales en `PaymentConfirmationService`.
+
+**IMPACTO**: `app/Core/Notifications/CustomerNotifier.php` (nuevo), `database/migrations/2026_09_01_000006_add_event_key_to_whatsapp_templates_table.php` (nueva), `app/Models/WhatsAppTemplate.php` (+`event_key` en fillable), `app/Filament/Resources/WhatsAppTemplate/Schemas/WhatsAppTemplateForm.php` (+campo), `app/Payments/Support/PaymentConfirmationService.php` (idempotencia + notificación). Tests nuevos: `tests/Feature/Core/CustomerNotifierTest.php` (6: ventana abierta, ventana cerrada, sin `Conversation`, sin plantilla configurada, error de Meta, excepción inesperada), `tests/Feature/Payments/PaymentConfirmationServiceTest.php` (+5: confirmación idempotente, rechazo idempotente, notificación en confirmación, notificación en rechazo, fallo de notificación no revierte el Payment). `tests/Feature/Core/CoreIsolationArchTest.php` (+1: `App\Core` no depende de `App\Payments`). 12 tests nuevos netos, cero regresiones (239 passed vs. 227 antes, mismos 22 fallos heredados de Fortify/Vite).
+
+**JUSTIFICACIÓN**: reutiliza al máximo la infraestructura ya construida (`WhatsAppTemplate`, `sendTemplateMessage()`, `Conversation.last_session_at`) en vez de crear un sistema de notificaciones nuevo; mantiene el mismo contrato de aislamiento de fallos ya validado en `AlertService`; y corrige un defecto de idempotencia real en el mismo cambio, en el único lugar donde debe vivir la guarda (el servicio, no la UI).
+
+**RIESGOS**:
+- El umbral de 23h30m es una aproximación conservadora sobre la regla real de Meta (24h exactas) — un margen mayor reduciría aún más el riesgo de que Meta rechace un mensaje libre, a costa de usar plantilla (con su propio costo/aprobación) un poco antes de lo estrictamente necesario.
+- `CustomerNotifier` no distingue "plantilla no configurada" de "plantilla configurada pero rechazada por Meta" de cara al dominio que llama — ambas terminan en un log, sin ningún reintento ni escalamiento; aceptable para el MVP (2 eventos, revisión manual de logs), no para un volumen alto sin monitoreo activo.
+- La idempotencia protege contra una segunda llamada completa a `confirm()`/`reject()`, no contra una condición de carrera de dos requests verdaderamente simultáneos sobre el mismo `Payment` (sin bloqueo a nivel de fila) — aceptable hoy porque el único punto de entrada es un click humano en Filament; relevante a revisar si se agrega el comando de WhatsApp diferido arriba.
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

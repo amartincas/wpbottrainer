@@ -12,6 +12,7 @@ class WhatsAppTemplate extends Model
     protected $fillable = [
         'tenant_id',
         'name',
+        'event_key',
         'body_preview',
         'parameters_map',
         'requires_phone_input',

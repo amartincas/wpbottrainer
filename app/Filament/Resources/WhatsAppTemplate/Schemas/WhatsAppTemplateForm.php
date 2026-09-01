@@ -39,6 +39,16 @@ class WhatsAppTemplateForm
                 ->required()
                 ->maxLength(512),
 
+            Select::make('event_key')
+                ->label('Evento del sistema')
+                ->options([
+                    'payment_confirmed' => 'Pago confirmado',
+                    'payment_rejected'  => 'Pago rechazado',
+                ])
+                ->native(false)
+                ->nullable()
+                ->helperText('Solo si esta plantilla debe usarse automaticamente para notificar un evento del sistema (fuera de la ventana de 24h). Dejar vacio si es de uso manual.'),
+
             TextInput::make('language')
                 ->label('Codigo de Idioma')
                 ->placeholder('es_CO')

@@ -57,6 +57,7 @@ Las 8 categorías de test pedidas para el Router viven así:
 | **WhatsApp** | `tests/Feature/ProcessWhatsAppMessageJobTest.php` — se verifica el payload exacto enviado a `graph.facebook.com` y que el tracking de estado (WAMID) se registra. |
 | **errores** | `tests/Feature/Core/IngestTest.php` (fallo de transcripción → mensaje de fallback específico) y `tests/Feature/ProcessWhatsAppMessageJobTest.php` (fallo del proveedor de IA → mensaje de fallback genérico + re-throw). |
 | **idempotencia** | `tests/Feature/WhatsAppWebhookTest.php` (heredado del Hito 1, sin modificar) — el Router/Dispatcher no introduce lógica de idempotencia nueva; la garantía sigue viviendo en el `Cache::add()` del Controller. |
+| **mensajes `image` (D027)** | `tests/Feature/WhatsAppWebhookTest.php` (+3, Hito 8) — un mensaje `type: image` extrae `mediaId` y despacha el Job igual que `audio`/`voice` (defecto real encontrado en el E2E de Payments: antes caía en silencio, sin log ni Job); un caption presente se conserva como `messageBody`; sin `mediaId` ni caption, se ignora igual que un mensaje vacío. |
 
 ## Cobertura de memoria y contexto (Hito 3)
 
@@ -97,7 +98,7 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 |---|---|
 | **detección de training** | `TrainingIntentClassifierTest.php` — palabras clave; contacto con onboarding incompleto se sigue clasificando como training aunque el mensaje no tenga palabras clave; un perfil ya completo no fuerza el intent. |
 | **fallback** | Cubierto por la ausencia de cambios en `ProcessWhatsAppMessageJobTest.php` (sigue en verde, sin modificar) — un mensaje sin señal de training sigue resolviendo a `FallbackChatHandler` exactamente igual que antes. |
-| **onboarding** | `TrainingConversationFlowTest.php` — primer contacto sin perfil recibe la primera pregunta; progresivo turno a turno sin repetir lo ya conocido; se completa en un solo mensaje si el usuario da todo de una vez. |
+| **onboarding** | `TrainingConversationFlowTest.php` — primer contacto sin perfil recibe la primera pregunta; progresivo turno a turno sin repetir lo ya conocido; se completa en un solo mensaje si el usuario da todo de una vez; flujo completo de 5 turnos con conteo exacto de llamadas HTTP a IA (Hito 5.1 — ver abajo). |
 | **persistencia de TrainingProfile** | `TrainingConversationFlowTest.php` — se verifica el estado de la fila en base de datos después de cada turno, no solo la respuesta enviada. |
 | **acceso permitido / denegado** | `TrainingConversationFlowTest.php` — sin `TrainingAccess` se informa que debe activar el servicio (cero llamadas a IA, perfil ya completo); con acceso vigente se genera y entrega la sesión. |
 | **generación de WorkoutSession / WorkoutExercise** | `TrainingConversationFlowTest.php` — se verifica la sesión creada, sus 3 `WorkoutExercise`, y que el texto enviado por WhatsApp contenga el entrenamiento. |
@@ -145,6 +146,66 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 | **aislamiento por Tenant** | Dos tenants con `wa_phone_number_id` distintos reciben webhooks independientes sin mezclar `Contact`/`TrainingProfile`. |
 
 **No cubierto por tests** (requiere Meta real, ver `docs/E2E_META_RUNBOOK.md` y D021): que Meta efectivamente entregue el mensaje al teléfono, y que un video se reproduzca dentro del chat de WhatsApp sin salir a un navegador.
+
+## Cobertura de AlertService (Hito 7.1)
+
+| Categoría | Dónde |
+|---|---|
+| **fan-out** | `tests/Feature/Core/AlertServiceTest.php` — TODOS los canales que `supports()` una Alert la reciben (no solo el primero, a diferencia de Router/PreRoutingScreener); `deliver()` nunca se llama si `supports()` es falso. |
+| **aislamiento de fallos** | `AlertServiceTest.php` — un canal que lanza excepción no detiene a los demás canales ni propaga la excepción al llamador. |
+| **inmutabilidad y saneo de `context`** | `tests/Feature/Core/AlertTest.php` — propiedades `readonly`; cualquier clave de `context` que luzca como secreto (`key`/`token`/`password`/`secret`/`credential`, cualquier mayúscula/minúscula) se reemplaza por `'[REDACTED]'`. |
+| **persistencia** | `tests/Feature/Core/PersistedAlertChannelTest.php` — soporta toda severidad/categoría; persiste en `alert_logs` con `delivery_status = 'recorded'`; nunca persiste un valor ya redactado por `Alert` como si fuera el secreto real. |
+| **WhatsApp al superadmin** | `tests/Feature/Core/WhatsAppAdminAlertChannelTest.php` — solo `Warning`/`Critical` (no `Info`); requiere `tenant_id` resoluble en `context`; requiere al menos un `User.is_super_admin` con `phone`; envía usando las credenciales Meta del Tenant **originador** (nunca las de otro tenant); throttling básico (una alerta idéntica repetida dentro de la ventana no se reenvía); nunca lanza excepción aunque Meta responda error. |
+| **integración con Safety** | `tests/Feature/Training/SafetyAlertIntegrationTest.php` — una señal de seguridad real genera un `AlertLog` y un envío de WhatsApp al superadmin; **el bloqueo de seguridad al usuario sigue funcionando aunque el envío de la alerta al admin falle** (verificado con `Http::sequence()` forzando un 500 en el primer envío). |
+| **severidades** | Cubierto transversalmente en `AlertServiceTest`/`AlertTest`/`WhatsAppAdminAlertChannelTest` — las 3 (`Info`/`Warning`/`Critical`) se ejercitan explícitamente. |
+
+## Cobertura de CustomerNotifier (ajuste de Hito 8)
+
+| Categoría | Dónde |
+|---|---|
+| **ventana abierta → mensaje libre** | `tests/Feature/Core/CustomerNotifierTest.php` — `Conversation.last_session_at` dentro de las 23h30m envía vía `WhatsAppService::sendMessage()` con el texto libre exacto que el dominio proveyó. |
+| **ventana cerrada → template** | `CustomerNotifierTest.php` — `last_session_at` a las 24h (>= 23h30m) resuelve la `WhatsAppTemplate` por `(tenant_id, event_key)`, cruza `parameters_map` contra las `variables` provistas, y envía vía `WhatsAppService::sendTemplateMessage()` con el `name`/`language` reales de esa plantilla. |
+| **sin `Conversation` registrada** | `CustomerNotifierTest.php` — se trata como ventana cerrada (conservador), igual que si hubiera vencido. |
+| **template inexistente** | `CustomerNotifierTest.php` — ventana cerrada sin ninguna `WhatsAppTemplate` para ese `(tenant_id, event_key)`: no se envía nada, no se lanza excepción, se loguea `CUSTOMER_NOTIFIER_TEMPLATE_NOT_CONFIGURED`. |
+| **error de Meta / excepción inesperada** | `CustomerNotifierTest.php` — Meta respondiendo error en el envío de plantilla, y una llamada con datos mínimos que no encuentra nada que enviar, terminan sin lanzar ninguna excepción hacia el llamador. |
+| **integración con Payments** | `tests/Feature/Payments/PaymentConfirmationServiceTest.php` — confirmar/rechazar con ventana abierta dispara el mensaje libre correcto (incluye el motivo real en el rechazo); un fallo de Meta durante la notificación nunca revierte el `Payment` ni el `TrainingAccess` ya persistidos. |
+| **aislamiento arquitectónico** | `tests/Feature/Core/CoreIsolationArchTest.php` (+1) — `App\Core` no depende de `App\Payments`; `CustomerNotifier` no puede acoplarse a ningún dominio concreto. |
+
+## Cobertura de Payments (Hito 8)
+
+| Categoría | Dónde |
+|---|---|
+| **clasificación de intent** | `tests/Feature/Payments/PaymentIntentClassifierTest.php` — palabras clave; un Payment abierto (`pending`/`under_review`) fuerza el intent aunque el mensaje no traiga texto (ej. una imagen sin caption); un contacto sin pagos abiertos y sin palabras clave nunca fuerza el intent. |
+| **extracción del comprobante (Extract)** | `tests/Feature/Payments/ReceiptExtractionServiceTest.php` — texto e imagen; nunca inventa un valor no legible; JSON malformado o error del proveedor devuelven un resultado vacío/incierto en vez de lanzar excepción; texto vacío no llama a la IA. |
+| **visión por proveedor** | `tests/Feature/Payments/AiVisionServicesTest.php` — confirma que cada implementación usa su modelo de visión dedicado (`gpt-4o-mini`, `grok-4.20-0309-non-reasoning`), distinto del modelo de chat configurado. Gemini solo prueba la forma de la petición — no fue verificado con una key real (ver docs/DECISIONS.md, D025). |
+| **validación determinista (Decide)** | `tests/Feature/Payments/PaymentValidationServiceTest.php` — `amount_mismatch`/`amount_unreadable`, `reference_missing`/`reference_already_used` (control global contra pagos `confirmed`, no solo del mismo tenant/contacto), `stale_receipt`/`date_unreadable`, `uncertain_extraction`; confirma que el servicio nunca cambia el `status` del Payment por sí solo. Incluye una guarda explícita `extension_loaded('bcmath')` (D028) — detecta en local que la extensión sigue disponible, aunque solo un test dentro del contenedor real de producción puede detectar si vuelve a faltar ahí. |
+| **confirmación → TrainingAccess** | `tests/Feature/Payments/PaymentConfirmationServiceTest.php` — acceso nuevo (1 mes); renovación antes de vencer extiende desde el vencimiento actual (no pierde días pagados); renovación después de vencer extiende desde `now()`; rechazar nunca toca `TrainingAccess`; reviewer `null` (pasarela futura) funciona sin cambiar la firma. |
+| **idempotencia (ajuste Hito 8)** | `PaymentConfirmationServiceTest.php` — confirmar un Payment ya `confirmed` es no-op (no re-extiende `expires_at`, no crea un segundo `TrainingAccess`, no reenvía la notificación, no sobrescribe la nota original); rechazar un Payment ya `rejected` es no-op equivalente. |
+| **notificación al cliente (ajuste Hito 8)** | `PaymentConfirmationServiceTest.php` — confirmar/rechazar con la ventana de conversación abierta dispara un mensaje libre con el contenido correcto; un fallo de Meta durante la notificación NUNCA revierte el `status` del Payment ni el `TrainingAccess` ya otorgado (ambos ya se persistieron antes de notificar). |
+| **flujo conversacional real** | `tests/Feature/Payments/PaymentConversationFlowTest.php` — mismo patrón que `TrainingConversationFlowTest.php`: vía el Job real, no la clase aislada. Cubre `payment_options`, creación de `Payment(pending)` con instrucciones (nunca promete activación), comprobante por texto (`under_review` + `AlertLog` + WhatsApp al superadmin), comprobante por imagen (descarga, hash, persistencia permanente, extracción por visión), un mensaje sin señal real de pago no crea `PaymentReceipt` ni cambia el estado, `payment_status` reporta cada estado en lenguaje claro, y confirma que el flujo conversacional **nunca** toca `TrainingAccess`. |
+| **aislamiento arquitectónico** | `tests/Feature/Payments/PaymentIsolationArchTest.php` — `App\Payments\Handlers`/`Support` (salvo `PaymentConfirmationService`) no dependen de `App\Models\TrainingAccess`. |
+| **modelo** | `tests/Feature/Payments/PaymentModelTest.php` — relaciones, casts de enums/json, `isOpen()`/`isAwaitingReceipt()` por estado. |
+| **Safety Review** | Extiende `tests/Feature/Training/TrainingProfileTest.php` — `clearSafetyFlag()` ahora exige reviewer+nota y los persiste; `flagForSafetyReview()` resetea cualquier revisión previa al marcar de nuevo. |
+
+**No cubierto por tests automatizados** (ver D025, riesgo documentado): la capa Filament (`PaymentResource`, la acción "Revisar seguridad" de `ContactsTable`) — sin precedente de test para Resources/Actions en este proyecto. La lógica que esas acciones invocan (`PaymentConfirmationService`, `TrainingProfile::clearSafetyFlag()`) sí está cubierta; falta una verificación manual real (clic en el panel) antes de considerar esta pieza completamente probada.
+
+## Cobertura de la fusión Extract+Narrate del onboarding (Hito 5.1)
+
+| Categoría pedida | Dónde |
+|---|---|
+| **1. extracción válida** | `OnboardingConversationServiceTest.php` — `extracted.*` con las mismas reglas de siempre. |
+| **2. extracción inválida** | Enum fuera del vocabulario, `restrictions` no-array, `sessions_per_week` fuera de 1-14 — todos se descartan (quedan `null`), igual que antes de la fusión. |
+| **3. next_action correcto + response válido** | `resolveQuestion()` usa la redacción de la IA. |
+| **4. next_action incorrecto** | La IA cree que falta un campo distinto del real → se descarta, se usa `FALLBACK_QUESTIONS` del campo real. |
+| **5. next_action ausente** | Mismo resultado que "incorrecto" — `null` nunca coincide con ningún valor esperado. |
+| **6. `complete_onboarding` antes de completar** | Verificado explícitamente: aunque la IA diga `complete_onboarding`, si el código determinó que falta un campo real, se pregunta por ese campo — `complete_onboarding` nunca puede completar el perfil por sí mismo (estructuralmente no aparece en `NEXT_ACTION_MAP`). |
+| **7. response vacío** | Se descarta aunque `next_action` coincida. |
+| **8. response excesivamente largo** | >300 caracteres se descarta aunque `next_action` coincida. |
+| **9. JSON inválido** | Resultado vacío (`extracted` todo `null`, `next_action`/`response` `null`), sin excepción. |
+| **10. error HTTP** | Mismo resultado vacío, sin excepción — el onboarding nunca se rompe. |
+| **11. flujo completo de onboarding** | `TrainingConversationFlowTest.php` — 5 turnos consecutivos, perfil completo verificado en BD al final. |
+| **12. exactamente UNA llamada HTTP a IA por turno** | Mismo test — se cuenta explícitamente cuántas peticiones a `api.openai.com` se hicieron en los 5 turnos (5, no 10 como habría sido con la arquitectura anterior). |
+| **13. restrictions + safety_signal_text independientes** | `OnboardingConversationServiceTest.php` — "tengo dolor en las rodillas" → `restrictions` poblado, `safety_signal_text: null`; test adicional que verifica que el prompt enviado a la IA contiene explícitamente la instrucción de independencia entre ambos campos. |
 
 ## WhatsApp
 

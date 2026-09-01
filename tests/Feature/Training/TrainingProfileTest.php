@@ -45,17 +45,37 @@ it('flags a profile for safety review deterministically', function () {
     expect($fresh->isFlaggedForSafetyReview())->toBeTrue();
 });
 
-it('only clears a safety flag via an explicit call, never automatically', function () {
+it('only clears a safety flag via an explicit human review, never automatically', function () {
     $profile = TrainingProfile::factory()->flaggedForSafetyReview('recent_surgery')->create();
+    $reviewer = \App\Models\User::factory()->create();
 
     expect($profile->isFlaggedForSafetyReview())->toBeTrue();
 
-    $profile->clearSafetyFlag();
+    $profile->clearSafetyFlag($reviewer, 'Consultó con su médico, autorizado a continuar.');
 
     $fresh = $profile->fresh();
     expect($fresh->safety_status)->toBe(SafetyStatus::Normal);
     expect($fresh->safety_flag_reason)->toBeNull();
     expect($fresh->safety_flagged_at)->toBeNull();
+    expect($fresh->safety_reviewed_by)->toBe($reviewer->id);
+    expect($fresh->safety_reviewed_at)->not->toBeNull();
+    expect($fresh->safety_review_note)->toBe('Consultó con su médico, autorizado a continuar.');
+});
+
+it('resets any previous safety review when flagged again — a new incident invalidates the old review', function () {
+    $reviewer = \App\Models\User::factory()->create();
+    $profile = TrainingProfile::factory()->create(['safety_status' => SafetyStatus::Normal]);
+    $profile->clearSafetyFlag($reviewer, 'Ya revisado una vez.');
+
+    expect($profile->fresh()->safety_reviewed_by)->toBe($reviewer->id);
+
+    $profile->flagForSafetyReview('chest_pain');
+
+    $fresh = $profile->fresh();
+    expect($fresh->safety_status)->toBe(SafetyStatus::FlaggedForReview);
+    expect($fresh->safety_reviewed_by)->toBeNull();
+    expect($fresh->safety_reviewed_at)->toBeNull();
+    expect($fresh->safety_review_note)->toBeNull();
 });
 
 it('does not carry an access_status field — entitlement lives in TrainingAccess', function () {

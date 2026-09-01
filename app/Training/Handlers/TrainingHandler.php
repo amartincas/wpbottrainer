@@ -2,6 +2,9 @@
 
 namespace App\Training\Handlers;
 
+use App\Core\Alerts\Alert;
+use App\Core\Alerts\AlertService;
+use App\Core\Alerts\AlertSeverity;
 use App\Core\Memory\ContextBuilder;
 use App\Core\Memory\ContextFragment;
 use App\Core\Messaging\ExecutionContext;
@@ -62,6 +65,7 @@ class TrainingHandler implements HandlerInterface
         private readonly ExecutionReportService $reportExtractor,
         private readonly ExecutionReportRecorder $reportRecorder,
         private readonly ContextBuilder $contextBuilder,
+        private readonly AlertService $alerts,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -94,6 +98,7 @@ class TrainingHandler implements HandlerInterface
 
         if ($signal !== null) {
             $profile->flagForSafetyReview($signal);
+            $this->emitSafetyAlert($tenant, $contact, $signal);
             $this->reply($from, SafetySignalDetector::ESCALATION_MESSAGE, $tenant);
 
             return;
@@ -109,16 +114,23 @@ class TrainingHandler implements HandlerInterface
         }
 
         // 2. Onboarding conversacional, mientras falte algún dato obligatorio.
+        // Hito 5.1: Extract+Narrate fusionados en UNA llamada de IA (antes
+        // eran 2 secuenciales) — ver App\Training\Support\
+        // OnboardingConversationService y D026 en docs/DECISIONS.md.
         if (! $profile->isOnboardingComplete()) {
             $fragment = $this->buildContext($context, 'training_profile');
 
-            $extracted = $this->onboarding->extractFields($body, $fragment->data, $tenant);
+            $aiCallStartedAt = microtime(true);
+            $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant);
+            $aiCallElapsedMs = (int) round((microtime(true) - $aiCallStartedAt) * 1000);
+            $extracted = $result['extracted'];
 
             if ($extracted['safety_signal_text'] !== null) {
                 $secondSignal = $this->safetyDetector->detect($extracted['safety_signal_text']);
 
                 if ($secondSignal !== null) {
                     $profile->flagForSafetyReview($secondSignal);
+                    $this->emitSafetyAlert($tenant, $contact, $secondSignal);
                     $this->reply($from, SafetySignalDetector::ESCALATION_MESSAGE, $tenant);
 
                     return;
@@ -129,7 +141,19 @@ class TrainingHandler implements HandlerInterface
             $profile = $profile->fresh();
 
             if (! $profile->isOnboardingComplete()) {
-                $question = $this->onboarding->nextQuestion($profile->firstMissingOnboardingField(), $tenant);
+                $realMissingField = $profile->firstMissingOnboardingField();
+                $question = $this->onboarding->resolveQuestion($realMissingField, $result['next_action'], $result['response']);
+
+                // Métricas Hito 5.1: comparar contra la línea base de 2
+                // llamadas/30-45s — ver docs/DECISIONS.md (D026).
+                Log::info('ONBOARDING_TURN_METRICS', [
+                    'tenant_id' => $tenant->id,
+                    'contact_id' => $contact->id,
+                    'ai_call_elapsed_ms' => $aiCallElapsedMs,
+                    'ai_calls_count' => 1,
+                    'used_ai_response' => $this->onboarding->usedAiResponse($realMissingField, $result['next_action'], $result['response']),
+                ]);
+
                 $this->reply($from, $question, $tenant);
 
                 return;
@@ -382,6 +406,38 @@ class TrainingHandler implements HandlerInterface
                 'whatsapp_message_id' => $message->id,
                 'tenant_id' => $tenant->id,
                 'customer_phone' => $from,
+            ]);
+        }
+    }
+
+    /**
+     * Hito 7.1: emite la Alert hacia AlertService (Core) — este método NO
+     * decide el canal ni el destinatario, solo describe qué pasó. Envuelto
+     * en su propio try/catch como defensa adicional (AlertService ya
+     * garantiza internamente que un canal roto no se propaga, pero el
+     * bloqueo de seguridad de este Handler debe seguir funcionando incluso
+     * si AlertService fallara de una forma totalmente inesperada) — nunca
+     * debe impedir que se responda con el mensaje de escalamiento.
+     */
+    private function emitSafetyAlert(Tenant $tenant, Contact $contact, string $reason): void
+    {
+        try {
+            $this->alerts->send(new Alert(
+                category: 'safety',
+                severity: AlertSeverity::Critical,
+                message: "Señal de seguridad detectada ({$reason}) — perfil marcado flagged_for_review.",
+                context: [
+                    'tenant_id' => $tenant->id,
+                    'contact_id' => $contact->id,
+                    'customer_phone' => $contact->customer_phone,
+                    'reason' => $reason,
+                ],
+            ));
+        } catch (\Throwable $e) {
+            Log::error('SAFETY_ALERT_EMIT_FAILED', [
+                'tenant_id' => $tenant->id,
+                'contact_id' => $contact->id,
+                'error' => $e->getMessage(),
             ]);
         }
     }

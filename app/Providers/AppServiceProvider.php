@@ -2,12 +2,17 @@
 
 namespace App\Providers;
 
+use App\Core\Alerts\AlertService;
+use App\Core\Alerts\Channels\PersistedAlertChannel;
+use App\Core\Alerts\Channels\WhatsAppAdminAlertChannel;
 use App\Core\Memory\ContextBuilder;
 use App\Core\Messaging\Dispatcher;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Handlers\FallbackChatHandler;
+use App\Payments\Handlers\PaymentHandler;
+use App\Payments\Support\PaymentIntentClassifier;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
@@ -36,6 +41,7 @@ class AppServiceProvider extends ServiceProvider
         // See App\Core\Messaging\Router and docs/DECISIONS.md (D019).
         $this->app->singleton(Router::class, fn ($app) => new Router($app, [
             TrainingIntentClassifier::class,
+            PaymentIntentClassifier::class,
         ]));
 
         // Core messaging PreRoutingScreener (Hito 7): ordered list of
@@ -48,6 +54,17 @@ class AppServiceProvider extends ServiceProvider
             SafetySignalPreRoutingScreen::class,
         ]));
 
+        // Core AlertService (Hito 7.1): infraestructura transversal, no
+        // pertenece a Training ni a Payments — cualquier dominio puede
+        // emitir una Alert sin saber por qué canal ni a quién llega. Mismo
+        // patrón Container-resuelto, pero con fan-out (todos los canales que
+        // "soporten" la Alert la reciben, no solo el primero). Ver
+        // App\Core\Alerts\AlertService y docs/DECISIONS.md.
+        $this->app->singleton(AlertService::class, fn ($app) => new AlertService($app, [
+            PersistedAlertChannel::class,
+            WhatsAppAdminAlertChannel::class,
+        ]));
+
         // Core messaging Dispatcher: maps each Intent to the Handler class
         // (not an instance) that resolves it. The Container builds the actual
         // instance at dispatch time — see App\Core\Messaging\Dispatcher and
@@ -56,6 +73,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->singleton(Dispatcher::class, fn ($app) => new Dispatcher($app, [
             Intent::FallbackChat->value => FallbackChatHandler::class,
             Intent::Training->value => TrainingHandler::class,
+            Intent::Payment->value => PaymentHandler::class,
         ]));
 
         // Core memory ContextBuilder: same Container-resolution pattern as

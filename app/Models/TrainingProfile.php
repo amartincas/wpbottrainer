@@ -23,6 +23,9 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'safety_status',
     'safety_flag_reason',
     'safety_flagged_at',
+    'safety_reviewed_by',
+    'safety_reviewed_at',
+    'safety_review_note',
 ])]
 class TrainingProfile extends Model
 {
@@ -39,12 +42,23 @@ class TrainingProfile extends Model
             'split_type' => SplitType::class,
             'safety_status' => SafetyStatus::class,
             'safety_flagged_at' => 'datetime',
+            'safety_reviewed_at' => 'datetime',
         ];
     }
 
     public function contact(): BelongsTo
     {
         return $this->belongsTo(Contact::class);
+    }
+
+    /**
+     * Hito 8: quién levantó el flag de seguridad — siempre un humano
+     * autorizado, nunca el LLM. Nullable: un perfil actualmente flagged
+     * (o que nunca fue revisado) no tiene uno.
+     */
+    public function safetyReviewedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'safety_reviewed_by');
     }
 
     /**
@@ -59,19 +73,32 @@ class TrainingProfile extends Model
             'safety_status' => SafetyStatus::FlaggedForReview,
             'safety_flag_reason' => $reason,
             'safety_flagged_at' => now(),
+            // Hito 8: cualquier revisión previa queda invalidada por una
+            // señal nueva — un humano ya había revisado y desbloqueado un
+            // incidente anterior, no este. Sin esto, el panel mostraría
+            // datos de una revisión que ya no aplica.
+            'safety_reviewed_by' => null,
+            'safety_reviewed_at' => null,
+            'safety_review_note' => null,
         ]);
     }
 
     /**
-     * Solo debe invocarse desde una acción humana explícita (superadmin/
-     * profesional del tenant) — nunca automáticamente ni por el LLM.
+     * Hito 7.1 → implementado en Hito 8: única forma de desbloquear un
+     * perfil marcado — siempre una acción humana explícita y autorizada
+     * (is_super_admin, ver App\Filament\Resources\Contacts), nunca
+     * automática ni por el LLM. $note es obligatoria (App\Filament valida
+     * esto en la UI; el modelo no impone longitud mínima).
      */
-    public function clearSafetyFlag(): void
+    public function clearSafetyFlag(User $reviewer, string $note): void
     {
         $this->update([
             'safety_status' => SafetyStatus::Normal,
             'safety_flag_reason' => null,
             'safety_flagged_at' => null,
+            'safety_reviewed_by' => $reviewer->id,
+            'safety_reviewed_at' => now(),
+            'safety_review_note' => $note,
         ]);
     }
 

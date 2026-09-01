@@ -131,10 +131,11 @@ TrainingHandler::handle(ExecutionContext)
        ├─ señal encontrada → TrainingProfile::flagForSafetyReview() + mensaje de escalamiento → FIN
        └─ perfil ya marcado de un turno anterior → mensaje de escalamiento → FIN (el LLM nunca lo desbloquea)
   → ¿TrainingProfile::isOnboardingComplete()?
-       NO → ContextBuilder->build(['training_profile']) + OnboardingConversationService::extractFields()
-              (Extract: LLM, validado antes de persistir — ver más abajo)
+       NO → ContextBuilder->build(['training_profile']) + OnboardingConversationService::extractAndRespond()
+              (Extract + Narrate en UNA llamada de IA desde Hito 5.1 — validado antes de persistir, ver más abajo)
             → aplica solo los campos válidos y no nulos
-            → ¿completo ahora? NO → OnboardingConversationService::nextQuestion() (Narrate) → FIN
+            → ¿completo ahora? NO → OnboardingConversationService::resolveQuestion() (Decide: ¿la IA acertó
+                                     qué faltaba? — Narrate real solo si sí) → FIN
                                 SÍ → continúa en el mismo turno, sin esperar otro mensaje
   → TrainingAccessGate::authorize(Contact)
        NO permitido → mensaje "activa el servicio" o de escalamiento (según el motivo) → FIN
@@ -150,11 +151,12 @@ TrainingHandler::handle(ExecutionContext)
 
 Todo mensaje saliente de `TrainingHandler` pasa por un método `reply()` interno que envía **y** persiste en `WhatsAppMessage` (ver 8.2) — no hay ninguna rama del flujo que hable con el usuario sin dejar rastro conversacional.
 
-**Onboarding conversacional** (`App\Training\Support\OnboardingConversationService`) — Extract → Decide → Narrate real por primera vez:
-- **Extract**: un único LLM call por turno (`extractFields()`), con un prompt que exige JSON estricto (`goal`, `experience_level`, `restrictions`, `available_equipment`, `sessions_per_week`, `safety_signal_text`) y el `training_profile` ya conocido (para no volver a preguntarlo). Cada valor se valida contra el vocabulario permitido (enums, arrays de strings, rango 1-14 para sesiones/semana) antes de aceptarse — un valor inválido o alucinado se descarta (`null`), nunca se persiste tal cual.
-- **Decide**: determinista, en `TrainingProfile::firstMissingOnboardingField()` — nunca lo decide el LLM.
-- **Narrate**: un único LLM call (`nextQuestion()`) que redacta la pregunta sobre el campo que el código ya determinó que falta. Si el proveedor de IA falla en cualquiera de los dos pasos, se usa un valor seguro por defecto (extracción vacía / pregunta canónica) — el onboarding nunca se rompe por una caída del proveedor de IA.
-- `restrictions`/`available_equipment` distinguen `null` ("todavía no preguntado") de `[]` ("preguntado, sin ninguno") — así no se vuelve a preguntar algo que el usuario ya respondió como "ninguno".
+**Onboarding conversacional** (`App\Training\Support\OnboardingConversationService`) — Extract → Decide → Narrate real, fusionado en **una sola llamada de IA por turno** desde el Hito 5.1 (antes eran 2 secuenciales: extraer, y luego narrar — ver D026):
+- **Extract + Narrate en una llamada** (`extractAndRespond()`): el LLM devuelve `{extracted: {...}, next_action, response}` — `extracted` con el mismo JSON estricto de siempre (`goal`, `experience_level`, `restrictions`, `available_equipment`, `sessions_per_week`, `safety_signal_text`), validado exactamente igual que antes (enums, arrays de strings, rango 1-14) antes de aceptarse. `next_action` (uno de 5 valores `ask_*` o `complete_onboarding`) y `response` (texto natural candidato) son señales adicionales, nunca autoritativas.
+- **Decide, en dos puntos, ambos deterministas, sin cambios de autoridad**: qué campo falta sigue siendo `TrainingProfile::firstMissingOnboardingField()`; si se usa la redacción de la IA o el fallback canónico lo decide `resolveQuestion()`, comparando el `next_action` del modelo contra una tabla fija (`NEXT_ACTION_MAP`) — solo coincidencia exacta + `response` utilizable (no vacío, ≤300 caracteres) activa el texto de la IA. Un `next_action: "complete_onboarding"` del modelo nunca completa el onboarding por sí mismo — es estructuralmente imposible que "coincida" con un campo real pendiente.
+- Si el proveedor de IA falla, o el JSON es inválido, se usa un resultado vacío + la pregunta canónica de `FALLBACK_QUESTIONS` — el onboarding nunca se rompe por una caída del proveedor de IA (sin cambios de comportamiento respecto a antes).
+- `restrictions`/`available_equipment` distinguen `null` ("todavía no preguntado") de `[]` ("preguntado, sin ninguno") — sin cambios.
+- `restrictions` y `safety_signal_text` son campos independientes del mismo JSON — una molestia física ordinaria ("dolor en la rodilla") siempre puede ir en `restrictions` sin que el prompt la fuerce a clasificarse (solo) como señal de seguridad; `safety_signal_text` queda acotado a las categorías reales que reconoce `SafetySignalDetector` (ver D026 — corrige un defecto real encontrado en el E2E del Hito 8).
 - Si el onboarding se completa con toda la información dada en un solo mensaje, el mismo turno continúa directo a la verificación de acceso — no se espera un mensaje adicional solo para confirmar.
 
 **Clasificación de intents** (`App\Core\Messaging\IntentClassifierInterface` + `App\Training\Support\TrainingIntentClassifier`): determinista, sin LLM. Coincidencia de palabras clave en español ("entrenar", "rutina", "gimnasio", etc.) **o** un `TrainingProfile` incompleto ya existente para ese `Contact` (para poder seguir el onboarding sin repetir palabras clave, ej. responder solo "3 veces por semana"). Clasificación asistida por LLM para frases que el listado de palabras clave no reconozca queda **explícitamente diferida** — no hay evidencia todavía de que sea necesaria, y agregarla ahora encarecería/enlentecería cada mensaje entrante, incluidos los que van a `fallback_chat`. Ver `docs/DECISIONS.md` (D019).
@@ -220,17 +222,71 @@ Ninguno de estos puntos es un defecto de arquitectura — son prerequisitos oper
 
 Además del pipeline `Ingest → Router → Dispatcher → Handler` (sección 6), existe un paso adicional entre `Ingest` y `Router`: `App\Core\Messaging\PreRoutingScreener`. Corre sobre **todo** mensaje, antes de cualquier clasificación de Intent — su único caso de uso hoy es `App\Training\Support\SafetySignalPreRoutingScreen`, que garantiza que una señal de seguridad (ej. dolor de pecho) se atienda sin importar si el Router habría clasificado el mensaje como `training` o no. Ver D023 en `docs/DECISIONS.md` para el hallazgo real que motivó este mecanismo.
 
+## 8.5 AlertService (Hito 7.1) — infraestructura transversal, no pertenece a ningún dominio
+
+`App\Core\Alerts\{Alert,AlertSeverity,AlertChannelInterface,AlertService}` — mismo patrón Container-resuelto que Router/Dispatcher/ContextBuilder/PreRoutingScreener, pero con **fan-out**: todos los canales registrados que "soportan" una `Alert` la reciben (no solo el primero), porque un mismo evento puede tener sentido en varios canales a la vez.
+
+Un dominio (Safety hoy; Payments, Meta/IA/Queue en el futuro) construye una `Alert` (`category` string libre, `severity` enum Info/Warning/Critical, `message`, `context`) y llama `AlertService::send()` — nunca decide el canal ni el destinatario. `Alert` sanea su propio `context` (redacta cualquier clave que luzca como secreto) antes de que un canal la vea.
+
+Canales hoy: `PersistedAlertChannel` (siempre registra en la tabla `alert_logs`, durable) y `WhatsAppAdminAlertChannel` (solo severidad Warning/Critical, envía usando las credenciales Meta del `Tenant` en `context['tenant_id']` a todos los `User.is_super_admin` con `phone` configurado, con throttling básico). Un fallo de cualquier canal nunca se propaga al proceso que originó la alerta. Conectado hoy solo a Safety (`TrainingHandler::emitSafetyAlert()`). Ver D024 en `docs/DECISIONS.md`.
+
+## 8.6 CustomerNotifier (Hito 8, ajuste) — infraestructura transversal para notificación transaccional al cliente
+
+`App\Core\Notifications\CustomerNotifier` — **explícitamente separado de `AlertService`**: `AlertService` es para operadores/superadmins (admin-facing); `CustomerNotifier` es para el cliente final (transaccional). No se fusionan.
+
+```php
+notify(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText): void
+```
+
+Decide **únicamente el mecanismo de entrega** — mensaje libre si la ventana de 24h de WhatsApp sigue abierta, `WhatsAppTemplate` si no — nunca decide **cuándo ni por qué** contactar al cliente; esa autoridad sigue siendo exclusiva de quien llama (Payments hoy; un futuro motor de Proactividad, sección 10, reutilizará el mismo método sin que este componente contenga ninguna de sus reglas).
+
+- **Señal de ventana**: `Conversation.last_session_at`, ya actualizada por el proyecto en cada mensaje **entrante** del cliente (nunca en salientes) — sin consultar ninguna API de Meta. Margen conservador de **23h30m** sobre las 24h reales.
+- **Ventana abierta** (`< 23h30m`, o exactamente `last_session_at` disponible): `WhatsAppService::sendMessage()` con el texto libre que el dominio ya provee.
+- **Ventana cerrada** (`>= 23h30m`, o sin `Conversation` registrada): busca `WhatsAppTemplate::where(tenant_id, event_key)` — el dominio nunca conoce el nombre técnico real aprobado por Meta, solo un `eventKey` libre (mismo criterio que `Alert::category`). Resuelve `parameters_map` (ya existente en `WhatsAppTemplate`) contra las `variables` que el dominio provee, y envía vía `WhatsAppService::sendTemplateMessage()`.
+- **Sin plantilla configurada, plantilla rechazada por Meta, o cualquier excepción**: se loguea y **nunca se propaga** — mismo contrato de aislamiento de fallos que `AlertService::send()`.
+
+Un dominio nunca conoce Graph API, nombre técnico de plantilla, versión de Meta, ni la regla de ventana — solo describe el evento (`eventKey` + `variables` + el texto libre que usaría si la ventana estuviera abierta). Conectado hoy solo a Payments (`PaymentConfirmationService::confirm()`/`reject()`, eventos `payment_confirmed`/`payment_rejected`). Ver D029 en `docs/DECISIONS.md`.
+
 ## 9. Exercise Library
 
 **ESTADO ACTUAL**: catálogo mínimo (`Exercise`, ver sección 8) — sin contenido real cargado todavía, solo el esquema y las factories de test. Almacenamiento de video recomendado (no implementado): object storage + CDN (ver `docs/DECISIONS.md`), por compatibilidad con URLs públicas de WhatsApp Cloud API y para no pagar ancho de banda repetido sirviendo el mismo video desde el propio servidor de aplicación.
 
 ## 10. Proactividad
 
-**PENDIENTE — no implementado.** El sistema es hoy 100% reactivo (solo responde a webhooks entrantes). `WhatsAppTemplate` (con `is_reengagement`) ya existe y es la pieza que se reutilizará como base del motor de proactividad.
+**PENDIENTE — no implementado.** El sistema es hoy 100% reactivo (solo responde a webhooks entrantes). `WhatsAppTemplate` (con `is_reengagement`) y, desde el ajuste de Hito 8, `App\Core\Notifications\CustomerNotifier` (sección 8.6) ya existen como la base de entrega que reutilizará el motor de proactividad — este último decide únicamente el mecanismo de envío (libre vs. plantilla), nunca cuándo ni por qué contactar; esas reglas viven exclusivamente en Proactivity cuando se construya, no en `CustomerNotifier`.
 
-## 11. Pagos
+## 11. Pagos (Hito 8 — implementado: flujo manual Nequi/Daviplata)
 
-**PENDIENTE — no implementado.** Diseño aprobado como referencia: `Payment` → `PaymentMethod` → `PaymentProviderInterface` (pasarelas con webhook) / `VerificationProviderInterface` (transferencia manual con evidencia + reglas deterministas), sin auto-aprobación automática en la primera versión.
+**ESTADO ACTUAL**: `App\Payments\*` es el segundo namespace de Domain real (después de Training, Hito 4). Flujo:
+
+```
+"Quiero pagar" → PaymentHandler(payment_options) → muestra métodos configurados en el Tenant
+  → usuario elige → PaymentHandler(payment_instructions) → crea Payment(pending) + instrucciones
+  → usuario envía comprobante (texto o imagen) → PaymentHandler(receipt_submission)
+       → ReceiptExtractionService (Extract, IA — solo lee lo visible, nunca decide)
+       → PaymentValidationService (Decide, determinista — produce validation_flags, nunca confirma/rechaza)
+       → Payment(under_review) + PaymentReceipt creado
+       → AlertService->send(category:'payments', severity:Warning) → WhatsApp al superadmin + AlertLog
+  → superadmin revisa en Filament (PaymentResource) → Confirmar/Rechazar (is_super_admin, nota registrada)
+       → App\Payments\Support\PaymentConfirmationService — ÚNICO camino a TrainingAccess
+           → idempotente: repetir confirm()/reject() sobre un Payment ya resuelto es no-op completo
+           → confirma: extiende TrainingAccess.expires_at (+1 mes, sin perder días ya pagados)
+                       → CustomerNotifier->notify(..., 'payment_confirmed', ...) tras persistir
+           → rechaza: no toca TrainingAccess en absoluto
+                       → CustomerNotifier->notify(..., 'payment_rejected', ...) tras persistir
+```
+
+`PaymentHandler` no importa `TrainingAccess` (verificado por arch test, no solo por convención) — `TrainingAccessGate`/`TrainingEngine` no se modificaron en absoluto para este hito; el propio `SafetySignalDetector` (Hito 4) ya anticipaba este momento en su propio comentario. `PaymentConfirmationService` tampoco importa Graph API/nombres de plantilla — delega toda la decisión de canal en `CustomerNotifier` (sección 8.6). Un fallo de notificación nunca revierte ni bloquea la confirmación/rechazo, que ya quedó persistida antes de intentar notificar.
+
+Entidades: `Payment` (sin `tenant_id` propio, vía `Contact`, mismo precedente de Hito 4), `PaymentReceipt` (uno por intento de comprobante — separada de `Payment` por el mismo motivo de granularidad que separó `ExerciseLog`/`ExerciseSet`). `Subscription` y `PaymentMethod` como tabla quedan diferidas explícitamente — "1 mes de acceso + renovación" se resuelve reutilizando `TrainingAccess.expires_at`, sin entidades nuevas.
+
+**Preparado para el futuro, no implementado**: `PaymentConfirmationService::confirm()` acepta un `?User $reviewer` nullable — el mismo método debe poder invocarse desde un webhook de pasarela real sin cambiar su firma, con la pasarela como autoridad automática (a diferencia de un comprobante manual, que siempre exige revisión humana). Ver D025 en `docs/DECISIONS.md`.
+
+**Confirmación/rechazo por WhatsApp del superadmin — auditado, explícitamente NO implementado**: hoy la única interfaz administrativa es Filament (`PaymentResource`). Un comando determinista (`CONFIRMAR <id>` / `RECHAZAR <id> <motivo>`) desde el WhatsApp del superadmin se diseñaría como un `PreRoutingScreen` nuevo (mismo mecanismo de la sección 8.4), que verificaría teléfono autorizado + sintaxis exacta antes de delegar en `PaymentConfirmationService` — heredando gratis su idempotencia (ver D029). Sin este screen, ningún mensaje del superadmin puede confundirse con un comando administrativo porque el parser simplemente no existe todavía.
+
+**Corregido en la validación E2E real de este ajuste** (ver D027/D028 en `docs/DECISIONS.md`): el webhook no reconocía mensajes `type: image` (caían en silencio antes de despachar el Job), y la imagen Docker de producción no tenía la extensión `bcmath` que `PaymentValidationService` necesita para comparar montos.
+
+**Visión de IA**: verificado empíricamente en este hito que OpenAI (`gpt-4o-mini`) y Grok (`grok-4.20-0309-non-reasoning`, distinto del modelo de chat barato por defecto) leen comprobantes correctamente — sin necesidad de agregar ningún proveedor nuevo. Gemini implementado pero no verificado con una key real.
 
 ## 12. Dashboard
 

@@ -9,6 +9,10 @@ app/
                      enrutamiento — CERO lógica de negocio, ver Hito 2, 3 y 5)
   Core/Memory/      ContextFragment, ContextProviderInterface, ContextBuilder
                      (mecanismo de memoria estructurada — primer proveedor real desde Hito 5)
+  Core/Alerts/      Alert, AlertSeverity, AlertChannelInterface, AlertService,
+                     Channels/{PersistedAlertChannel,WhatsAppAdminAlertChannel}
+                     (infraestructura transversal de notificación — fan-out a todos los
+                     canales que soporten la Alert, no solo el primero; ver Hito 7.1)
   Handlers/         FallbackChatHandler (Handler heredado del e-commerce — TODA la lógica
                      conversacional de ese dominio vive aquí, fuera de Core a propósito)
   Training/         Engine/TrainingEngine (paso "Decide", determinista), Handlers/
@@ -20,11 +24,17 @@ app/
                      ExecutionReportService,ExecutionReportRecorder,ExecutionReportOutcome,
                      AccessGateResult,TrainingAccessDeniedException}, Enums/* (vocabulario
                      cerrado del dominio, incluye RpeCategory) — ver Hito 4, 5 y 6.
+  Payments/         Enums/{PaymentStatus,PaymentMethodType}, Support/{PaymentIntentClassifier,
+                     ReceiptExtractionService,PaymentValidationService,PaymentConfirmationService},
+                     Handlers/PaymentHandler (único Handler real — payment_options/
+                     payment_instructions/receipt_submission/payment_status son subflujos
+                     internos, no intents separados) — segundo namespace de Domain, mismo
+                     criterio que App\Training\* (Hito 8)
   Models/           Tenant, User, Contact, Conversation, Product, ProductImage,
                      WhatsAppMessage, WhatsAppTemplate, TrainingProfile, Exercise,
                      WorkoutSession, WorkoutExercise, ExerciseLog, ExerciseSet,
-                     TrainingAccess (Hito 4 — plano, mismo namespace que el resto,
-                     no App\Training\Models)
+                     TrainingAccess, AlertLog, Payment, PaymentReceipt (todos planos,
+                     mismo namespace, no App\Training\Models / App\Payments\Models)
   Http/Controllers/ WhatsAppController (webhook Meta)
   Http/Middleware/  CheckTenantSetup
   Jobs/             ProcessWhatsAppMessage (orquestador delgado: Ingest → Router → Dispatcher,
@@ -68,7 +78,8 @@ Desde el Hito 2, `App\Core\Messaging\*` y `App\Handlers\*` son la primera fronte
 - **Prescrito vs. ejecutado nunca se mezclan.** `WorkoutExercise` = lo que el Training Engine decidió y mostró. `ExerciseLog`/`ExerciseSet` = lo que el usuario reportó. Ninguna escritura de ejecución debe tocar una columna `prescribed_*`.
 - **Acceso y seguridad pasan siempre por `TrainingAccessGate`.** Ningún Handler ni servicio debe generar contenido de entrenamiento sin invocar `TrainingAccessGate::authorize()` primero. `TrainingHandler` lo verifica explícitamente antes de llamar a `TrainingEngine` (que también lo verifica internamente, como defensa en profundidad) — no introducir un tercer mecanismo de verificación en paralelo.
 - **El LLM nunca decide seguridad por sí solo.** `SafetySignalDetector::detect()` es un backstop determinista de patrones, evaluado siempre sobre el texto crudo del mensaje **y**, durante onboarding, sobre `safety_signal_text` (una frase que el LLM puede señalar como parte de su JSON de extracción). Ninguna de las dos fuentes decide por sí sola — el bloqueo real siempre pasa por `TrainingProfile::flagForSafetyReview()` (determinista). Solo una acción humana explícita puede llamar a `clearSafetyFlag()` — nunca código automático ni una nueva respuesta del usuario.
-- **El LLM nunca decide onboarding, solo extrae y narra.** `App\Training\Support\OnboardingConversationService::extractFields()` valida cada campo contra el vocabulario permitido antes de devolverlo — un valor inválido se descarta, nunca se persiste. Qué campo preguntar a continuación lo decide `TrainingProfile::firstMissingOnboardingField()` (determinista); el LLM solo redacta la pregunta sobre el campo ya decidido (`nextQuestion()`).
+- **El LLM nunca decide onboarding, solo extrae y redacta.** Desde el Hito 5.1, `App\Training\Support\OnboardingConversationService::extractAndRespond()` hace Extract+Narrate en una sola llamada — `extracted.*` se valida contra el vocabulario permitido exactamente igual que antes (un valor inválido se descarta, nunca se persiste). El `next_action`/`response` que devuelve son solo una **señal**: qué campo preguntar a continuación lo sigue decidiendo `TrainingProfile::firstMissingOnboardingField()` (determinista, sin cambios); `OnboardingConversationService::resolveQuestion()` es quien compara el `next_action` del modelo contra el campo real que el código determinó — solo si coinciden se usa la redacción de la IA, si no, se usa `FALLBACK_QUESTIONS`. No agregar nunca una ruta donde el valor `next_action`/`response` del modelo se use sin pasar por esa verificación. Ver D026.
+- **`restrictions` y `safety_signal_text` son independientes en el prompt de onboarding.** No volver a redactar el prompt de forma que "cualquier mención de dolor" apunte solo a `safety_signal_text` — un hallazgo real del Hito 8 mostró que eso impedía completar `restrictions` con limitaciones físicas ordinarias. `safety_signal_text` debe seguir acotado a las mismas categorías que `SafetySignalDetector` ya reconoce como urgencia real.
 - **El mensaje de entrega del entrenamiento se construye sin LLM.** Ver `TrainingHandler::buildWorkoutMessage()` — texto determinista desde `WorkoutExercise`, para que el LLM nunca pueda alterar series/repeticiones/cargas al comunicarlas.
 - **`Exercise` es catálogo global.** No agregar `tenant_id` a `Exercise` sin una decisión explícita — ver D018.
 - **Clasificación de intents de Training es determinista, sin LLM** (`TrainingIntentClassifier`) — no agregar una llamada de IA a la clasificación sin una decisión explícita, ya que corre en el camino de cada mensaje entrante. Tres señales, todas deterministas: palabra clave, `TrainingProfile` incompleto, o `WorkoutSession` pendiente (`scheduled`) para el `Contact`. Ver D019, D020.
@@ -77,6 +88,18 @@ Desde el Hito 2, `App\Core\Messaging\*` y `App\Handlers\*` son la primera fronte
 - **No completar automáticamente series/reps/carga/RPE faltantes.** Si un reporte no trae ningún dato cuantificable ni cualitativo, `ExecutionReportRecorder` pregunta en vez de inferir — nunca usa la prescripción (`WorkoutExercise`) como sustituto de lo que el usuario no dijo.
 - **Toda conversación de Training pasa por `TrainingHandler::logInbound()`/`reply()`.** No llamar a `WhatsAppService::sendMessage()` directamente desde un subflujo nuevo — eso rompería la persistencia en `WhatsAppMessage` que Hito 6 resolvió como deuda de Hito 5.
 - **Memoria conversacional (`WhatsAppMessage`) y historial de entrenamiento (`ExerciseLog`/`ExerciseSet`) nunca se mezclan.** Ningún código debe escribir en ambas desde el mismo punto pensando que son la misma fuente de verdad — se correlacionan solo a través de `Contact`.
+
+## Dominio Payments (Hito 8)
+
+- **`TrainingAccess` solo se modifica desde `PaymentConfirmationService`.** `PaymentHandler` no debe importar `App\Models\TrainingAccess` bajo ninguna circunstancia — verificado por `tests/Feature/Payments/PaymentIsolationArchTest.php`, no solo por convención. Confirmar/rechazar un pago SIEMPRE pasa por ese servicio, nunca por una escritura directa desde un Handler o una acción de Filament.
+- **La IA nunca confirma un pago.** `ReceiptExtractionService` (Extract) solo puede devolver `null` para un campo no legible — nunca decide si el monto es correcto ni si el pago es válido. `PaymentValidationService` (Decide, determinista, sin IA) solo produce `validation_flags`; la decisión de `confirmed`/`rejected` es siempre una acción humana explícita (`is_super_admin`) o, en el futuro, un webhook de pasarela verificado — nunca el LLM.
+- **Un `Payment` nunca se crea ni se edita a mano desde Filament.** `PaymentResource` no tiene páginas de crear/editar a propósito — solo se revisa (Confirmar/Rechazar). Si algún día hace falta editar un campo, es una señal de que falta un flujo conversacional o administrativo real, no un formulario genérico.
+- **Nunca hardcodear Colombia/COP en `App\Payments\*`.** Toda configuración de país/moneda/métodos vive en `Tenant` (`currency`, `country`, `monthly_price`, `nequi_number`, `daviplata_number`, `gateway_provider`). Un método sin configurar (`null`) simplemente no se ofrece — no usar un valor por defecto de negocio dentro del código.
+- **Visión de IA usa un modelo dedicado, nunca `Tenant.ai_model`.** `AiServiceInterface::analyzeImage()` en cada servicio (`OpenAIService`/`GrokService`/`GeminiService`) usa una constante de modelo propia (`VISION_MODEL`), verificada empíricamente por proveedor — el modelo de chat del Tenant se elige por costo (ver `AIServiceFactory::DEFAULT_MODELS`) y no tiene por qué soportar visión.
+- **Un comprobante es evidencia de auditoría — nunca se borra.** A diferencia del audio de `Ingest` (transitorio, se borra tras transcribir), `PaymentHandler::persistReceiptFile()` copia el archivo descargado a una ubicación permanente (`receipts/{tenant_id}/...`) antes de que cualquier limpieza posterior pudiera afectarlo.
+- **Safety Review comparte la misma convención que Payment.** `TrainingProfile::clearSafetyFlag(User $reviewer, string $note)` tiene exactamente el mismo shape que `PaymentConfirmationService::confirm()`/`reject()` (reviewer + nota + timestamp) — si se agrega un tercer flujo de "revisión humana" en el futuro, debe seguir el mismo patrón, no inventar uno nuevo.
+- **`PaymentConfirmationService::confirm()`/`reject()` son idempotentes (ajuste de Hito 8).** Verifican `$payment->status` antes de escribir nada — una segunda llamada sobre un Payment ya resuelto es un no-op completo (no re-extiende `TrainingAccess`, no re-notifica). Cualquier canal nuevo que llegue a estos métodos (Filament hoy; un futuro comando de WhatsApp del superadmin, no implementado) hereda la protección gratis — **nunca dupliques esta verificación en el canal**, la guarda vive únicamente aquí.
+- **La notificación al cliente nunca vive en `PaymentHandler` ni en Filament.** `PaymentConfirmationService` llama a `CustomerNotifier::notify()` después de persistir el cambio de estado — ver "Cómo notificar a un cliente desde un dominio nuevo" más abajo.
 
 ## Observabilidad del pipeline real (Hito 7)
 
@@ -98,6 +121,43 @@ Nueva instrumentación siempre debe ser **aditiva** (un `Log::info`/`Log::warnin
 ## Prueba E2E real con Meta/WhatsApp
 
 Ver **`docs/E2E_META_RUNBOOK.md`** para el checklist completo (credenciales necesarias, cómo levantar el túnel con `herd share`, cómo crear un `Tenant`/`Exercise` de prueba, y los escenarios A-E a ejecutar). El entorno de desarrollo actual no tiene credenciales de Meta configuradas — ver D021.
+
+## Cómo emitir una alerta desde un dominio nuevo (Hito 7.1)
+
+```php
+app(\App\Core\Alerts\AlertService::class)->send(new \App\Core\Alerts\Alert(
+    category: 'payments',                                  // string libre — el nombre del dominio/subsistema
+    severity: \App\Core\Alerts\AlertSeverity::Warning,      // Info | Warning | Critical (solo Warning/Critical llegan a WhatsApp)
+    message: 'Pago #23 pendiente de verificación',
+    context: ['tenant_id' => $tenant->id, 'payment_id' => 23],
+));
+```
+
+- Nunca construyas un mensaje de WhatsApp ni resuelvas un destinatario en tu propio dominio — `AlertService` y sus canales (`App\Core\Alerts\Channels\*`) son los únicos que conocen ese detalle.
+- Incluye `tenant_id` en `context` si tu alerta debe entregarse por WhatsApp (`WhatsAppAdminAlertChannel` no puede resolver un emisor Meta sin él).
+- No incluyas nunca un valor sensible en `context` bajo una clave que contenga `key`/`token`/`password`/`secret`/`credential` — `Alert` lo redacta automáticamente, pero es mejor no depender de eso: pasa solo identificadores (IDs, nombres, razones).
+
+## Cómo notificar a un cliente desde un dominio nuevo (Hito 8, ajuste)
+
+`AlertService` es para operadores/superadmins. Si en cambio necesitas avisarle algo **al cliente final** (transaccional, no una alerta administrativa), usa `App\Core\Notifications\CustomerNotifier`:
+
+```php
+app(\App\Core\Notifications\CustomerNotifier::class)->notify(
+    tenant: $tenant,
+    to: $contact->customer_phone,
+    eventKey: 'payment_confirmed',                 // string libre — ver más abajo cómo registrar uno nuevo
+    variables: ['amount' => '50.000 COP', 'method' => 'Nequi'],
+    freeFormText: '✅ Tu pago fue confirmado. Tu acceso ya está activo. 💪',
+);
+```
+
+- **Nunca** construyas tú mismo la llamada a Meta ni decidas mensaje-libre-vs-plantilla en tu dominio — `CustomerNotifier` es el único que conoce `Conversation.last_session_at`/la regla de ventana (23h30m) y `WhatsAppService`.
+- `freeFormText` es el mensaje que se envía tal cual si la ventana de 24h sigue abierta — la misma redacción humana que ya usarías en un `PaymentHandler::reply()`.
+- `variables` son valores YA resueltos por tu dominio (nunca resuelvas tú un `parameters_map` ni sepas de posiciones `{{1}}`, `{{2}}`) — si la ventana está cerrada, `CustomerNotifier` los cruza contra el `parameters_map` de la `WhatsAppTemplate` que un operador registró para ese `eventKey`.
+- **Para que la plantilla exista**: un operador (o superadmin) crea/edita una fila en `WhatsAppTemplate` (Filament → WhatsApp Templates) con el `name`/`language` reales aprobados por Meta, y selecciona tu `eventKey` en el campo "Evento del sistema". Si no existe ninguna plantilla para ese `(tenant_id, eventKey)`, `CustomerNotifier` solo loguea (`CUSTOMER_NOTIFIER_TEMPLATE_NOT_CONFIGURED`) y no revienta — pero tampoco entrega nada fuera de ventana hasta que se configure.
+- Un fallo de entrega (plantilla no configurada, Meta la rechaza, error de red) **nunca** se propaga — mismo contrato que `AlertService::send()`. No envuelvas la llamada en tu propio try/catch, ya es innecesario.
+- `eventKey` es un string libre a propósito (mismo criterio que `Alert::category`) — no hace falta tocar `CustomerNotifier` para agregar un evento nuevo, solo definir el nombre en tu dominio y registrar la plantilla correspondiente en Filament.
+- Un canal nuevo (email, push, Slack) se agrega implementando `AlertChannelInterface` y registrándolo en el array de `AppServiceProvider` — igual que agregar un `IntentClassifier` o un `ContextProvider`.
 
 ## Convenciones de nombres
 

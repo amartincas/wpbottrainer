@@ -16,6 +16,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 #[Fillable([
     'contact_id',
+    'payment_id',
     'status',
     'granted_at',
     'expires_at',
@@ -38,6 +39,16 @@ class TrainingAccess extends Model
     public function contact(): BelongsTo
     {
         return $this->belongsTo(Contact::class);
+    }
+
+    /**
+     * Hito 8: trazabilidad de qué Payment originó/extendió este acceso.
+     * Nullable — accesos otorgados manualmente (ej. Hito 7, antes de que
+     * Payments existiera) no tienen uno.
+     */
+    public function payment(): BelongsTo
+    {
+        return $this->belongsTo(Payment::class);
     }
 
     public function isCurrentlyValid(): bool

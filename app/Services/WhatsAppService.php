@@ -317,6 +317,16 @@ class WhatsAppService
                     $extension = 'm4a';
                 } elseif (str_contains($contentType, 'ogg')) {
                     $extension = 'ogg';
+                } elseif (str_contains($contentType, 'jpeg') || str_contains($contentType, 'jpg')) {
+                    // Hito 8 (Payments): comprobantes llegan como imagen, no
+                    // audio — sin esto, un JPEG se guardaba con extensión
+                    // .ogg por el default de arriba (el contenido seguía
+                    // siendo correcto, pero la extensión engañaba).
+                    $extension = 'jpg';
+                } elseif (str_contains($contentType, 'png')) {
+                    $extension = 'png';
+                } elseif (str_contains($contentType, 'webp')) {
+                    $extension = 'webp';
                 }
             }
 

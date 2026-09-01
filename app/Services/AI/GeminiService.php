@@ -18,6 +18,46 @@ class GeminiService implements AiServiceInterface
     }
 
     /**
+     * Hito 8 (Payments) — a diferencia de OpenAI y Grok, esta implementación
+     * NO fue verificada con una key real durante este hito (no había
+     * ninguna credencial de Gemini configurada en ningún Tenant existente).
+     * Sigue el formato documentado públicamente de la API de Gemini
+     * (`inline_data` dentro de `parts`, mismo endpoint `generateContent` ya
+     * usado por getResponse()) — debe confirmarse con una prueba real antes
+     * de activar `ai_provider: gemini` para un Tenant que use comprobantes
+     * de pago con imagen.
+     */
+    public function analyzeImage(string $base64Image, string $mimeType, string $prompt): string
+    {
+        try {
+            $response = Http::withHeaders([
+                'x-goog-api-key' => $this->apiKey,
+                'Content-Type' => 'application/json',
+            ])
+                ->timeout(30)
+                ->post("https://generativelanguage.googleapis.com/v1beta/models/{$this->model}:generateContent", [
+                    'contents' => [[
+                        'role' => 'user',
+                        'parts' => [
+                            ['text' => $prompt],
+                            ['inline_data' => ['mime_type' => $mimeType, 'data' => $base64Image]],
+                        ],
+                    ]],
+                    'generationConfig' => ['maxOutputTokens' => 500],
+                ]);
+
+            if ($response->failed()) {
+                $errorMessage = $response->json()['error']['message'] ?? $response->body();
+                throw new \Exception('Gemini vision error: '.$errorMessage);
+            }
+
+            return $response->json('candidates.0.content.parts.0.text') ?? '';
+        } catch (\Exception $e) {
+            throw new \Exception('Gemini vision service error: '.$e->getMessage());
+        }
+    }
+
+    /**
      * Get a response from Google Gemini API.
      *
      * @param string $userMessage The user's message

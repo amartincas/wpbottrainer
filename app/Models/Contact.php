@@ -60,6 +60,16 @@ class Contact extends Model
     }
 
     /**
+     * Hito 8 — dominio Payments. Igual que Training: Contact sigue siendo la
+     * única identidad, esta relación expone datos que pertenecen a
+     * Payments, no a Core.
+     */
+    public function payments(): HasMany
+    {
+        return $this->hasMany(Payment::class);
+    }
+
+    /**
      * Mark the contact as processed.
      */
     public function markAsProcessed(): void
