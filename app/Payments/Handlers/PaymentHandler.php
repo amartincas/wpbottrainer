@@ -318,23 +318,54 @@ class PaymentHandler implements HandlerInterface
         return false;
     }
 
+    /**
+     * Traduce cada `validation_flags` (claves técnicas de
+     * PaymentValidationService, sin cambios) a una frase legible para el
+     * superadmin en WhatsApp — Filament sigue mostrando la clave técnica tal
+     * cual (badges de PaymentsTable/PaymentInfolist, sin tocar), esto es
+     * exclusivamente para el texto de la alerta.
+     */
+    private const FLAG_DESCRIPTIONS = [
+        'uncertain_extraction' => 'La IA no está segura de los datos extraídos — revisa el comprobante.',
+        'amount_unreadable' => 'No se pudo leer el monto del comprobante.',
+        'amount_mismatch' => 'El monto detectado no coincide con el esperado.',
+        'reference_missing' => 'No se encontró número de referencia.',
+        'reference_already_used' => 'Esa referencia ya fue usada en otro pago confirmado.',
+        'date_unreadable' => 'Fecha no pudo validarse automáticamente.',
+        'stale_receipt' => 'El comprobante parece tener más de 15 días.',
+    ];
+
     private function emitPaymentAlert(Payment $payment, Tenant $tenant): void
     {
         try {
-            $flagsSummary = $payment->validation_flags !== []
-                ? "\n⚠️ ".implode(', ', $payment->validation_flags)
-                : '';
+            $extracted = $payment->extracted_data ?? [];
 
             $lines = [
                 '🚨 Pago pendiente de verificación',
                 "Pago #{$payment->id}",
-                "Usuario: {$payment->contact->customer_phone}",
+                '',
+                'DATOS DEL COMPROBANTE',
+                'Monto detectado: '.$this->formatAmount($extracted['amount'] ?? null, $payment->currency),
+                'Monto esperado: '.$this->formatAmount((float) $payment->amount, $payment->currency),
+                // NUNCA sustituir por now() ni ninguna otra fecha inferida —
+                // exclusivamente lo que la IA extrajo literalmente, o "no
+                // disponible" si no extrajo nada (ver docs/DECISIONS.md).
+                'Fecha extraída: '.($extracted['date'] ?? 'no disponible'),
+                'Referencia: '.($extracted['reference'] ?? 'no legible'),
                 "Método: {$payment->method_label}",
-                'Monto: '.number_format((float) $payment->amount, 0, ',', '.').' '.$payment->currency,
-                'Fecha: '.now()->format('Y-m-d'),
-                'Referencia: '.($payment->extracted_data['reference'] ?? 'no legible'),
-                'Estado: pendiente'.$flagsSummary,
+                "Usuario: {$payment->contact->customer_phone}",
             ];
+
+            if ($payment->validation_flags !== []) {
+                $lines[] = '';
+                $lines[] = '⚠️ ADVERTENCIAS DE VALIDACIÓN';
+                foreach ($payment->validation_flags as $flag) {
+                    $lines[] = '- '.(self::FLAG_DESCRIPTIONS[$flag] ?? $flag);
+                }
+            }
+
+            $lines[] = '';
+            $lines[] = 'Estado: pendiente de revisión';
 
             $this->alerts->send(new Alert(
                 category: 'payments',
@@ -349,6 +380,15 @@ class PaymentHandler implements HandlerInterface
         } catch (\Throwable $e) {
             Log::error('PAYMENT_ALERT_EMIT_FAILED', ['payment_id' => $payment->id, 'error' => $e->getMessage()]);
         }
+    }
+
+    private function formatAmount(?float $amount, string $currency): string
+    {
+        if ($amount === null) {
+            return 'no disponible';
+        }
+
+        return number_format($amount, 0, ',', '.').' '.$currency;
     }
 
     private function logInbound(Tenant $tenant, string $from, string $rawBody): void
