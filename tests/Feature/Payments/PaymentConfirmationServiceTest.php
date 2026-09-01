@@ -5,6 +5,7 @@ use App\Models\Conversation;
 use App\Models\Payment;
 use App\Models\TrainingAccess;
 use App\Models\User;
+use App\Models\WhatsAppMessage;
 use App\Models\WhatsAppTemplate;
 use App\Models\WorkoutSession;
 use App\Payments\Enums\PaymentStatus;
@@ -255,12 +256,15 @@ it('does not send either message a second time when confirm() is retried on an a
     Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
     app(PaymentConfirmationService::class)->confirm($payment, $reviewer);
     Http::assertSentCount(2);
+    $messageCountAfterFirstConfirm = WhatsAppMessage::where('customer_phone', $contact->customer_phone)->count();
+    expect($messageCountAfterFirstConfirm)->toBe(2); // payment_confirmed + training_invite, persistidos (Hito 8.1)
 
     Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]); // reinicia el contador
 
     app(PaymentConfirmationService::class)->confirm($payment->fresh(), $reviewer); // reintento
 
     Http::assertNothingSent(); // ni la notificación de pago ni la invitación se repiten
+    expect(WhatsAppMessage::where('customer_phone', $contact->customer_phone)->count())->toBe($messageCountAfterFirstConfirm); // tampoco se duplica el historial
 });
 
 it('sends the training invite as a free-form message when the conversation window is open', function () {

@@ -6,6 +6,7 @@ use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\IntentClassifierInterface;
 use App\Models\Contact;
+use App\Training\Enums\TrainingAccessStatus;
 use App\Training\Enums\WorkoutSessionStatus;
 
 /**
@@ -57,7 +58,10 @@ class TrainingIntentClassifier implements IntentClassifierInterface
             return null;
         }
 
-        if ($this->hasIncompleteOnboarding($contact) || $this->hasPendingWorkoutSession($contact)) {
+        if ($this->hasIncompleteOnboarding($contact)
+            || $this->hasPendingWorkoutSession($contact)
+            || $this->hasActiveAccessAwaitingFirstWorkout($contact)
+        ) {
             return Intent::Training;
         }
 
@@ -76,5 +80,31 @@ class TrainingIntentClassifier implements IntentClassifierInterface
         return $contact->workoutSessions()
             ->where('status', WorkoutSessionStatus::Scheduled)
             ->exists();
+    }
+
+    /**
+     * Hito 8.1 — hallazgo real del E2E comercial: un contacto con acceso
+     * recién activado, sin ninguna WorkoutSession todavía, respondiendo a la
+     * invitación a entrenar ("Sí", "Dale", "Listo") no contiene ninguna
+     * palabra clave de Training ni cae en ninguna otra señal de estado — el
+     * Router caía por defecto a fallback_chat (el chat genérico heredado de
+     * ecommerce), que improvisaba una respuesta sin autoridad real.
+     *
+     * Deliberadamente acotada a este caso concreto (acceso activo + cero
+     * WorkoutSession) — NO es un mecanismo general de "qué se espera del
+     * usuario en cualquier estado conversacional futuro"; eso es una
+     * responsabilidad de un futuro motor de Proactivity/estado
+     * conversacional, no de este clasificador determinista. Ver
+     * docs/DECISIONS.md.
+     */
+    private function hasActiveAccessAwaitingFirstWorkout(Contact $contact): bool
+    {
+        $access = $contact->trainingAccess;
+
+        if ($access === null || $access->status !== TrainingAccessStatus::Active) {
+            return false;
+        }
+
+        return ! $contact->workoutSessions()->exists();
     }
 }

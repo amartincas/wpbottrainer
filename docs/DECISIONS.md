@@ -514,6 +514,33 @@ Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar
 
 ---
 
+### D032 — Hito 8.1: continuidad Payment → Training (hallazgo real del primer E2E comercial)
+
+**CONTEXTO**: el primer E2E comercial completo (onboarding → pago → confirmación → invitación → entrenamiento) NO fue satisfactorio. El pendiente de D031 se confirmó: el cliente respondió "Sí" a la invitación a entrenar y el sistema respondió con un mensaje inventado ("tu servicio está activado... vamos a crear tu p[lan]") en vez de generar el entrenamiento; el turno siguiente terminó en 3 timeouts reales de Grok (30002ms c/u) y el mensaje genérico "estoy experimentando dificultades técnicas".
+
+**AUDITORÍA (evidencia real, logs + BD del VPS, no solo código)**: reconstruida la conversación completa vía `WhatsAppMessage`/logs de `queue`. Hallazgo central único que explica casi todo: **no existía ninguna señal de estado que le indicara al `Router` que un contacto recién activado, sin ningún entrenamiento aún, debía seguir en Training** — `TrainingIntentClassifier` solo reconocía palabra clave, onboarding incompleto, o `WorkoutSession` en `Scheduled`; ninguna aplica justo después de confirmar un pago. El mensaje "Sí" (sin palabra clave) caía por defecto en `Intent::FallbackChat` → el chat genérico heredado de ecommerce (Hito 1) improvisaba una respuesta sin autoridad real, y su propio prompt (no relacionado con Training) es lo que llevó al usuario a reenviar "51 años, peso 81, estatura 1,75..." — nunca fue `TrainingHandler` re-preguntando (verificado en BD: `TrainingProfile` conservó íntegros los 5 campos reales de Training en todo momento). El timeout de Grok fue un evento real de red, pero nunca debió ocurrir en ese handler para ese mensaje.
+
+**Hallazgo colateral encontrado en la misma auditoría**: `CustomerNotifier` (D029) nunca persistía sus envíos en `WhatsAppMessage` — los mensajes de `payment_confirmed`/`training_invite` llegaban de verdad al cliente pero eran invisibles en el historial que usa `FallbackChatHandler` para construir su prompt (y en el panel `WhatsAppChatCenter`), agravando la confusión de la IA genérica al responder "Sí".
+
+**Otras observaciones auditadas, con causa raíz identificada pero explícitamente diferidas** (no implementadas en este ajuste): confirmación/rechazo de Payments por comando de WhatsApp del superadmin (sigue siendo D029, 0% implementado — el mensaje real "Aprobado pago 4" coincidió con la keyword "pago" de `PaymentIntentClassifier` y cayó en `handlePaymentOptions()`); preguntas de onboarding configurables por administrador (feature nueva, `FALLBACK_QUESTIONS`/`NEXT_ACTION_MAP` siguen siendo constantes PHP fijas).
+
+**DECISIÓN TOMADA** (3 cambios mínimos, todos aditivos):
+1. **`TrainingIntentClassifier::hasActiveAccessAwaitingFirstWorkout(Contact $contact)`** (nueva señal, mismo patrón que `hasIncompleteOnboarding()`/`hasPendingWorkoutSession()`): `TrainingAccess.status = Active` Y cero `WorkoutSession` para el contacto → fuerza `Intent::Training` sin importar el texto del mensaje. Deliberadamente acotada a este caso concreto — NO es un mecanismo general de estado conversacional para el futuro (eso es responsabilidad de un futuro Proactivity/motor de estado, no de este clasificador determinista).
+2. **`CustomerNotifier` persiste cada envío en `WhatsAppMessage`** (`role: assistant`) antes de intentar el envío real — mismo patrón que `PaymentHandler::reply()`/`TrainingHandler::reply()`, y también trackea el WAMID vía `WhatsAppStatusTracker`. Para la rama de plantilla (ventana cerrada) se persiste el texto libre equivalente, no la plantilla cruda con `{{N}}` — mantiene el historial legible. No se persiste nada si no hay plantilla configurada (no se envió nada realmente).
+3. **`TrainingHandler::ACCESS_REQUIRED_MESSAGE` reescrito**: de *"Contáctanos para activarlo"* (vago) a una instrucción explícita — *"Escribe 'quiero pagar' para ver las opciones."*
+
+**No se tocó**: `TrainingEngine`, `PaymentValidationService`, `FallbackChatHandler`, Safety, `AlertService`, ni se implementó `ProactivityEngine`.
+
+**IMPACTO**: `app/Training/Support/TrainingIntentClassifier.php` (+señal), `app/Core/Notifications/CustomerNotifier.php` (+persistencia), `app/Training/Handlers/TrainingHandler.php` (mensaje reescrito). Tests nuevos: `TrainingIntentClassifierTest.php` (+6: acceso activo sin `WorkoutSession` fuerza training con "Sí"/"Dale"/mensaje sin keyword; no aplica sin `TrainingAccess`; no aplica con `TrainingAccess` no-`Active`; no aplica con una `WorkoutSession` ya existente), `CustomerNotifierTest.php` (+4: persiste mensaje libre, persiste texto equivalente en la rama de template, no persiste si no se envió nada, una sola invocación no duplica internamente), `tests/Feature/PaymentToTrainingIntegrationTest.php` (nuevo, integración completa: pago confirmado → invitación → "Sí" → `WorkoutSession` → video). 2 tests existentes actualizados (`MetaWebhookTrainingE2ETest.php`, `Training/ExecutionReportFlowTest.php`, `Training/TrainingConversationFlowTest.php`) — su única aserción sobre el texto de `ACCESS_REQUIRED_MESSAGE` cambió legítimamente junto con el mensaje. 260 passed (22 fallos preexistentes de Fortify/Vite, sin cambio) — 11 tests nuevos netos.
+
+**JUSTIFICACIÓN**: el fix reutiliza exactamente el patrón ya validado dos veces en `TrainingIntentClassifier` (una señal de estado más, no una reescritura), y la persistencia en `CustomerNotifier` simplemente iguala un patrón ya usado en dos Handlers — ningún mecanismo nuevo, ninguna abstracción nueva.
+
+**RIESGOS**:
+- La señal `hasActiveAccessAwaitingFirstWorkout` fuerza `Intent::Training` para **cualquier** mensaje de un contacto en ese estado, no solo una respuesta a la invitación — aceptable porque el estado en sí (acceso activo, cero entrenamientos) es transitorio y de corta duración (desaparece en cuanto se genera la primera `WorkoutSession`), pero un mensaje genuinamente ajeno a Training en esa ventana (ej. una pregunta administrativa) también se enrutaría a Training.
+- Persistir el texto libre equivalente en la rama de plantilla significa que el historial de `WhatsAppMessage` no refleja el contenido literal exacto que Meta entregó (con variables ya sustituidas por Meta desde la plantilla aprobada) — aceptable para legibilidad interna, documentado como aproximación.
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

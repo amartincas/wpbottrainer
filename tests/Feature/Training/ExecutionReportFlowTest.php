@@ -445,7 +445,8 @@ it('blocks a report attempt when access is not granted, without touching Exercis
     sendMessageAsContact($contact->fresh(), 'Sentadilla 10x40');
 
     expect(ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->exists())->toBeFalse();
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar el servicio'));
+    // Mensaje actualizado en Hito 8.1 — instrucción explícita ("quiero pagar").
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso'));
 });
 
 // 21. Bloqueado por seguridad.

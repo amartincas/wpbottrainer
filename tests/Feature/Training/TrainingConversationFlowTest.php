@@ -111,9 +111,12 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
     expect($profile->goal->value)->toBe('build_muscle'); // conservado del primer turno
     expect($profile->sessions_per_week)->toBe(4);
 
-    // Sin acceso todavía -> se le informa que debe activar el servicio.
+    // Sin acceso todavía -> se le informa que debe activar el servicio, con
+    // instrucción explícita de cómo hacerlo (Hito 8.1 — el mensaje anterior
+    // ("Contáctanos") no invitaba a decir "quiero pagar").
     Http::assertSent(fn ($request) => $request->url() === 'https://graph.facebook.com/v20.0/'.$tenant->wa_phone_number_id.'/messages'
-        && str_contains(data_get($request->data(), 'text.body', ''), 'activar el servicio'));
+        && str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
 });
 
 // 11 y 12 (Hito 5.1): flujo completo de onboarding turno a turno + exactamente
@@ -161,7 +164,7 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
     expect($aiCalls)->toBe(5);
 });
 
-it('informs the user they need to activate the service when access is denied', function () {
+it('informs the user they need to activate the service when access is denied, with an explicit instruction (Hito 8.1)', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
     TrainingProfile::factory()->create(['contact_id' => $contact->id]); // complete, no TrainingAccess row
@@ -171,7 +174,11 @@ it('informs the user they need to activate the service when access is denied', f
     sendTrainingMessage($tenant, '573001112233', 'Dame mi entrenamiento de hoy');
 
     expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(0);
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar el servicio'));
+    // Hito 8.1 — hallazgo real del E2E comercial: el mensaje anterior
+    // ("Contáctanos para activarlo") era vago; ahora instruye explícitamente
+    // qué escribir para activar el acceso.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
     Http::assertSentCount(1); // no AI call at all — profile already complete
 });
 

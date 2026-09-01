@@ -193,7 +193,8 @@ it('persists the outbound message and logs the failure when Meta rejects the sen
 
     $botMessage = WhatsAppMessage::where('tenant_id', $tenant->id)->where('role', 'assistant')->first();
     expect($botMessage)->not->toBeNull();
-    expect($botMessage->content)->toContain('activar el servicio');
+    // Mensaje actualizado en Hito 8.1 — instrucción explícita ("quiero pagar").
+    expect($botMessage->content)->toContain('activar tu acceso');
 });
 
 it('degrades gracefully through the real webhook route when the AI provider fails during onboarding', function () {

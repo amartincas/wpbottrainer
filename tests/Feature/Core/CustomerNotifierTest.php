@@ -3,6 +3,7 @@
 use App\Core\Notifications\CustomerNotifier;
 use App\Models\Conversation;
 use App\Models\Tenant;
+use App\Models\WhatsAppMessage;
 use App\Models\WhatsAppTemplate;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -119,6 +120,90 @@ it('logs and swallows the failure when Meta rejects the template send, without t
     app(CustomerNotifier::class)->notify($tenant, '573001112233', 'payment_confirmed', [], 'libre');
 
     expect(true)->toBeTrue(); // llegar aquí sin excepción es la aserción real
+});
+
+// ── Persistencia en WhatsAppMessage (Hito 8.1) ──────────────────────────
+
+it('persists the free-form message in WhatsAppMessage, consistent with PaymentHandler/TrainingHandler history', function () {
+    $tenant = Tenant::factory()->create();
+    Conversation::create([
+        'tenant_id' => $tenant->id,
+        'customer_phone' => '573001112233',
+        'last_session_at' => now()->subHours(1),
+    ]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(CustomerNotifier::class)->notify(
+        $tenant, '573001112233', 'payment_confirmed', ['amount' => '50.000 COP'], 'Tu pago fue confirmado.'
+    );
+
+    $message = WhatsAppMessage::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->first();
+    expect($message)->not->toBeNull();
+    expect($message->role)->toBe('assistant');
+    expect($message->content)->toBe('Tu pago fue confirmado.');
+});
+
+it('persists the free-form equivalent text in WhatsAppMessage even when the actual channel used is a Template', function () {
+    $tenant = Tenant::factory()->create();
+    Conversation::create([
+        'tenant_id' => $tenant->id,
+        'customer_phone' => '573001112233',
+        'last_session_at' => now()->subHours(24),
+    ]);
+    WhatsAppTemplate::create([
+        'tenant_id' => $tenant->id,
+        'name' => 'payment_confirmed_v1',
+        'event_key' => 'payment_confirmed',
+        'body_preview' => 'Tu pago de {{1}} fue confirmado.',
+        'parameters_map' => ['1' => 'amount'],
+        'language' => 'es_CO',
+        'type' => 'utility',
+    ]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(CustomerNotifier::class)->notify(
+        $tenant, '573001112233', 'payment_confirmed', ['amount' => '50.000 COP'], 'Tu pago fue confirmado (texto libre).'
+    );
+
+    $message = WhatsAppMessage::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->first();
+    expect($message)->not->toBeNull();
+    expect($message->content)->toBe('Tu pago fue confirmado (texto libre).');
+});
+
+it('does not persist any WhatsAppMessage when no template is configured and the window is closed (nothing was actually sent)', function () {
+    $tenant = Tenant::factory()->create();
+    // Sin Conversation (ventana cerrada) y sin WhatsAppTemplate para el evento.
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(CustomerNotifier::class)->notify($tenant, '573001112233', 'payment_confirmed', [], 'libre');
+
+    expect(WhatsAppMessage::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->exists())->toBeFalse();
+});
+
+it('persists exactly one message and sends exactly once per notify() call — no internal duplication', function () {
+    // CustomerNotifier no es idempotente por sí mismo — esa guarda vive en
+    // quien decide SI llamar (PaymentConfirmationService, D029; ver ahí la
+    // prueba real de "un reintento de confirm() no duplica ningún mensaje").
+    // Esta prueba solo documenta que UNA invocación no produce, por error
+    // interno, más de un WhatsAppMessage o más de un envío.
+    $tenant = Tenant::factory()->create();
+    Conversation::create([
+        'tenant_id' => $tenant->id,
+        'customer_phone' => '573001112233',
+        'last_session_at' => now()->subHours(1),
+    ]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(CustomerNotifier::class)->notify(
+        $tenant, '573001112233', 'payment_confirmed', [], 'Tu pago fue confirmado.'
+    );
+
+    expect(WhatsAppMessage::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->count())->toBe(1);
+    Http::assertSentCount(1);
 });
 
 it('logs and swallows any unexpected exception without propagating it', function () {

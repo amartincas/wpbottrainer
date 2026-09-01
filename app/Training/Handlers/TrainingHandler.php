@@ -54,8 +54,8 @@ use Illuminate\Support\Facades\Log;
  */
 class TrainingHandler implements HandlerInterface
 {
-    private const ACCESS_REQUIRED_MESSAGE = 'Para generar tu entrenamiento personalizado necesitas activar el '
-        .'servicio de WpbotTrainer. Contáctanos para activarlo y podemos empezar de inmediato. 💪';
+    private const ACCESS_REQUIRED_MESSAGE = 'Tu perfil ya está listo. 💪 Para comenzar a entrenar necesitas activar '
+        .'tu acceso. Escribe "quiero pagar" para ver las opciones.';
 
     public function __construct(
         private readonly TrainingAccessGate $accessGate,

@@ -4,8 +4,10 @@ namespace App\Core\Notifications;
 
 use App\Models\Conversation;
 use App\Models\Tenant;
+use App\Models\WhatsAppMessage;
 use App\Models\WhatsAppTemplate;
 use App\Services\WhatsAppService;
+use App\Services\WhatsAppStatusTracker;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -56,7 +58,7 @@ class CustomerNotifier
                 return;
             }
 
-            $this->sendViaTemplate($tenant, $to, $eventKey, $variables);
+            $this->sendViaTemplate($tenant, $to, $eventKey, $variables, $freeFormText);
         } catch (\Throwable $e) {
             Log::error('CUSTOMER_NOTIFIER_FAILED', [
                 'tenant_id' => $tenant->id,
@@ -87,17 +89,14 @@ class CustomerNotifier
 
     private function sendFreeForm(Tenant $tenant, string $to, string $eventKey, string $text): void
     {
+        $message = $this->persistOutbound($tenant, $to, $text);
+
         $wamid = WhatsAppService::sendMessage($to, $text, $tenant);
 
-        Log::info('CUSTOMER_NOTIFIER_SENT', [
-            'tenant_id' => $tenant->id,
-            'event_key' => $eventKey,
-            'channel' => 'free_form',
-            'success' => $wamid !== null,
-        ]);
+        $this->trackDelivery($message, $wamid, $eventKey, 'free_form');
     }
 
-    private function sendViaTemplate(Tenant $tenant, string $to, string $eventKey, array $variables): void
+    private function sendViaTemplate(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText): void
     {
         $template = WhatsAppTemplate::where('tenant_id', $tenant->id)
             ->where('event_key', $eventKey)
@@ -114,15 +113,54 @@ class CustomerNotifier
 
         $orderedVariables = $this->resolveVariables($template, $variables);
 
+        // Se persiste el texto libre equivalente (no la plantilla cruda con
+        // {{N}}) — mantiene el historial legible en WhatsAppChatCenter/el
+        // contexto de FallbackChatHandler, igual que si la ventana hubiera
+        // estado abierta. El canal técnico realmente usado queda en el log
+        // CUSTOMER_NOTIFIER_SENT, no en WhatsAppMessage.
+        $message = $this->persistOutbound($tenant, $to, $freeFormText);
+
         $wamid = WhatsAppService::sendTemplateMessage($to, $template->name, $template->language, $orderedVariables, $tenant);
 
-        Log::info('CUSTOMER_NOTIFIER_SENT', [
+        $this->trackDelivery($message, $wamid, $eventKey, 'template', $template->name);
+    }
+
+    /**
+     * Mismo patrón ya usado por PaymentHandler::reply()/TrainingHandler::reply()
+     * — el historial de WhatsAppMessage debe quedar consistente sin importar
+     * qué componente originó el mensaje saliente. Se persiste ANTES de
+     * intentar el envío real (igual que esos dos) para que quede registro de
+     * lo que se intentó comunicar incluso si Meta rechaza el envío.
+     */
+    private function persistOutbound(Tenant $tenant, string $to, string $text): WhatsAppMessage
+    {
+        return WhatsAppMessage::create([
             'tenant_id' => $tenant->id,
-            'event_key' => $eventKey,
-            'channel' => 'template',
-            'template_name' => $template->name,
-            'success' => $wamid !== null,
+            'customer_phone' => $to,
+            'role' => 'assistant',
+            'content' => $text,
         ]);
+    }
+
+    private function trackDelivery(WhatsAppMessage $message, ?string $wamid, string $eventKey, string $channel, ?string $templateName = null): void
+    {
+        if ($wamid !== null) {
+            WhatsAppStatusTracker::trackMessage($message->id, $wamid);
+        } else {
+            Log::warning('CUSTOMER_NOTIFIER_META_SEND_FAILED', [
+                'whatsapp_message_id' => $message->id,
+                'event_key' => $eventKey,
+                'channel' => $channel,
+            ]);
+        }
+
+        Log::info('CUSTOMER_NOTIFIER_SENT', array_filter([
+            'tenant_id' => $message->tenant_id,
+            'event_key' => $eventKey,
+            'channel' => $channel,
+            'template_name' => $templateName,
+            'success' => $wamid !== null,
+        ], fn ($v) => $v !== null));
     }
 
     /**
