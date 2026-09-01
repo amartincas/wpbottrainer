@@ -143,11 +143,21 @@ class WhatsAppController extends Controller
         $body = $message['text']['body'] ?? null;
     } elseif (in_array($type, ['audio', 'voice'], true)) {
         $mediaId = $message[$type]['id'] ?? null;
-        
+
         // Keep body empty so ProcessWhatsAppMessage can trigger transcription logic
-        $body = null; 
-        
+        $body = null;
+
         Log::info('WhatsApp audio/voice message received', [
+            'tenant_id' => $tenant->id,
+            'customer_phone' => $fromPhone,
+            'message_id' => $phoneId,
+            'media_id' => $mediaId,
+        ]);
+    } elseif ($type === 'image') {
+        $mediaId = $message['image']['id'] ?? null;
+        $body = $message['image']['caption'] ?? null; // por si el usuario añade texto a la imagen
+
+        Log::info('WhatsApp image message received', [
             'tenant_id' => $tenant->id,
             'customer_phone' => $fromPhone,
             'message_id' => $phoneId,

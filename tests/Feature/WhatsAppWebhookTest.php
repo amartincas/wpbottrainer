@@ -98,6 +98,109 @@ it('ignores the webhook payload when no tenant matches the phone_number_id', fun
     Queue::assertNothingPushed();
 });
 
+it('resolves the tenant and dispatches the job on an incoming image message (comprobante de pago)', function () {
+    // Regression test for the Hito 8 defect: the controller only recognized
+    // 'text' and 'audio'/'voice' when extracting body/mediaId, so an incoming
+    // 'image' message (e.g. a Nequi/Daviplata payment receipt) fell through
+    // both branches, left body/mediaId both null, and was silently dropped by
+    // the (!$body && !$mediaId) guard before the job was ever dispatched.
+    Queue::fake();
+
+    $tenant = Tenant::factory()->create([
+        'wa_phone_number_id' => '1234567890',
+    ]);
+
+    $payload = [
+        'entry' => [[
+            'changes' => [[
+                'value' => [
+                    'metadata' => ['phone_number_id' => '1234567890'],
+                    'messages' => [[
+                        'id' => 'wamid.IMAGE123',
+                        'from' => '573001112233',
+                        'type' => 'image',
+                        'image' => ['id' => 'MEDIA_ID_ABC', 'mime_type' => 'image/jpeg'],
+                    ]],
+                ],
+            ]],
+        ]],
+    ];
+
+    $response = $this->postJson('/api/whatsapp/webhook/anything', $payload);
+
+    $response->assertOk();
+
+    Queue::assertPushed(ProcessWhatsAppMessage::class, function (ProcessWhatsAppMessage $job) use ($tenant) {
+        return $job->tenant->is($tenant)
+            && $job->from === '573001112233'
+            && $job->messageType === 'image'
+            && $job->mediaId === 'MEDIA_ID_ABC';
+    });
+});
+
+it('carries an image caption as the message body when present', function () {
+    Queue::fake();
+
+    $tenant = Tenant::factory()->create([
+        'wa_phone_number_id' => '1234567890',
+    ]);
+
+    $payload = [
+        'entry' => [[
+            'changes' => [[
+                'value' => [
+                    'metadata' => ['phone_number_id' => '1234567890'],
+                    'messages' => [[
+                        'id' => 'wamid.IMAGE456',
+                        'from' => '573001112233',
+                        'type' => 'image',
+                        'image' => ['id' => 'MEDIA_ID_XYZ', 'mime_type' => 'image/jpeg', 'caption' => 'Aqui esta mi pago'],
+                    ]],
+                ],
+            ]],
+        ]],
+    ];
+
+    $response = $this->postJson('/api/whatsapp/webhook/anything', $payload);
+
+    $response->assertOk();
+
+    Queue::assertPushed(ProcessWhatsAppMessage::class, function (ProcessWhatsAppMessage $job) {
+        return $job->messageType === 'image'
+            && $job->mediaId === 'MEDIA_ID_XYZ'
+            && $job->messageBody === 'Aqui esta mi pago';
+    });
+});
+
+it('ignores an image message with no media id and no caption', function () {
+    Queue::fake();
+
+    $tenant = Tenant::factory()->create([
+        'wa_phone_number_id' => '1234567890',
+    ]);
+
+    $payload = [
+        'entry' => [[
+            'changes' => [[
+                'value' => [
+                    'metadata' => ['phone_number_id' => '1234567890'],
+                    'messages' => [[
+                        'id' => 'wamid.IMAGE789',
+                        'from' => '573001112233',
+                        'type' => 'image',
+                        'image' => [],
+                    ]],
+                ],
+            ]],
+        ]],
+    ];
+
+    $response = $this->postJson('/api/whatsapp/webhook/anything', $payload);
+
+    $response->assertOk();
+    Queue::assertNothingPushed();
+});
+
 it('does not dispatch the job twice for a retried WAMID (idempotency)', function () {
     Queue::fake();
     Cache::flush();
