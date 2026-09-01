@@ -61,6 +61,7 @@ class PaymentConfirmationService
         $access = $this->grantAccess($payment);
 
         $this->notifyConfirmed($payment, $access);
+        $this->notifyTrainingInvite($payment);
     }
 
     public function reject(Payment $payment, User $reviewer, string $reason): void
@@ -122,6 +123,32 @@ class PaymentConfirmationService
                 'expires_at' => $expiresAt,
             ],
             freeFormText: "✅ Tu pago de {$amount} ({$payment->method_label}) fue confirmado. Tu acceso está activo hasta el {$expiresAt}. 💪",
+        );
+    }
+
+    /**
+     * Segundo mensaje, proactivo — invita a iniciar el entrenamiento, nunca
+     * lo inicia por sí mismo. NUNCA crea una WorkoutSession: eso solo ocurre
+     * si el usuario responde y su mensaje entra por el flujo normal de
+     * Training (Router → TrainingIntentClassifier → TrainingHandler), igual
+     * que cualquier otro mensaje entrante — este método no conoce ni toca
+     * TrainingEngine/TrainingHandler en absoluto.
+     *
+     * Comparte la misma guarda de idempotencia de confirm() (no se llama de
+     * nuevo en un reintento sobre un Payment ya confirmado) y el mismo
+     * aislamiento de fallos de CustomerNotifier (un fallo aquí no afecta a
+     * notifyConfirmed() ni revierte nada ya persistido).
+     */
+    private function notifyTrainingInvite(Payment $payment): void
+    {
+        $tenant = $payment->contact->tenant;
+
+        $this->notifier->notify(
+            tenant: $tenant,
+            to: $payment->contact->customer_phone,
+            eventKey: 'training_invite',
+            variables: [],
+            freeFormText: '🎉 ¡Listo! Tu pago fue confirmado y tu acceso ya está activo. ¿Quieres que te prepare tu entrenamiento?',
         );
     }
 

@@ -253,7 +253,7 @@ Un dominio nunca conoce Graph API, nombre técnico de plantilla, versión de Met
 
 ## 10. Proactividad
 
-**PENDIENTE — no implementado.** El sistema es hoy 100% reactivo (solo responde a webhooks entrantes). `WhatsAppTemplate` (con `is_reengagement`) y, desde el ajuste de Hito 8, `App\Core\Notifications\CustomerNotifier` (sección 8.6) ya existen como la base de entrega que reutilizará el motor de proactividad — este último decide únicamente el mecanismo de envío (libre vs. plantilla), nunca cuándo ni por qué contactar; esas reglas viven exclusivamente en Proactivity cuando se construya, no en `CustomerNotifier`.
+**PENDIENTE — no implementado.** El sistema es hoy 100% reactivo (solo responde a webhooks entrantes), con una única excepción puntual: tras confirmar un Payment, se envía una invitación a entrenar (D031) — no es un motor de proactividad, es un mensaje fijo disparado por un evento síncrono ya existente, sin programación ni recordatorios por inactividad. `WhatsAppTemplate` (con `is_reengagement`) y `App\Core\Notifications\CustomerNotifier` (sección 8.6) ya existen como la base de entrega que reutilizará el motor de proactividad real — este último decide únicamente el mecanismo de envío (libre vs. plantilla), nunca cuándo ni por qué contactar; esas reglas viven exclusivamente en Proactivity cuando se construya, no en `CustomerNotifier`.
 
 ## 11. Pagos (Hito 8 — implementado: flujo manual Nequi/Daviplata)
 
@@ -272,6 +272,9 @@ Un dominio nunca conoce Graph API, nombre técnico de plantilla, versión de Met
            → idempotente: repetir confirm()/reject() sobre un Payment ya resuelto es no-op completo
            → confirma: extiende TrainingAccess.expires_at (+1 mes, sin perder días ya pagados)
                        → CustomerNotifier->notify(..., 'payment_confirmed', ...) tras persistir
+                       → CustomerNotifier->notify(..., 'training_invite', ...) — invita a entrenar,
+                         NUNCA crea WorkoutSession; si el usuario responde, su mensaje entra por
+                         el Router/Dispatcher normal, sin código nuevo que lo intercepte
            → rechaza: no toca TrainingAccess en absoluto
                        → CustomerNotifier->notify(..., 'payment_rejected', ...) tras persistir
 ```

@@ -44,6 +44,7 @@ class WhatsAppTemplateForm
                 ->options([
                     'payment_confirmed' => 'Pago confirmado',
                     'payment_rejected'  => 'Pago rechazado',
+                    'training_invite'   => 'Invitación a entrenar (tras pago confirmado)',
                 ])
                 ->native(false)
                 ->nullable()

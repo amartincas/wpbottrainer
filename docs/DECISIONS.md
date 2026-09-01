@@ -484,6 +484,36 @@ Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar
 
 ---
 
+### D030 — Fix real encontrado en la auditoría previa al deploy: la alerta de Payments mostraba `now()` como fecha del comprobante
+
+**CONTEXTO**: auditoría puntual pedida antes de desplegar D029 — la alerta real del Payment #2 mostraba "Fecha: 2026-09-01" junto a "⚠️ date_unreadable", contradictorio para el superadmin.
+
+**CAUSA RAÍZ**: `PaymentHandler::emitPaymentAlert()` construía la línea "Fecha" con `now()->format('Y-m-d')` — la fecha del servidor en el momento de generar la alerta, sin leer nunca `extracted_data['date']`. Coincidía con la fecha real solo porque la prueba completa ocurrió el mismo día. La IA (prompt: *"fecha tal como aparece"*) y `PaymentValidationService::checkStaleness()` (`Carbon::parse()` no entiende relativos en español como "hoy") funcionaban correctamente — el único defecto real estaba en la representación.
+
+**DECISIÓN TOMADA**: `emitPaymentAlert()` reescrito — "Fecha extraída" muestra exclusivamente `extracted_data['date']` o `'no disponible'`, nunca `now()`; se muestran monto detectado Y esperado por separado (antes solo el esperado, incluso con `amount_mismatch`); `validation_flags` se traducen a frases legibles (`FLAG_DESCRIPTIONS`, nuevo, solo para el texto de la alerta — Filament sigue mostrando la clave técnica cruda sin cambios); la sección de advertencias (encabezado incluido) se omite por completo si no hay flags. No se tocó `ReceiptExtractionService` ni `PaymentValidationService`.
+
+**IMPACTO**: `app/Payments/Handlers/PaymentHandler.php`. Tests: `tests/Feature/Payments/PaymentAlertFormatTest.php` (4, nuevo). 243 passed (22 fallos preexistentes, sin cambio). Verificado con datos reales (Payment #3, comprobante real de $60.000 vs $50.000 esperado): alerta mostró "Monto detectado: 60.000 COP", "Monto esperado: 50.000 COP", "Fecha extraída: 26 de mayo de 2026" (literal, nunca la fecha del servidor), advertencias en texto legible.
+
+**RIESGOS**: ninguno nuevo — cambio de representación puro, sin tocar extracción/validación/decisión de negocio.
+
+---
+
+### D031 — Ajuste de UX: segundo mensaje proactivo invitando a entrenar tras confirmar un pago
+
+**CONTEXTO**: hallazgo real durante el primer E2E comercial — el cliente recibía la confirmación de pago pero no tenía ninguna señal de que podía pedir su entrenamiento; tenía que descubrirlo por sí mismo.
+
+**DECISIÓN TOMADA**: `PaymentConfirmationService::confirm()` llama a un segundo método, `notifyTrainingInvite()`, inmediatamente después de `notifyConfirmed()` — mismo mecanismo (`CustomerNotifier`, `eventKey: 'training_invite'`, sin variables), mismo texto libre si la ventana está abierta, mismo `WhatsAppTemplate` (nuevo `event_key` agregado al Select de `WhatsAppTemplateForm`) si está cerrada. **Nunca crea una `WorkoutSession`** — es exclusivamente una invitación; si el usuario responde, su mensaje entra por el Router/Dispatcher normal como cualquier otro, sin ningún código nuevo que lo intercepte. No se creó `ProactivityEngine` ni ningún mecanismo de recordatorio por inactividad — explícitamente fuera de alcance.
+
+**Idempotencia y aislamiento de fallos, verificados antes de implementar (sin cambios de código adicionales)**: la guarda existente de `confirm()` (D029) corta la ejecución completa antes de llegar a cualquier notificación en un reintento sobre un Payment ya confirmado — el segundo mensaje hereda esa protección gratis, sin guarda propia. `CustomerNotifier::notify()` ya nunca propaga excepciones (D029) — un fallo en el segundo mensaje no afecta al primero ni revierte `Payment`/`TrainingAccess`, ya persistidos antes de notificar.
+
+**IMPACTO**: `app/Payments/Support/PaymentConfirmationService.php` (+`notifyTrainingInvite()`), `app/Filament/Resources/WhatsAppTemplate/Schemas/WhatsAppTemplateForm.php` (+opción `training_invite`). Tests nuevos: `tests/Feature/Payments/PaymentConfirmationServiceTest.php` (+6: ambos mensajes se envían por separado, nunca crea `WorkoutSession`, un reintento no duplica ningún mensaje, ventana abierta → libre, ventana cerrada con plantilla configurada → template, un fallo en el segundo mensaje no revierte Payment/TrainingAccess). 249 passed (22 fallos preexistentes, sin cambio).
+
+**PENDIENTE, no resuelto en este ajuste**: si la respuesta del usuario a la invitación es una afirmación genérica sin palabra clave de entrenamiento (ej. "sí", "dale"), no está verificado que `TrainingIntentClassifier` la clasifique como intent `training` — a confirmar durante el E2E real; si falla, es un hallazgo nuevo a reportar antes de tocar el clasificador (explícitamente no modificado en este ajuste).
+
+**RIESGOS**: dos mensajes seguidos en vez de uno — aceptable para el MVP, revisar si en el futuro conviene combinarlos en un solo mensaje con la plantilla adecuada.
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

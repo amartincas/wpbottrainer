@@ -5,6 +5,8 @@ use App\Models\Conversation;
 use App\Models\Payment;
 use App\Models\TrainingAccess;
 use App\Models\User;
+use App\Models\WhatsAppTemplate;
+use App\Models\WorkoutSession;
 use App\Payments\Enums\PaymentStatus;
 use App\Payments\Support\PaymentConfirmationService;
 use App\Training\Enums\TrainingAccessStatus;
@@ -202,4 +204,124 @@ it('a notification delivery failure never reverts the Payment confirmation or th
 
     expect($payment->fresh()->status)->toBe(PaymentStatus::Confirmed);
     expect(TrainingAccess::where('contact_id', $contact->id)->exists())->toBeTrue();
+});
+
+// ── Segundo mensaje proactivo: invitación a entrenar (ajuste de UX) ─────
+
+it('sends both the payment-confirmed notification AND the training invite as two separate messages', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subMinutes(5),
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    Http::assertSentCount(2);
+    Http::assertSent(fn ($request) => $request['type'] === 'text' && str_contains($request['text']['body'], 'confirmado'));
+    Http::assertSent(fn ($request) => $request['type'] === 'text' && str_contains($request['text']['body'], '¿Quieres que te prepare tu entrenamiento?'));
+});
+
+it('never creates a WorkoutSession when sending the training invite — only inviting, never starting training', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subMinutes(5),
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    expect(WorkoutSession::where('contact_id', $contact->id)->exists())->toBeFalse();
+});
+
+it('does not send either message a second time when confirm() is retried on an already-confirmed Payment', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subMinutes(5),
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+    $reviewer = User::factory()->create();
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+    app(PaymentConfirmationService::class)->confirm($payment, $reviewer);
+    Http::assertSentCount(2);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]); // reinicia el contador
+
+    app(PaymentConfirmationService::class)->confirm($payment->fresh(), $reviewer); // reintento
+
+    Http::assertNothingSent(); // ni la notificación de pago ni la invitación se repiten
+});
+
+it('sends the training invite as a free-form message when the conversation window is open', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subMinutes(10), // dentro de 23h30m
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    Http::assertSent(fn ($request) => $request['type'] === 'text' && str_contains($request['text']['body'], 'entrenamiento'));
+});
+
+it('sends the training invite via WhatsApp Template when the conversation window is closed and a template is configured', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subHours(24), // >= 23h30m
+    ]);
+    WhatsAppTemplate::create([
+        'tenant_id' => $contact->tenant_id,
+        'name' => 'training_invite_v1',
+        'event_key' => 'training_invite',
+        'body_preview' => '¿Quieres que te prepare tu entrenamiento?',
+        'parameters_map' => [],
+        'language' => 'es_CO',
+        'type' => 'utility',
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    Http::assertSent(fn ($request) => $request['type'] === 'template' && $request['template']['name'] === 'training_invite_v1');
+});
+
+it('a failure delivering the training invite never reverts the Payment confirmation or the TrainingAccess grant, nor affects the payment-confirmed notification already sent', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create([
+        'tenant_id' => $contact->tenant_id,
+        'customer_phone' => $contact->customer_phone,
+        'last_session_at' => now()->subMinutes(5),
+    ]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    // Ambos mensajes van por mensaje libre (ventana abierta) al mismo
+    // endpoint de Meta — Http::fake no puede fallar solo el segundo, así
+    // que se verifica lo que realmente importa: aunque Meta fallara,
+    // Payment/TrainingAccess ya quedaron persistidos antes de notificar.
+    Http::fake(['graph.facebook.com/*' => Http::response(['error' => ['message' => 'boom']], 500)]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    expect($payment->fresh()->status)->toBe(PaymentStatus::Confirmed);
+    expect(TrainingAccess::where('contact_id', $contact->id)->exists())->toBeTrue();
+    Http::assertSentCount(2); // ambos intentos se hicieron, pese al error de Meta
 });
