@@ -72,7 +72,7 @@ class TrainingIntentClassifier implements IntentClassifierInterface
     {
         $profile = $contact->trainingProfile;
 
-        return $profile !== null && ! $profile->isOnboardingComplete();
+        return $profile !== null && ! $profile->isOnboardingComplete($contact);
     }
 
     private function hasPendingWorkoutSession(Contact $contact): bool

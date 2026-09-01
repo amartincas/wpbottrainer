@@ -114,11 +114,14 @@ class TrainingHandler implements HandlerInterface
         }
 
         // 2. Onboarding conversacional, mientras falte algún dato obligatorio.
-        // Hito 5.1: Extract+Narrate fusionados en UNA llamada de IA (antes
-        // eran 2 secuenciales) — ver App\Training\Support\
-        // OnboardingConversationService y D026 en docs/DECISIONS.md.
-        if (! $profile->isOnboardingComplete()) {
+        // Hito 5.1: Extract+Narrate fusionados en UNA llamada de IA. Hito 8.3:
+        // se agregan nombre/training_location (bloqueantes) y datos físicos
+        // (nunca bloqueantes, se preguntan una sola vez) — ver
+        // App\Training\Support\OnboardingConversationService y D026/D033 en
+        // docs/DECISIONS.md.
+        if (! $profile->isOnboardingComplete($contact)) {
             $fragment = $this->buildContext($context, 'training_profile');
+            $pendingFieldBeforeTurn = $profile->firstMissingOnboardingField($contact);
 
             $aiCallStartedAt = microtime(true);
             $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant);
@@ -137,11 +140,22 @@ class TrainingHandler implements HandlerInterface
                 }
             }
 
-            $this->applyExtractedFields($profile, $extracted);
-            $profile = $profile->fresh();
+            $this->applyExtractedFields($contact, $profile, $extracted);
 
-            if (! $profile->isOnboardingComplete()) {
-                $realMissingField = $profile->firstMissingOnboardingField();
+            // Los datos físicos se preguntan una sola vez (Hito 8.3, aprobado
+            // explícitamente): si el campo pendiente ANTES de este turno ya
+            // era 'physical_stats', este turno fue la oportunidad de
+            // responder — se acepta lo que haya llegado (parcial o nada) y
+            // no se vuelve a insistir, sin importar si la IA extrajo algo.
+            if ($pendingFieldBeforeTurn === 'physical_stats') {
+                $profile->update(['physical_stats_asked' => true]);
+            }
+
+            $profile = $profile->fresh();
+            $contact = $contact->fresh();
+
+            if (! $profile->isOnboardingComplete($contact)) {
+                $realMissingField = $profile->firstMissingOnboardingField($contact);
                 $question = $this->onboarding->resolveQuestion($realMissingField, $result['next_action'], $result['response']);
 
                 // Métricas Hito 5.1: comparar contra la línea base de 2
@@ -311,11 +325,26 @@ class TrainingHandler implements HandlerInterface
         return $lines !== [] ? implode("\n", $lines) : 'Listo.';
     }
 
-    private function applyExtractedFields(TrainingProfile $profile, array $extracted): void
+    /**
+     * Hito 8.3: `name` se persiste en Contact.customer_name (identidad, no
+     * vive en TrainingProfile) — nunca se sobrescribe si el usuario ya tenía
+     * un nombre guardado, salvo corrección explícita (fuera de alcance de
+     * este hito: hoy simplemente no se vuelve a preguntar una vez existe).
+     */
+    private function applyExtractedFields(Contact $contact, TrainingProfile $profile, array $extracted): void
     {
+        if ($extracted['name'] !== null && $contact->customer_name === null) {
+            $contact->update(['customer_name' => $extracted['name']]);
+        }
+
         $updates = [];
 
-        foreach (['goal', 'experience_level', 'restrictions', 'available_equipment', 'sessions_per_week'] as $field) {
+        foreach ([
+            'goal', 'experience_level', 'primary_focus', 'secondary_focus',
+            'restrictions', 'available_equipment',
+            'equipment_fully_equipped', 'training_location', 'sessions_per_week',
+            'age', 'sex', 'weight_kg', 'height_cm',
+        ] as $field) {
             if ($extracted[$field] !== null) {
                 $updates[$field] = $extracted[$field];
             }

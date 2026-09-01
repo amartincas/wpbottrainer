@@ -13,6 +13,7 @@ use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Paso "Decide" del patrón Extract → Decide → Narrate (ver docs/ARCHITECTURE.md).
@@ -39,13 +40,50 @@ class TrainingEngine
 
     private const PROGRESSION_RPE_THRESHOLD = 7;
 
-    private const DEFAULT_SETS = 3;
+    /**
+     * Hito 8.4: cuántas de las sesiones más recientes cuentan para penalizar
+     * (nunca excluir) un ejercicio por repetido — ver sortCandidates(). Un
+     * valor bajo a propósito: con el catálogo real actual (1 ejercicio en
+     * producción, ver docs/DECISIONS.md D034) un valor alto dejaría la
+     * anti-repetición sin ningún candidato "no repetido" para desempatar.
+     */
+    private const ANTI_REPETITION_LOOKBACK_SESSIONS = 2;
 
-    private const DEFAULT_REPS = 10;
+    private const DIFFICULTY_ORDER = [
+        'beginner' => 0,
+        'intermediate' => 1,
+        'advanced' => 2,
+    ];
 
-    private const DEFAULT_TIME_BASED_SECONDS = 30;
-
-    private const DEFAULT_REST_SECONDS = 60;
+    /**
+     * Hito 8.4 — punto 9 aprobado: valores de arranque para un ejercicio SIN
+     * historial propio todavía (ni una ejecución real de este contacto). Son
+     * HEURÍSTICAS INICIALES DE PRODUCTO, revisables en cualquier momento sin
+     * migración — NUNCA una prescripción científica universal ni una tabla
+     * validada clínicamente. En cuanto existe una ejecución real, la
+     * progresión por RPE (ver progressionFor()) gobierna sets/reps/carga/
+     * duración para ESE ejercicio y contacto — estos valores dejan de
+     * aplicar. `rest_seconds` no tiene mecanismo de progresión por historial
+     * (nunca lo tuvo, ver Hito 4-8.3): siempre se deriva del objetivo
+     * vigente, con o sin historial.
+     *
+     * Justificación direccional de cada objetivo (no una cita a un estudio
+     * específico, un criterio de producto documentado para ser revisado):
+     * - lose_weight: más repeticiones y menos descanso → mayor densidad de
+     *   trabajo por sesión (énfasis metabólico/gasto calórico).
+     * - build_muscle: descanso más largo → permite recuperar más carga entre
+     *   series (énfasis en fuerza/hipertrofia con series de calidad).
+     * - endurance: repeticiones/tiempo altos con descanso mínimo → prioriza
+     *   sostener el esfuerzo, no la carga máxima.
+     * - general_fitness: punto medio, igual al valor por defecto histórico
+     *   de este motor antes de Hito 8.4.
+     */
+    private const GOAL_DEFAULTS = [
+        'lose_weight' => ['sets' => 3, 'reps' => 15, 'rest_seconds' => 30, 'duration_seconds' => 40],
+        'build_muscle' => ['sets' => 4, 'reps' => 10, 'rest_seconds' => 90, 'duration_seconds' => 30],
+        'endurance' => ['sets' => 3, 'reps' => 18, 'rest_seconds' => 20, 'duration_seconds' => 45],
+        'general_fitness' => ['sets' => 3, 'reps' => 10, 'rest_seconds' => 60, 'duration_seconds' => 30],
+    ];
 
     /**
      * Grupos musculares que componen cada "foco" posible por tipo de
@@ -107,7 +145,7 @@ class TrainingEngine
 
         $focus = $this->decideFocus($profile, $recentSessions);
 
-        $exercises = $this->selectExercises($profile, $focus);
+        $exercises = $this->selectExercises($profile, $focus, $recentSessions, $contact);
 
         $session = WorkoutSession::create([
             'contact_id' => $contact->id,
@@ -117,7 +155,7 @@ class TrainingEngine
         ]);
 
         foreach ($exercises as $index => $exercise) {
-            $this->prescribeExercise($session, $exercise, $index + 1, $contact);
+            $this->prescribeExercise($session, $exercise, $index + 1, $contact, $profile);
         }
 
         $profile->update(['next_focus' => $this->nextInRotation($focus, $profile->split_type)]);
@@ -223,22 +261,172 @@ class TrainingEngine
     }
 
     /**
+     * Hito 8.4 — Decide de la selección de ejercicios, en el orden de
+     * prioridad aprobado: elegibilidad → foco → objetivo/nivel →
+     * anti-repetición → determinismo.
+     *
+     * 1. Elegibilidad (filtro duro, nunca un puntaje): seguridad
+     *    (restricciones vs. contraindicaciones) y equipamiento — ver
+     *    isEligible(). Un ejercicio no elegible NUNCA entra a ningún nivel,
+     *    sin importar cuánto matchee el foco.
+     * 2. Foco: entre los elegibles, se clasifican en 3 niveles —
+     *    primario (Exercise.primary_muscle/secondary_muscles intersecta
+     *    TrainingProfile.primary_focus), secundario (ídem con
+     *    secondary_focus), y general (el mecanismo de rotación por
+     *    continuidad ya existente, ROTATIONS/decideFocus, sin cambios,
+     *    usado como fallback cuando no hay foco declarado o se agotan los
+     *    candidatos de foco). Un perfil sin foco declarado (primary_focus
+     *    === []) se comporta exactamente igual que antes de Hito 8.4: solo
+     *    existe el nivel general.
+     * 3. Objetivo/nivel: dentro de un mismo nivel de foco, se prioriza el
+     *    ejercicio cuya difficulty_level coincide con el experience_level
+     *    del perfil (ver difficultyMatchRank()). El objetivo (goal) no
+     *    tiene hoy una etiqueta propia por ejercicio en el catálogo — su
+     *    efecto en la personalización es sobre la PRESCRIPCIÓN (sets/reps/
+     *    descanso, ver GOAL_DEFAULTS), no sobre qué ejercicios se eligen;
+     *    esa es una decisión de modelado explícita, documentada en
+     *    docs/DECISIONS.md D034, no una omisión.
+     * 4. Anti-repetición: SOLO desempata entre ejercicios ya empatados en
+     *    foco y nivel — nunca puede hacer que un ejercicio de un nivel de
+     *    foco inferior, o con peor ajuste de nivel, le gane a uno mejor por
+     *    el solo hecho de ser distinto. Esto es exactamente la salvaguarda
+     *    pedida: al ordenar primero por nivel de foco y luego por ajuste de
+     *    nivel, la anti-repetición nunca alcanza a comparar dos ejercicios
+     *    que no eran ya intercambiables en esas dos dimensiones.
+     * 5. Determinismo: último desempate por id ascendente — la misma
+     *    combinación de perfil/catálogo/historial produce siempre la misma
+     *    sesión.
+     *
+     * La selección final es, simplemente, tomar los primeros
+     * EXERCISES_PER_SESSION de [nivel primario ordenado, nivel secundario
+     * ordenado, nivel general ordenado] concatenados en ese orden — el
+     * orden de los niveles YA garantiza que el foco domina sobre todo lo
+     * demás, sin necesitar pesos numéricos calibrados a mano.
+     *
+     * Garantía de foco (Hito 8.4, punto 5 aprobado): con primary_focus
+     * declarado, se espera que al menos ceil(EXERCISES_PER_SESSION/2) de
+     * los ejercicios elegidos vengan de los niveles primario+secundario. Si
+     * el catálogo elegible no alcanza para cumplirla, se registra
+     * TRAINING_FOCUS_FALLBACK — nunca se bloquea ni se inventa un ejercicio
+     * para forzarla (ver docs/DECISIONS.md D034: catálogo real de
+     * producción hoy tiene un único ejercicio activo, sin esta metadata).
+     *
      * @return Collection<int, Exercise>
      */
-    private function selectExercises(TrainingProfile $profile, string $focus): Collection
+    private function selectExercises(TrainingProfile $profile, string $focus, Collection $recentSessions, Contact $contact): Collection
     {
-        $muscleGroups = explode(',', $focus);
+        $recentlyUsedExerciseIds = $recentSessions
+            ->take(self::ANTI_REPETITION_LOOKBACK_SESSIONS)
+            ->flatMap(fn (WorkoutSession $session) => $session->workoutExercises->pluck('exercise_id'))
+            ->unique()
+            ->values()
+            ->all();
 
-        return Exercise::query()
+        $eligible = Exercise::query()
             ->where('is_active', true)
-            ->whereIn('muscle_group', $muscleGroups)
             ->get()
-            ->filter(fn (Exercise $exercise) => $this->isSafeForProfile($exercise, $profile))
+            ->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+
+        $primaryFocus = $profile->primary_focus ?? [];
+        $secondaryFocus = $profile->secondary_focus ?? [];
+        $generalMuscleGroups = explode(',', $focus);
+
+        $primaryTier = collect();
+        $secondaryTier = collect();
+        $generalTier = collect();
+
+        foreach ($eligible as $exercise) {
+            $exerciseMuscles = array_values(array_filter(array_merge(
+                [$exercise->primary_muscle?->value],
+                $exercise->secondary_muscles ?? []
+            )));
+
+            if ($primaryFocus !== [] && array_intersect($exerciseMuscles, $primaryFocus) !== []) {
+                $primaryTier->push($exercise);
+            } elseif ($secondaryFocus !== [] && array_intersect($exerciseMuscles, $secondaryFocus) !== []) {
+                $secondaryTier->push($exercise);
+            } elseif (in_array($exercise->muscle_group, $generalMuscleGroups, true)) {
+                $generalTier->push($exercise);
+            }
+            // Un ejercicio elegible que no matchea ni el foco declarado ni
+            // el muscle_group de la rotación actual queda deliberadamente
+            // fuera de los 3 niveles — no es candidato para ESTA sesión.
+        }
+
+        $primaryTier = $this->sortCandidates($primaryTier, $profile, $recentlyUsedExerciseIds);
+        $secondaryTier = $this->sortCandidates($secondaryTier, $profile, $recentlyUsedExerciseIds);
+        $generalTier = $this->sortCandidates($generalTier, $profile, $recentlyUsedExerciseIds);
+
+        $focusSlotsAvailable = $primaryTier->count() + $secondaryTier->count();
+        $minFocusSlots = (int) ceil(self::EXERCISES_PER_SESSION / 2);
+
+        if ($primaryFocus !== [] && $focusSlotsAvailable < $minFocusSlots) {
+            Log::info('TRAINING_FOCUS_FALLBACK', [
+                'contact_id' => $contact->id,
+                'primary_focus' => $primaryFocus,
+                'secondary_focus' => $secondaryFocus,
+                'focus_candidates_available' => $focusSlotsAvailable,
+                'min_focus_slots_required' => $minFocusSlots,
+            ]);
+        }
+
+        return $primaryTier->concat($secondaryTier)->concat($generalTier)
             ->take(self::EXERCISES_PER_SESSION)
             ->values();
     }
 
-    private function isSafeForProfile(Exercise $exercise, TrainingProfile $profile): bool
+    /**
+     * @param  array<int, int>  $recentlyUsedExerciseIds
+     * @return Collection<int, Exercise>
+     */
+    private function sortCandidates(Collection $candidates, TrainingProfile $profile, array $recentlyUsedExerciseIds): Collection
+    {
+        return $candidates->sort(function (Exercise $a, Exercise $b) use ($profile, $recentlyUsedExerciseIds) {
+            $levelDiff = $this->difficultyMatchRank($a, $profile) <=> $this->difficultyMatchRank($b, $profile);
+            if ($levelDiff !== 0) {
+                return $levelDiff;
+            }
+
+            $repeatA = in_array($a->id, $recentlyUsedExerciseIds, true) ? 1 : 0;
+            $repeatB = in_array($b->id, $recentlyUsedExerciseIds, true) ? 1 : 0;
+            if ($repeatA !== $repeatB) {
+                return $repeatA <=> $repeatB;
+            }
+
+            return $a->id <=> $b->id;
+        })->values();
+    }
+
+    /**
+     * 0 = coincide exactamente con el nivel del perfil, 1 = un nivel de
+     * diferencia (ej. intermediate pidió, el ejercicio es beginner o
+     * advanced), 2 = sin dato o diferencia mayor.
+     */
+    private function difficultyMatchRank(Exercise $exercise, TrainingProfile $profile): int
+    {
+        $profileLevel = $profile->experience_level?->value;
+        $exerciseLevel = $exercise->difficulty_level;
+
+        if ($profileLevel === null || ! isset(self::DIFFICULTY_ORDER[$exerciseLevel]) || ! isset(self::DIFFICULTY_ORDER[$profileLevel])) {
+            return 2;
+        }
+
+        if ($exerciseLevel === $profileLevel) {
+            return 0;
+        }
+
+        $diff = abs(self::DIFFICULTY_ORDER[$exerciseLevel] - self::DIFFICULTY_ORDER[$profileLevel]);
+
+        return $diff === 1 ? 1 : 2;
+    }
+
+    /**
+     * Filtro duro de elegibilidad (nunca un puntaje): seguridad y
+     * equipamiento. `equipment_fully_equipped` (Hito 8.3) hace que CUALQUIER
+     * ejercicio sea elegible en cuanto a equipo — declarar acceso amplio
+     * significa que no vale la pena enumerar qué tiene exactamente.
+     */
+    private function isEligible(Exercise $exercise, TrainingProfile $profile): bool
     {
         $restrictions = $profile->restrictions ?? [];
         $contraindications = $exercise->contraindications ?? [];
@@ -249,7 +437,7 @@ class TrainingEngine
 
         $equipmentNeeded = $exercise->equipment_needed ?? [];
 
-        if ($equipmentNeeded === []) {
+        if ($equipmentNeeded === [] || $profile->equipment_fully_equipped === true) {
             return true;
         }
 
@@ -258,9 +446,9 @@ class TrainingEngine
         return array_diff($equipmentNeeded, $available) === [];
     }
 
-    private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, Contact $contact): WorkoutExercise
+    private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, Contact $contact, TrainingProfile $profile): WorkoutExercise
     {
-        $progression = $this->progressionFor($exercise, $contact);
+        $progression = $this->progressionFor($exercise, $contact, $profile);
 
         return WorkoutExercise::create([
             'workout_session_id' => $session->id,
@@ -270,7 +458,7 @@ class TrainingEngine
             'prescribed_reps' => $progression['reps'],
             'prescribed_load' => $progression['load'],
             'prescribed_duration_seconds' => $progression['duration_seconds'],
-            'rest_seconds' => self::DEFAULT_REST_SECONDS,
+            'rest_seconds' => $progression['rest_seconds'],
             'exercise_snapshot' => $exercise->toSnapshot(),
         ]);
     }
@@ -279,14 +467,20 @@ class TrainingEngine
      * Regla de progresión mínima: si la última ejecución reportada de este
      * ejercicio tuvo un RPE bajo (esfuerzo percibido manejable) y se
      * completó, se sube ligeramente la carga/duración. Si no hay ejecución
-     * previa, se usa un valor conservador por defecto. Nunca se recalculan
-     * WorkoutExercise ya creados — esto solo afecta a la sesión nueva.
+     * previa, se usan los valores de arranque del objetivo vigente
+     * (GOAL_DEFAULTS, Hito 8.4 — antes de esto eran constantes fijas sin
+     * relación con el objetivo). Nunca se recalculan WorkoutExercise ya
+     * creados — esto solo afecta a la sesión nueva.
      *
-     * @return array{sets: ?int, reps: ?int, load: ?float, duration_seconds: ?int}
+     * `rest_seconds` nunca tuvo progresión por historial (ver GOAL_DEFAULTS)
+     * — siempre refleja el objetivo vigente, exista o no ejecución previa.
+     *
+     * @return array{sets: ?int, reps: ?int, load: ?float, duration_seconds: ?int, rest_seconds: int}
      */
-    private function progressionFor(Exercise $exercise, Contact $contact): array
+    private function progressionFor(Exercise $exercise, Contact $contact, TrainingProfile $profile): array
     {
         $isTimeBased = $exercise->tracking_type === TrackingType::TimeBased;
+        $goalDefaults = self::GOAL_DEFAULTS[$profile->goal?->value] ?? self::GOAL_DEFAULTS['general_fitness'];
 
         $lastExecution = WorkoutExercise::query()
             ->where('exercise_id', $exercise->id)
@@ -298,8 +492,8 @@ class TrainingEngine
 
         if ($lastExecution === null || $lastExecution->exerciseLog === null) {
             return $isTimeBased
-                ? ['sets' => self::DEFAULT_SETS, 'reps' => null, 'load' => null, 'duration_seconds' => self::DEFAULT_TIME_BASED_SECONDS]
-                : ['sets' => self::DEFAULT_SETS, 'reps' => self::DEFAULT_REPS, 'load' => null, 'duration_seconds' => null];
+                ? ['sets' => $goalDefaults['sets'], 'reps' => null, 'load' => null, 'duration_seconds' => $goalDefaults['duration_seconds'], 'rest_seconds' => $goalDefaults['rest_seconds']]
+                : ['sets' => $goalDefaults['sets'], 'reps' => $goalDefaults['reps'], 'load' => null, 'duration_seconds' => null, 'rest_seconds' => $goalDefaults['rest_seconds']];
         }
 
         $log = $lastExecution->exerciseLog;
@@ -307,24 +501,26 @@ class TrainingEngine
         $shouldProgress = $log->rpe !== null && $log->rpe <= self::PROGRESSION_RPE_THRESHOLD;
 
         if ($isTimeBased) {
-            $lastDuration = $topSet?->actual_duration_seconds ?? $lastExecution->prescribed_duration_seconds ?? self::DEFAULT_TIME_BASED_SECONDS;
+            $lastDuration = $topSet?->actual_duration_seconds ?? $lastExecution->prescribed_duration_seconds ?? $goalDefaults['duration_seconds'];
 
             return [
-                'sets' => $lastExecution->prescribed_sets ?? self::DEFAULT_SETS,
+                'sets' => $lastExecution->prescribed_sets ?? $goalDefaults['sets'],
                 'reps' => null,
                 'load' => null,
                 'duration_seconds' => $shouldProgress ? $lastDuration + 10 : $lastDuration,
+                'rest_seconds' => $goalDefaults['rest_seconds'],
             ];
         }
 
         $lastLoad = $topSet?->actual_load ?? $lastExecution->prescribed_load;
-        $lastReps = $topSet?->actual_reps ?? $lastExecution->prescribed_reps ?? self::DEFAULT_REPS;
+        $lastReps = $topSet?->actual_reps ?? $lastExecution->prescribed_reps ?? $goalDefaults['reps'];
 
         return [
-            'sets' => $lastExecution->prescribed_sets ?? self::DEFAULT_SETS,
+            'sets' => $lastExecution->prescribed_sets ?? $goalDefaults['sets'],
             'reps' => $lastReps,
             'load' => $lastLoad !== null && $shouldProgress ? ((float) $lastLoad + 2.5) : ($lastLoad !== null ? (float) $lastLoad : null),
             'duration_seconds' => null,
+            'rest_seconds' => $goalDefaults['rest_seconds'],
         ];
     }
 }

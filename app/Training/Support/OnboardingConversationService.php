@@ -5,65 +5,67 @@ namespace App\Training\Support;
 use App\Factories\AIServiceFactory;
 use App\Models\Tenant;
 use App\Training\Enums\ExperienceLevel;
+use App\Training\Enums\MuscleFocus;
+use App\Training\Enums\Sex;
 use App\Training\Enums\TrainingGoal;
+use App\Training\Enums\TrainingLocation;
 use Illuminate\Support\Facades\Log;
 
 /**
  * El Extract/Narrate de onboarding (Hito 5, fusionados en una sola llamada
- * de IA en el Hito 5.1) — fuera de TrainingHandler porque construir el
- * prompt y validar el JSON es una responsabilidad real, testeable de forma
- * independiente, no orquestación.
+ * de IA en el Hito 5.1, ampliado en Hito 8.3) — fuera de TrainingHandler
+ * porque construir el prompt y validar el JSON es una responsabilidad real,
+ * testeable de forma independiente, no orquestación.
  *
- * Extract → Decide → Narrate (docs/DECISIONS.md, D007 y D026):
- * - extractAndRespond() hace Extract Y Narrate en UNA sola llamada: el LLM
- *   devuelve `extracted` (candidatos estructurados, nunca confiados
- *   ciegamente — cada valor se valida aquí antes de existir para el
- *   llamador) + `next_action` (una SEÑAL, no una decisión) + `response`
- *   (una redacción natural candidata).
+ * Extract → Decide → Narrate (docs/DECISIONS.md, D007, D026, D033):
+ * - extractAndRespond() hace Extract Y Narrate en UNA sola llamada.
  * - Decidir qué campo falta de verdad sigue sin pasar por aquí — sigue
- *   siendo TrainingProfile::firstMissingOnboardingField() (determinista),
- *   invocado por TrainingHandler después de aplicar los campos extraídos.
- * - resolveQuestion() es el punto de Decide para la redacción: compara el
- *   `next_action` de la IA contra el campo real que el código ya determinó
- *   que falta. Solo si coinciden exactamente, Y `response` es utilizable,
- *   se usa el texto de la IA — en cualquier otro caso (incluida una IA que
- *   diga "complete_onboarding" cuando en realidad falta algo) se usa
- *   FALLBACK_QUESTIONS. La IA nunca tiene autoridad sobre esta decisión,
- *   solo sobre la redacción cuando el código ya confirmó que aplica.
+ *   siendo TrainingProfile::firstMissingOnboardingField() (determinista).
+ * - resolveQuestion() es el punto de Decide para la redacción.
  *
- * No se envía historial de conversación de WhatsApp a la IA aquí — solo el
- * mensaje actual y los campos ya conocidos del TrainingProfile (vía el
- * ContextFragment `training_profile`, pasado por el llamador).
+ * Hito 8.3: se agregan `name` (persistido en Contact.customer_name, no en
+ * TrainingProfile — TrainingHandler lo aplica al modelo correcto),
+ * `training_location`, `equipment_fully_equipped` (representación explícita
+ * de "disponibilidad amplia/completa" sin enumerar — nunca asume que CUALQUIER
+ * gimnasio tiene absolutamente todo, solo registra la declaración del
+ * usuario), y los 4 datos físicos (`age`/`sex`/`weight_kg`/`height_cm`) —
+ * capturados desde MVP pero NUNCA bloqueantes (ver TrainingProfile).
  */
 class OnboardingConversationService
 {
     private const FALLBACK_QUESTIONS = [
+        'name' => '¿Cómo te gustaría que te llame?',
         'goal' => '¿Cuál es tu objetivo principal: perder peso, ganar músculo, mejorar tu condición física general o resistencia?',
         'experience_level' => '¿Cuál es tu nivel de experiencia entrenando: principiante, intermedio o avanzado?',
+        'primary_focus' => '¿Hay alguna zona de tu cuerpo que quieras priorizar especialmente? Por ejemplo glúteos, piernas, espalda o abdomen — o si prefieres trabajar todo por igual, también dime.',
+        'training_location' => '¿Dónde vas a entrenar: en casa, en el gimnasio, o al aire libre?',
         'restrictions' => '¿Tienes alguna lesión, dolor o limitación física que debamos tener en cuenta?',
         'available_equipment' => '¿Qué equipo tienes disponible para entrenar? Por ejemplo mancuernas, bandas, barra, o ninguno.',
         'sessions_per_week' => '¿Cuántos días a la semana puedes entrenar?',
+        'physical_stats' => 'Para terminar de afinar tu plan, si quieres cuéntame tu edad, sexo, peso y estatura — no es obligatorio.',
     ];
 
     /**
-     * Hito 5.1: mapea cada campo de TrainingProfile al valor de
-     * `next_action` que la IA debe usar cuando ESE es el campo que falta.
-     * Código puro, cerrado — nunca lo decide la IA. Único consumidor:
-     * resolveQuestion(). "complete_onboarding" no aparece aquí a propósito:
-     * no hay ningún campo real que mapee a él, así que nunca puede
-     * "coincidir" con un campo pendiente — es estructuralmente imposible
-     * que ese valor por sí solo complete el onboarding.
+     * Hito 5.1/8.3/8.4: mapea cada campo pendiente al valor de `next_action`
+     * que la IA debe usar cuando ESE es el campo que falta. Código puro,
+     * cerrado — nunca lo decide la IA. Único consumidor: resolveQuestion().
+     * "complete_onboarding" no aparece aquí a propósito.
      */
     private const NEXT_ACTION_MAP = [
+        'name' => 'ask_name',
         'goal' => 'ask_goal',
         'experience_level' => 'ask_experience_level',
+        'primary_focus' => 'ask_primary_focus',
+        'training_location' => 'ask_training_location',
         'restrictions' => 'ask_restrictions',
         'available_equipment' => 'ask_equipment',
         'sessions_per_week' => 'ask_sessions_per_week',
+        'physical_stats' => 'ask_physical_stats',
     ];
 
     private const VALID_NEXT_ACTIONS = [
-        'ask_goal', 'ask_experience_level', 'ask_restrictions', 'ask_equipment', 'ask_sessions_per_week',
+        'ask_name', 'ask_goal', 'ask_experience_level', 'ask_primary_focus', 'ask_training_location',
+        'ask_restrictions', 'ask_equipment', 'ask_sessions_per_week', 'ask_physical_stats',
         'complete_onboarding',
     ];
 
@@ -75,15 +77,21 @@ class OnboardingConversationService
     private const MAX_RESPONSE_LENGTH = 300;
 
     /**
-     * Extract + Narrate en una sola llamada (Hito 5.1 — antes eran 2
-     * llamadas secuenciales: extractFields() + nextQuestion()).
+     * Extract + Narrate en una sola llamada.
      *
      * @param array<string, mixed>|null $knownProfile el ContextFragment
-     *        `training_profile` actual (campos ya respondidos), para que la
-     *        IA no vuelva a preguntar lo que ya sabe.
+     *        `training_profile` actual (campos ya respondidos, incluido el
+     *        nombre desde Contact), para que la IA no vuelva a preguntar lo
+     *        que ya sabe.
      * @return array{
-     *     extracted: array{goal: ?string, experience_level: ?string, restrictions: ?array,
-     *                        available_equipment: ?array, sessions_per_week: ?int, safety_signal_text: ?string},
+     *     extracted: array{
+     *         name: ?string, goal: ?string, experience_level: ?string,
+     *         primary_focus: ?array, secondary_focus: ?array,
+     *         training_location: ?string, available_equipment: ?array,
+     *         equipment_fully_equipped: ?bool, restrictions: ?array,
+     *         sessions_per_week: ?int, age: ?int, sex: ?string,
+     *         weight_kg: ?float, height_cm: ?int, safety_signal_text: ?string,
+     *     },
      *     next_action: ?string,
      *     response: ?string,
      * }
@@ -111,9 +119,7 @@ class OnboardingConversationService
     /**
      * Decide, de forma 100% determinista, qué pregunta enviar al usuario.
      * $realMissingField viene de TrainingProfile::firstMissingOnboardingField()
-     * (la única autoridad) — nunca de la IA. La respuesta de la IA
-     * ($aiNextAction/$aiResponse, del mismo turno que ya se procesó) solo se
-     * usa si coincide exactamente con lo que el código ya sabe que falta.
+     * (la única autoridad) — nunca de la IA.
      */
     public function resolveQuestion(string $realMissingField, ?string $aiNextAction, ?string $aiResponse): string
     {
@@ -126,11 +132,6 @@ class OnboardingConversationService
         return self::FALLBACK_QUESTIONS[$realMissingField] ?? self::FALLBACK_QUESTIONS['goal'];
     }
 
-    /**
-     * Hito 5.1: true solo cuando se usó la redacción de la IA — útil para
-     * medir, en observabilidad, qué proporción de turnos reales terminó en
-     * fallback vs. respuesta natural.
-     */
     public function usedAiResponse(string $realMissingField, ?string $aiNextAction, ?string $aiResponse): bool
     {
         $expectedAction = self::NEXT_ACTION_MAP[$realMissingField] ?? null;
@@ -153,11 +154,20 @@ class OnboardingConversationService
     {
         return [
             'extracted' => [
+                'name' => null,
                 'goal' => null,
                 'experience_level' => null,
-                'restrictions' => null,
+                'primary_focus' => null,
+                'secondary_focus' => null,
+                'training_location' => null,
                 'available_equipment' => null,
+                'equipment_fully_equipped' => null,
+                'restrictions' => null,
                 'sessions_per_week' => null,
+                'age' => null,
+                'sex' => null,
+                'weight_kg' => null,
+                'height_cm' => null,
                 'safety_signal_text' => null,
             ],
             'next_action' => null,
@@ -178,19 +188,53 @@ Del mensaje del usuario, extrae ÚNICAMENTE lo que menciona explícitamente. NUN
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin explicación) con esta forma exacta:
 {
-  "extracted": {"goal": "lose_weight"|"build_muscle"|"general_fitness"|"endurance"|null, "experience_level": "beginner"|"intermediate"|"advanced"|null, "restrictions": ["tag", ...]|[]|null, "available_equipment": ["tag", ...]|[]|null, "sessions_per_week": <entero 1-14>|null, "safety_signal_text": "<frase textual>"|null},
-  "next_action": "ask_goal"|"ask_experience_level"|"ask_restrictions"|"ask_equipment"|"ask_sessions_per_week"|"complete_onboarding",
+  "extracted": {
+    "name": "<nombre o como quiere que le llamen>" | null,
+    "goal": "lose_weight"|"build_muscle"|"general_fitness"|"endurance"|null,
+    "experience_level": "beginner"|"intermediate"|"advanced"|null,
+    "primary_focus": ["glutes"|"quads"|"hamstrings"|"calves"|"chest"|"back"|"shoulders"|"biceps"|"triceps"|"abs"|"full_body", ...]|[]|null,
+    "secondary_focus": ["glutes"|"quads"|"hamstrings"|"calves"|"chest"|"back"|"shoulders"|"biceps"|"triceps"|"abs"|"full_body", ...]|[]|null,
+    "training_location": "home"|"gym"|"outdoor"|null,
+    "available_equipment": ["tag", ...]|[]|null,
+    "equipment_fully_equipped": true|false|null,
+    "restrictions": ["tag", ...]|[]|null,
+    "sessions_per_week": <entero 1-14>|null,
+    "age": <entero>|null,
+    "sex": "male"|"female"|"prefer_not_to_say"|null,
+    "weight_kg": <número>|null,
+    "height_cm": <entero>|null,
+    "safety_signal_text": "<frase textual>"|null
+  },
+  "next_action": "ask_name"|"ask_goal"|"ask_experience_level"|"ask_primary_focus"|"ask_training_location"|"ask_restrictions"|"ask_equipment"|"ask_sessions_per_week"|"ask_physical_stats"|"complete_onboarding",
   "response": "<tu respuesta conversacional en español>"
 }
 
 Reglas de "extracted":
-- Usa null en cualquier campo que el mensaje no mencione. Usa [] únicamente si el usuario dice explícitamente que no tiene restricciones o no tiene equipo.
+- Usa null en cualquier campo que el mensaje no mencione. Usa [] únicamente si el usuario dice explícitamente que no tiene restricciones, no tiene equipo, o no tiene ninguna zona que priorizar (quiere trabajar todo por igual).
 - Cualquier lesión, dolor, molestia o limitación física que el usuario mencione (ej. "dolor en la rodilla", "molestia en la espalda") va SIEMPRE en "restrictions", sin importar si también aparece en "safety_signal_text" — son campos independientes, pueden llenarse ambos a la vez o solo uno.
 - "safety_signal_text": SOLO llénalo si el mensaje sugiere una posible urgencia médica real (dolor de pecho, dificultad para respirar, pérdida de conocimiento/desmayo, cirugía muy reciente, entumecimiento/hormigueo severo, lesión grave repentina, o complicación de embarazo). Una molestia o dolor ordinario de entrenamiento (rodilla, espalda, hombro, ciática, etc., sin esos signos) NO es una urgencia — usa null aquí aunque sí llenes "restrictions". Ejemplo: "tengo dolor en las rodillas" → restrictions: ["dolor en las rodillas"], safety_signal_text: null.
+- "equipment_fully_equipped": true SOLO si el usuario indica acceso amplio o completo a equipo SIN enumerar (ej. "tengo de todo", "tengo todo", "lo normal de un gimnasio", "está bien equipado") — en ese caso "available_equipment" puede quedar null o vacío, NUNCA inventes una lista de aparatos. Si el usuario menciona equipo específico (ej. "solo pesas", "tengo mancuernas y bandas", o incluso solo dice "gimnasio" sin más detalle sobre qué tiene), usa "available_equipment" con lo mencionado (o null si solo dijo el lugar, sin hablar de equipo) y deja "equipment_fully_equipped" en null — decir dónde entrena no es lo mismo que declarar que tiene todo el equipo.
+- "primary_focus": la(s) zona(s) que el usuario indica querer PRIORIZAR especialmente (no es lo mismo que un simple "quiero ponerme en forma", eso es "goal"). Traduce el lenguaje natural a este vocabulario cerrado, usando esta tabla:
+  - "glúteos"/"cola"/"pompis" → ["glutes"]
+  - "piernas" (sin especificar más) → ["quads", "hamstrings", "glutes", "calves"]
+  - "cuádriceps"/"muslos" → ["quads"]
+  - "isquiotibiales"/"femorales" → ["hamstrings"]
+  - "pantorrillas"/"gemelos" → ["calves"]
+  - "espalda" → ["back"]
+  - "abdomen"/"abdominales"/"core"/"panza" → ["abs"]
+  - "pecho"/"pectorales" → ["chest"]
+  - "brazos" (sin especificar más) → ["biceps", "triceps"]
+  - "bíceps" → ["biceps"]
+  - "tríceps" → ["triceps"]
+  - "hombros" → ["shoulders"]
+  - "todo por igual"/"todo el cuerpo"/"no tengo preferencia"/"parejo" → [] (respuesta válida, NUNCA null en este caso)
+  Si el usuario menciona una zona con MENOR énfasis o de forma secundaria junto a la principal (ej. "sobre todo glúteos, y algo de espalda también"), la principal va en "primary_focus" y la secundaria en "secondary_focus" — NUNCA reveles ni menciones estos dos términos técnicos al usuario, son solo para uso interno.
+- Puedes extraer VARIOS campos de un mismo mensaje si el usuario los menciona juntos (ej. "Me llamo Ana, entreno en un gimnasio y tengo de todo" → name, training_location y equipment_fully_equipped los tres a la vez).
+- Los datos físicos (age/sex/weight_kg/height_cm) son opcionales para el usuario — si responde "prefiero no decir" o cambia de tema, dejas esos campos en null, nunca insistas ni los inventes.
 
-Reglas de "next_action": indica cuál de estos 5 campos obligatorios sigue sin responderse (goal, experience_level, restrictions, available_equipment, sessions_per_week), considerando el perfil ya conocido MÁS lo que acabas de extraer de este mensaje. Usa "complete_onboarding" solo si los 5 ya están respondidos. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
+Reglas de "next_action": indica cuál de estos campos pendientes sigue sin responderse, en este orden de prioridad: name, goal, experience_level, primary_focus, training_location, available_equipment, restrictions, sessions_per_week, y por último (opcional) datos físicos. Usa "complete_onboarding" solo si ya no falta nada de lo anterior. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
 
-Reglas de "response": redacta en tono natural y cercano, como un entrenador personal real — NUNCA como un formulario. Si el onboarding sigue incompleto, reconoce brevemente lo que el usuario acaba de decir y luego haz la siguiente pregunta de forma conversacional. Máximo 2-3 frases.
+Reglas de "response": redacta en tono natural y cercano, como un entrenador personal real — NUNCA como un formulario. Si ya conoces el nombre del usuario, puedes usarlo con naturalidad. Si el onboarding sigue incompleto, reconoce brevemente lo que el usuario acaba de decir y luego haz la siguiente pregunta de forma conversacional. Máximo 2-3 frases. Nunca uses los términos técnicos "primary_focus"/"secondary_focus" — habla de "zona a priorizar" o similar, en lenguaje natural.
 PROMPT;
     }
 
@@ -198,9 +242,7 @@ PROMPT;
      * El resultado de la IA nunca se confía tal cual: cada campo de
      * "extracted" se valida contra el vocabulario/forma permitida aquí, y
      * cualquier valor inválido se descarta (queda null) en vez de
-     * persistirse. "next_action" se descarta si no es una de las 6 claves
-     * cerradas conocidas. "response" se deja tal cual si es string —
-     * isUsableResponse()/resolveQuestion() deciden si se usa.
+     * persistirse.
      */
     private function parseCombinedJson(string $raw): array
     {
@@ -219,11 +261,20 @@ PROMPT;
 
         return [
             'extracted' => [
+                'name' => $this->validateName($extractedRaw['name'] ?? null),
                 'goal' => $this->validateEnumValue($extractedRaw['goal'] ?? null, TrainingGoal::class),
                 'experience_level' => $this->validateEnumValue($extractedRaw['experience_level'] ?? null, ExperienceLevel::class),
-                'restrictions' => $this->validateStringArray($extractedRaw['restrictions'] ?? null),
+                'primary_focus' => $this->validateMuscleFocusArray($extractedRaw['primary_focus'] ?? null),
+                'secondary_focus' => $this->validateMuscleFocusArray($extractedRaw['secondary_focus'] ?? null),
+                'training_location' => $this->validateEnumValue($extractedRaw['training_location'] ?? null, TrainingLocation::class),
                 'available_equipment' => $this->validateStringArray($extractedRaw['available_equipment'] ?? null),
+                'equipment_fully_equipped' => $this->validateBool($extractedRaw['equipment_fully_equipped'] ?? null),
+                'restrictions' => $this->validateStringArray($extractedRaw['restrictions'] ?? null),
                 'sessions_per_week' => $this->validateSessionsPerWeek($extractedRaw['sessions_per_week'] ?? null),
+                'age' => $this->validateIntRange($extractedRaw['age'] ?? null, 10, 100),
+                'sex' => $this->validateEnumValue($extractedRaw['sex'] ?? null, Sex::class),
+                'weight_kg' => $this->validateNumericRange($extractedRaw['weight_kg'] ?? null, 20, 300),
+                'height_cm' => $this->validateIntRange($extractedRaw['height_cm'] ?? null, 100, 250),
                 'safety_signal_text' => is_string($extractedRaw['safety_signal_text'] ?? null) && $extractedRaw['safety_signal_text'] !== ''
                     ? $extractedRaw['safety_signal_text']
                     : null,
@@ -231,6 +282,22 @@ PROMPT;
             'next_action' => is_string($nextAction) && in_array($nextAction, self::VALID_NEXT_ACTIONS, true) ? $nextAction : null,
             'response' => is_string($decoded['response'] ?? null) ? $decoded['response'] : null,
         ];
+    }
+
+    private function validateName(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        $trimmed = trim($value);
+
+        return ($trimmed !== '' && mb_strlen($trimmed) <= 60) ? $trimmed : null;
+    }
+
+    private function validateBool(mixed $value): ?bool
+    {
+        return is_bool($value) ? $value : null;
     }
 
     private function validateEnumValue(mixed $value, string $enumClass): ?string
@@ -247,7 +314,29 @@ PROMPT;
         return array_values(array_filter($value, fn ($v) => is_string($v) && $v !== ''));
     }
 
+    /**
+     * A diferencia de validateStringArray(), restringe cada elemento al
+     * vocabulario cerrado de MuscleFocus — cualquier valor que la IA
+     * hubiera inventado fuera de esta lista se descarta silenciosamente
+     * (nunca se persiste una zona muscular que el código no reconoce).
+     */
+    private function validateMuscleFocusArray(mixed $value): ?array
+    {
+        if (! is_array($value)) {
+            return null;
+        }
+
+        return array_values(array_unique(array_filter(
+            array_map(fn ($v) => is_string($v) ? MuscleFocus::tryFrom($v)?->value : null, $value)
+        )));
+    }
+
     private function validateSessionsPerWeek(mixed $value): ?int
+    {
+        return $this->validateIntRange($value, 1, 14);
+    }
+
+    private function validateIntRange(mixed $value, int $min, int $max): ?int
     {
         if (is_int($value)) {
             $int = $value;
@@ -257,6 +346,17 @@ PROMPT;
             return null;
         }
 
-        return ($int >= 1 && $int <= 14) ? $int : null;
+        return ($int >= $min && $int <= $max) ? $int : null;
+    }
+
+    private function validateNumericRange(mixed $value, float $min, float $max): ?float
+    {
+        if (! is_numeric($value)) {
+            return null;
+        }
+
+        $float = (float) $value;
+
+        return ($float >= $min && $float <= $max) ? $float : null;
     }
 }

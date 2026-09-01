@@ -41,11 +41,26 @@ class TrainingProfileContextProvider implements ContextProviderInterface
         return new ContextFragment(
             label: 'training_profile',
             data: [
+                // Hito 8.3: el nombre vive en Contact, no en TrainingProfile
+                // — se incluye aquí de todos modos porque este fragmento es
+                // "lo que ya sabemos del usuario", no "columnas de esta tabla".
+                'name' => $contact->customer_name,
                 'goal' => $profile->goal?->value,
                 'experience_level' => $profile->experience_level?->value,
+                // Hito 8.4: se exponen para que la IA de onboarding no
+                // vuelva a preguntar una zona ya declarada — nunca se
+                // muestran al usuario tal cual (son vocabulario interno).
+                'primary_focus' => $profile->primary_focus,
+                'secondary_focus' => $profile->secondary_focus,
+                'training_location' => $profile->training_location?->value,
                 'restrictions' => $profile->restrictions,
                 'available_equipment' => $profile->available_equipment,
+                'equipment_fully_equipped' => $profile->equipment_fully_equipped,
                 'sessions_per_week' => $profile->sessions_per_week,
+                'age' => $profile->age,
+                'sex' => $profile->sex?->value,
+                'weight_kg' => $profile->weight_kg !== null ? (float) $profile->weight_kg : null,
+                'height_cm' => $profile->height_cm,
             ],
             source: 'db',
             confidence: 'confirmed',

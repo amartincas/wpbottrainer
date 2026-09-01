@@ -4,8 +4,10 @@ namespace App\Models;
 
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\SafetyStatus;
+use App\Training\Enums\Sex;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingGoal;
+use App\Training\Enums\TrainingLocation;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -15,9 +17,18 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'contact_id',
     'goal',
     'experience_level',
+    'primary_focus',
+    'secondary_focus',
     'available_equipment',
+    'equipment_fully_equipped',
     'restrictions',
     'sessions_per_week',
+    'age',
+    'sex',
+    'weight_kg',
+    'height_cm',
+    'physical_stats_asked',
+    'training_location',
     'split_type',
     'next_focus',
     'safety_status',
@@ -36,9 +47,18 @@ class TrainingProfile extends Model
         return [
             'goal' => TrainingGoal::class,
             'experience_level' => ExperienceLevel::class,
+            'primary_focus' => 'array',
+            'secondary_focus' => 'array',
             'available_equipment' => 'array',
+            'equipment_fully_equipped' => 'boolean',
             'restrictions' => 'array',
             'sessions_per_week' => 'integer',
+            'age' => 'integer',
+            'sex' => Sex::class,
+            'weight_kg' => 'decimal:2',
+            'height_cm' => 'integer',
+            'physical_stats_asked' => 'boolean',
+            'training_location' => TrainingLocation::class,
             'split_type' => SplitType::class,
             'safety_status' => SafetyStatus::class,
             'safety_flagged_at' => 'datetime',
@@ -108,33 +128,49 @@ class TrainingProfile extends Model
     }
 
     /**
-     * Onboarding mínimo completo (Hito 5): objetivo, nivel, restricciones,
-     * equipamiento y sesiones/semana. `restrictions`/`available_equipment`
-     * distinguen "todavía no preguntado" (null) de "preguntado, sin ninguno"
-     * (`[]`) — solo lo primero cuenta como incompleto.
+     * Onboarding mínimo completo (Hito 5, ampliado en Hito 8.3 y 8.4):
+     * nombre (`Contact.customer_name` — identidad, no vive en este modelo),
+     * objetivo, nivel, zona a priorizar (`primary_focus`), lugar de
+     * entrenamiento, equipamiento, restricciones, sesiones/semana, y haber
+     * preguntado los datos físicos una vez (`physical_stats_asked`).
+     * `restrictions`/`available_equipment`/`primary_focus` distinguen
+     * "todavía no preguntado" (null) de "preguntado, sin ninguno" (`[]`) —
+     * solo lo primero cuenta como incompleto.
+     *
+     * Deliberadamente NO exige `age`/`sex`/`weight_kg`/`height_cm` — se
+     * capturan desde MVP (docs/DECISIONS.md) pero nunca bloquean el
+     * onboarding; se preguntan una sola vez (`physical_stats_asked`) y se
+     * acepta cualquier respuesta, incluida ninguna.
      */
-    public function isOnboardingComplete(): bool
+    public function isOnboardingComplete(Contact $contact): bool
     {
-        return $this->goal !== null
-            && $this->experience_level !== null
-            && $this->sessions_per_week !== null
-            && $this->restrictions !== null
-            && $this->available_equipment !== null;
+        return $this->firstMissingOnboardingField($contact) === null;
     }
 
     /**
      * El primer campo obligatorio todavía sin responder, en el orden en que
      * se pregunta — o null si el onboarding ya está completo. El código
      * decide cuál falta (Decide); el LLM solo redacta la pregunta (Narrate).
+     *
+     * Orden (Hito 8.4): nombre → objetivo → nivel → zona a priorizar →
+     * lugar → equipamiento → restricciones → frecuencia → datos físicos.
+     * `primary_focus` tiene pregunta dedicada obligatoria (no es puramente
+     * oportunista) — ver docs/DECISIONS.md D034. `secondary_focus` nunca
+     * bloquea el onboarding: es una representación interna derivada, el
+     * usuario nunca la ve ni la responde directamente.
      */
-    public function firstMissingOnboardingField(): ?string
+    public function firstMissingOnboardingField(Contact $contact): ?string
     {
         return match (true) {
+            $contact->customer_name === null => 'name',
             $this->goal === null => 'goal',
             $this->experience_level === null => 'experience_level',
-            $this->restrictions === null => 'restrictions',
+            $this->primary_focus === null => 'primary_focus',
+            $this->training_location === null => 'training_location',
             $this->available_equipment === null => 'available_equipment',
+            $this->restrictions === null => 'restrictions',
             $this->sessions_per_week === null => 'sessions_per_week',
+            ! $this->physical_stats_asked => 'physical_stats',
             default => null,
         };
     }

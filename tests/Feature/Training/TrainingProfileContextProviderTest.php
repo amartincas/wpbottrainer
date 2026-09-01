@@ -7,6 +7,7 @@ use App\Models\Tenant;
 use App\Models\TrainingProfile;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\TrainingGoal;
+use App\Training\Enums\TrainingLocation;
 use App\Training\Memory\TrainingProfileContextProvider;
 
 /**
@@ -31,14 +32,19 @@ it('returns unknown confidence and null data when the contact has no profile yet
 
 it('returns confirmed profile data for a contact that already has one', function () {
     $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233', 'customer_name' => 'Carlos']);
     TrainingProfile::factory()->create([
         'contact_id' => $contact->id,
         'goal' => TrainingGoal::BuildMuscle,
         'experience_level' => ExperienceLevel::Beginner,
+        'training_location' => TrainingLocation::Gym,
         'restrictions' => ['knee'],
         'available_equipment' => ['dumbbells'],
+        'equipment_fully_equipped' => false,
         'sessions_per_week' => 4,
+        'age' => 30,
+        'weight_kg' => 80.5,
+        'height_cm' => 175,
     ]);
 
     $context = new ExecutionContext(
@@ -52,11 +58,20 @@ it('returns confirmed profile data for a contact that already has one', function
     expect($fragment->confidence)->toBe('confirmed');
     expect($fragment->source)->toBe('db');
     expect($fragment->data)->toBe([
+        'name' => 'Carlos',
         'goal' => 'build_muscle',
         'experience_level' => 'beginner',
+        'primary_focus' => [],
+        'secondary_focus' => null,
+        'training_location' => 'gym',
         'restrictions' => ['knee'],
         'available_equipment' => ['dumbbells'],
+        'equipment_fully_equipped' => false,
         'sessions_per_week' => 4,
+        'age' => 30,
+        'sex' => null,
+        'weight_kg' => 80.5,
+        'height_cm' => 175,
     ]);
 });
 

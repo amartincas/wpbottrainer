@@ -5,6 +5,7 @@ namespace App\Training\Support;
 use App\Factories\AIServiceFactory;
 use App\Models\Tenant;
 use App\Training\Enums\RpeCategory;
+use App\Training\Enums\SkipReason;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -46,7 +47,7 @@ class ExecutionReportService
      *        still unreported in the active session — the LLM may only name
      *        one of these; anything else is treated as unresolved.
      * @return array{reports: array<int, array{
-     *     exercise_name: ?string, not_performed: bool,
+     *     exercise_name: ?string, not_performed: bool, skip_reason: ?string,
      *     sets: array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>,
      *     rpe: ?int, note: ?string, uncertain: bool,
      * }>, session_finished: bool}
@@ -84,6 +85,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
     {
       "exercise_name": "<uno de los nombres de la lista>" | null,
       "not_performed": true | false,
+      "skip_reason": "cant_do"|"dont_want"|"no_time"|"other" (SOLO si not_performed=true y el usuario dio o insinuó una razón, ej. "no pude" → cant_do, "no quiero" → dont_want, "no me dio tiempo" → no_time) | null,
       "sets": [{"reps": <entero>|null, "load": <número>|null, "duration_seconds": <entero>|null}, ...],
       "rpe_number": <entero 1-10 si el usuario dio un número explícito de esfuerzo> | null,
       "rpe_category": "very_easy"|"easy"|"moderate"|"hard"|"very_hard" (SOLO si el usuario describió el esfuerzo con palabras, ej. "fácil", "pesado", "muy difícil") | null,
@@ -91,15 +93,16 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
       "uncertain": true (si el usuario usó lenguaje de duda: "creo que", "más o menos", "unas", "tal vez") | false
     }
   ],
-  "session_finished": true (si el usuario indica que terminó/cerró toda la sesión, ej. "eso fue todo", "ya terminé", "listo") | false
+  "session_finished": true (si el usuario indica que terminó/cerró toda la sesión, ej. "eso fue todo", "ya terminé") | false
 }
 
 Reglas:
 - Un elemento de "sets" por cada serie que el usuario mencionó explícitamente. Si dice "3 series de 10 con 40kg" sin variación, genera 3 elementos idénticos {"reps":10,"load":40,"duration_seconds":null}.
 - Si el usuario no da NINGÚN número de series/repeticiones/carga/duración para un ejercicio, "sets" debe ser un arreglo vacío [] — nunca inventes un valor.
-- "not_performed": true solo si el usuario dice explícitamente que NO hizo ese ejercicio.
+- "not_performed": true solo si el usuario dice explícitamente que NO hizo ese ejercicio (incluye tanto "no pude" como "no quiero" — la diferencia va en "skip_reason", no en este campo).
 - Puedes incluir más de un elemento en "reports" si el mensaje cubre varios ejercicios.
-- Si el mensaje no reporta nada de ningún ejercicio de la lista, "reports" debe ser [].
+- IMPORTANTE: una confirmación breve sin ningún detalle (ej. "hecho", "listo", "ya", "terminado", "list") SIGUE siendo un reporte real, no un mensaje vacío — genera UN elemento en "reports" para ese caso, con "exercise_name": null (deja que el sistema determine a cuál ejercicio se refiere), "not_performed": false, "sets": [], y todo lo demás null. NUNCA devuelvas "reports": [] para una confirmación de este tipo.
+- Si el mensaje genuinamente no tiene ninguna relación con el entrenamiento (ej. cambia de tema por completo), "reports" debe ser [].
 PROMPT;
     }
 
@@ -122,9 +125,12 @@ PROMPT;
                 continue;
             }
 
+            $notPerformed = (bool) ($report['not_performed'] ?? false);
+
             $reports[] = [
                 'exercise_name' => is_string($report['exercise_name'] ?? null) ? $report['exercise_name'] : null,
-                'not_performed' => (bool) ($report['not_performed'] ?? false),
+                'not_performed' => $notPerformed,
+                'skip_reason' => $notPerformed ? $this->validateSkipReason($report['skip_reason'] ?? null) : null,
                 'sets' => $this->validateSets($report['sets'] ?? null),
                 'rpe' => $this->resolveRpe($report),
                 'note' => is_string($report['note'] ?? null) && $report['note'] !== '' ? $report['note'] : null,
@@ -165,6 +171,11 @@ PROMPT;
         }
 
         return $validated;
+    }
+
+    private function validateSkipReason(mixed $value): ?string
+    {
+        return is_string($value) ? SkipReason::tryFrom($value)?->value : null;
     }
 
     private function resolveRpe(array $report): ?int

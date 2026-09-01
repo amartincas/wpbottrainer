@@ -103,6 +103,7 @@ class ExecutionReportRecorder
             'workout_exercise_id' => $workoutExercise->id,
             'rpe' => $report['rpe'],
             'note' => ($note !== null && $note !== '') ? $note : null,
+            'skip_reason' => $report['skip_reason'] ?? null,
             'logged_at' => now(),
         ]);
 

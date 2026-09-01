@@ -40,5 +40,7 @@ it('produces a snapshot with exactly the fields shown to the user', function () 
         'instructions' => 'Baja controlando la rodilla.',
         'video_url' => 'https://videos.example.test/squat.mp4',
         'muscle_group' => 'legs',
+        'primary_muscle' => null,
+        'secondary_muscles' => null,
     ]);
 });

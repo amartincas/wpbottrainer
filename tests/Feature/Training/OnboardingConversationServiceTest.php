@@ -33,6 +33,23 @@ function combinedPayload(array $overrides = []): array
     ], $overrides);
 }
 
+/**
+ * Payload crudo "extracted" completo (Hito 8.3) — representa lo que la IA
+ * devolvería en el JSON, con todos los campos presentes (a diferencia de
+ * combinedPayload(), que solo declara los 6 originales por brevedad en los
+ * tests heredados del Hito 5.1).
+ */
+function emptyExtractedForTest(array $overrides = []): array
+{
+    return array_merge([
+        'name' => null, 'goal' => null, 'experience_level' => null,
+        'primary_focus' => null, 'secondary_focus' => null, 'training_location' => null,
+        'restrictions' => null, 'available_equipment' => null, 'equipment_fully_equipped' => null,
+        'sessions_per_week' => null, 'age' => null, 'sex' => null, 'weight_kg' => null,
+        'height_cm' => null, 'safety_signal_text' => null,
+    ], $overrides);
+}
+
 // 1. Extracción válida
 it('extracts and validates a fully well-formed response', function () {
     fakeCombinedResponse(combinedPayload([
@@ -51,8 +68,11 @@ it('extracts and validates a fully well-formed response', function () {
     );
 
     expect($result['extracted'])->toBe([
-        'goal' => 'build_muscle', 'experience_level' => 'beginner', 'restrictions' => ['knee'],
-        'available_equipment' => [], 'sessions_per_week' => 3, 'safety_signal_text' => null,
+        'name' => null, 'goal' => 'build_muscle', 'experience_level' => 'beginner',
+        'primary_focus' => null, 'secondary_focus' => null,
+        'training_location' => null, 'available_equipment' => [], 'equipment_fully_equipped' => null,
+        'restrictions' => ['knee'], 'sessions_per_week' => 3,
+        'age' => null, 'sex' => null, 'weight_kg' => null, 'height_cm' => null, 'safety_signal_text' => null,
     ]);
     expect($result['next_action'])->toBe('complete_onboarding');
     expect($result['response'])->toBe('¡Perfecto, ya tengo todo!');
@@ -162,8 +182,12 @@ it('returns an empty result when the AI provider fails, without throwing', funct
 
     expect($result)->toBe([
         'extracted' => [
-            'goal' => null, 'experience_level' => null, 'restrictions' => null,
-            'available_equipment' => null, 'sessions_per_week' => null, 'safety_signal_text' => null,
+            'name' => null, 'goal' => null, 'experience_level' => null,
+            'primary_focus' => null, 'secondary_focus' => null,
+            'training_location' => null, 'available_equipment' => null, 'equipment_fully_equipped' => null,
+            'restrictions' => null, 'sessions_per_week' => null,
+            'age' => null, 'sex' => null, 'weight_kg' => null, 'height_cm' => null,
+            'safety_signal_text' => null,
         ],
         'next_action' => null,
         'response' => null,
@@ -209,5 +233,192 @@ it('the combined prompt explicitly instructs that restrictions and safety_signal
 
         return str_contains($systemPrompt, 'son campos independientes')
             && str_contains($systemPrompt, 'dolor en las rodillas');
+    });
+});
+
+// ── Hito 8.3: nombre, training_location, equipo amplio, datos físicos ──
+
+it('extracts name, training_location and equipment_fully_equipped from a single compound message', function () {
+    // "Entreno en un gimnasio y tengo de todo" — el caso real reportado en
+    // el E2E comercial. Varios campos en un mismo turno.
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest([
+            'name' => 'Ana',
+            'training_location' => 'gym',
+            'equipment_fully_equipped' => true,
+        ]),
+        'next_action' => 'ask_experience_level',
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'Me llamo Ana, entreno en un gimnasio y tengo de todo',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+    );
+
+    expect($result['extracted']['name'])->toBe('Ana');
+    expect($result['extracted']['training_location'])->toBe('gym');
+    expect($result['extracted']['equipment_fully_equipped'])->toBeTrue();
+    expect($result['extracted']['available_equipment'])->toBeNull(); // nunca se inventa una lista
+});
+
+it('keeps equipment_fully_equipped false/null when the user names specific equipment instead of declaring broad availability', function () {
+    // "Solo pesas" — equipo específico, no una declaración de "todo".
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest([
+            'available_equipment' => ['pesas'],
+            'equipment_fully_equipped' => null,
+        ]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('solo pesas', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['available_equipment'])->toBe(['pesas']);
+    expect($result['extracted']['equipment_fully_equipped'])->toBeNull();
+});
+
+it('discards an invalid training_location value instead of trusting the LLM', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['training_location' => 'un_lugar_inventado']),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['training_location'])->toBeNull();
+});
+
+it('extracts physical stats when given, and leaves them null when the user declines', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['age' => 30, 'sex' => 'female', 'weight_kg' => 65.5, 'height_cm' => 168]),
+        'next_action' => 'complete_onboarding',
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        '30 años, mujer, 65.5 kg, 168 cm',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+    );
+
+    expect($result['extracted']['age'])->toBe(30);
+    expect($result['extracted']['sex'])->toBe('female');
+    expect($result['extracted']['weight_kg'])->toBe(65.5);
+    expect($result['extracted']['height_cm'])->toBe(168);
+});
+
+it('discards physical stats outside a plausible range instead of trusting the LLM', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['age' => 250, 'weight_kg' => 900, 'height_cm' => 5]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['age'])->toBeNull();
+    expect($result['extracted']['weight_kg'])->toBeNull();
+    expect($result['extracted']['height_cm'])->toBeNull();
+});
+
+it('the combined prompt explicitly instructs how to handle broad/ambiguous equipment availability without enumerating', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'tengo de todo')
+            && str_contains($systemPrompt, 'equipment_fully_equipped')
+            && str_contains($systemPrompt, 'solo pesas');
+    });
+});
+
+// ── Hito 8.4: objetivos específicos (primary_focus/secondary_focus) ────
+
+it('translates a simple muscle-focus phrase into the closed MuscleFocus vocabulary', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['primary_focus' => ['glutes']]),
+        'next_action' => 'ask_training_location',
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'quiero aumentar glúteos',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+    );
+
+    expect($result['extracted']['primary_focus'])->toBe(['glutes']);
+});
+
+it('accepts an empty primary_focus as a valid, complete answer — "no preference" is not "not answered"', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['primary_focus' => []]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'quiero trabajar todo por igual',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+    );
+
+    expect($result['extracted']['primary_focus'])->toBe([]);
+});
+
+it('discards a primary_focus value outside the closed MuscleFocus vocabulary instead of trusting the LLM', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['primary_focus' => ['glutes', 'un_valor_inventado']]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['primary_focus'])->toBe(['glutes']);
+});
+
+it('extracts a compound focus ("piernas") and a lower-emphasis secondary_focus in the same message', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest([
+            'primary_focus' => ['quads', 'hamstrings', 'glutes', 'calves'],
+            'secondary_focus' => ['back'],
+        ]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'sobre todo piernas, y algo de espalda también',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+    );
+
+    expect($result['extracted']['primary_focus'])->toBe(['quads', 'hamstrings', 'glutes', 'calves']);
+    expect($result['extracted']['secondary_focus'])->toBe(['back']);
+});
+
+it('uses the AI response for primary_focus when next_action matches the real missing field', function () {
+    $service = new OnboardingConversationService;
+
+    $question = $service->resolveQuestion('primary_focus', 'ask_primary_focus', '¿Alguna zona que quieras priorizar?');
+
+    expect($question)->toBe('¿Alguna zona que quieras priorizar?');
+    expect($service->usedAiResponse('primary_focus', 'ask_primary_focus', '¿Alguna zona que quieras priorizar?'))->toBeTrue();
+});
+
+it('falls back to the canned primary_focus question when next_action does not match', function () {
+    $service = new OnboardingConversationService;
+
+    $question = $service->resolveQuestion('primary_focus', 'ask_goal', '¿Cuál es tu objetivo?');
+
+    expect($question)->toBe(
+        '¿Hay alguna zona de tu cuerpo que quieras priorizar especialmente? Por ejemplo glúteos, piernas, espalda o abdomen — o si prefieres trabajar todo por igual, también dime.'
+    );
+});
+
+it('the combined prompt never exposes the internal primary_focus/secondary_focus terms as user-facing language', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'glúteos')
+            && str_contains($systemPrompt, 'piernas')
+            && str_contains($systemPrompt, 'Nunca uses los términos técnicos');
     });
 });

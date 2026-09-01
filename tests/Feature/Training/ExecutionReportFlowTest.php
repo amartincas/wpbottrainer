@@ -462,3 +462,82 @@ it('blocks a report attempt when a safety signal is present, without touching Ex
     expect(TrainingProfile::where('contact_id', $contact->id)->first()->isFlaggedForSafetyReview())->toBeTrue();
     Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.openai.com'));
 });
+
+// ── Hito 8.3: fix real del hallazgo del E2E comercial — "hecho" ─────────
+
+// 22. El defecto real: "hecho" (sin nombrar el ejercicio, sin métricas) NO
+// debe reenviar el mismo ejercicio — con el prompt corregido, produce UN
+// reporte que ExecutionReportRecorder ya sabía resolver (único ejercicio
+// pendiente) y pedir la aclaración correspondiente.
+it('never resends the same exercise/session when the user replies "hecho" without detail — asks for clarification instead', function () {
+    $contact = readyTrainingContact();
+    [$session, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Plancha']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            // Refleja exactamente la regla nueva del prompt: una confirmación
+            // sin detalle sigue produciendo UN reporte, con exercise_name null.
+            'reports' => [[
+                'exercise_name' => null, 'not_performed' => false, 'skip_reason' => null,
+                'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'hecho');
+
+    expect(ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->exists())->toBeFalse();
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+
+    // Pide aclaración — nunca reenvía el ejercicio/video.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), '¿Cuántas series'));
+    Http::assertNotSent(fn ($request) => data_get($request->data(), 'type') === 'video');
+});
+
+// 23. "no pude" vs "no quiero" — mismo not_performed, distinto skip_reason,
+// nunca inventado si el usuario no da ninguna razón.
+it('distinguishes "no pude" from "no quiero" via skip_reason, without inventing a reason when none is given', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Sentadilla', 'not_performed' => true, 'skip_reason' => 'dont_want',
+                'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'no quiero hacer sentadillas hoy');
+
+    $log = ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->first();
+    expect($log)->not->toBeNull();
+    expect($log->skip_reason->value)->toBe('dont_want');
+});
+
+it('records skip_reason as null when not_performed is true but no reason was given or implied', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Sentadilla', 'not_performed' => true, 'skip_reason' => null,
+                'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'no la hice');
+
+    $log = ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->first();
+    expect($log)->not->toBeNull();
+    expect($log->skip_reason)->toBeNull();
+});

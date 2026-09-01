@@ -80,15 +80,15 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 |---|---|
 | **relaciones** | Cada archivo de entidad (`TrainingProfileTest`, `ExerciseTest`, `WorkoutSessionTest`, etc.) prueba sus propias relaciones (`belongsTo`/`hasMany`/`hasOne`) contra factories reales. |
 | **multi-tenancy** | `TrainingMultiTenancyTest.php` — dos tenants no mezclan `WorkoutSession` de sus contactos; `Exercise` es verificado como catálogo global (sin columna `tenant_id`); `TrainingProfile`/`WorkoutSession`/`TrainingAccess` verificados sin `tenant_id` propio (se escalan vía `Contact`, mismo precedente que `product_images`). |
-| **TrainingProfile** | `TrainingProfileTest.php` — casts de enums/arrays, `flagForSafetyReview()`/`clearSafetyFlag()`, ausencia de `access_status`. |
-| **Exercise** | `ExerciseTest.php` — casts, `is_active` como mecanismo de retiro (nunca borrado físico), `toSnapshot()`. |
+| **TrainingProfile** | `TrainingProfileTest.php` — casts de enums/arrays (incluidos `primary_focus`/`secondary_focus`, Hito 8.4), `flagForSafetyReview()`/`clearSafetyFlag()`, ausencia de `access_status`. |
+| **Exercise** | `ExerciseTest.php` — casts, `is_active` como mecanismo de retiro (nunca borrado físico), `toSnapshot()` (incluye `primary_muscle`/`secondary_muscles` desde Hito 8.4). |
 | **WorkoutSession** | `WorkoutSessionTest.php` — relación con `Contact`, orden de `workoutExercises`, estados `scheduled`/`completed`/`skipped`. |
 | **WorkoutExercise + snapshot** | `WorkoutExerciseImmutabilityTest.php` — editar el `Exercise` en vivo **no** cambia el `exercise_snapshot` ya guardado; borrar el `Exercise` referenciado (`nullOnDelete`) no destruye el `WorkoutExercise` ni su snapshot; los campos `prescribed_*` no se sobrescriben. |
 | **ExerciseLog / ExerciseSet** | `ExerciseLogAndSetTest.php` — reproduce el caso de la sentadilla con reps/carga distintas por serie (10×40kg, 10×45kg, 8×50kg); ejercicios por tiempo (`actual_duration_seconds`); una sesión puede reportarse parcialmente (no todo `WorkoutExercise` tiene `ExerciseLog`). |
 | **prescrito vs. ejecutado** | `ExerciseLogAndSetTest.php` — registrar un `ExerciseLog`/`ExerciseSet` con valores muy distintos a lo prescrito nunca modifica las columnas `prescribed_*` del `WorkoutExercise`. |
 | **TrainingAccess / acceso-expiración** | `TrainingAccessTest.php` — `isCurrentlyValid()` para activo/trial/expirado/revocado/con fecha pasada; verificación de que la tabla no contiene ningún campo de facturación. |
 | **safety gate** | `TrainingAccessGateTest.php` + `SafetySignalDetectorTest.php` — el Gate bloquea por `no_access`/`access_invalid`/`safety_flagged` (seguridad tiene prioridad incluso con acceso vigente) y permite solo cuando ambas fuentes están en orden; el detector reconoce frases de alarma conocidas (case-insensitive) y no confunde una restricción normal ("me duele la rodilla") con una señal de alarma. |
-| **Training Engine — decisión** | `TrainingEngineTest.php` — bloqueo por `TrainingAccessDeniedException` (sin acceso, perfil marcado); idempotencia (sesión pendiente se devuelve sin cambios); generación respetando restricciones/equipamiento; progresión de carga/duración según RPE reportado; rotación evita repetir el foco de la sesión completada inmediatamente anterior. |
+| **Training Engine — decisión** | `TrainingEngineTest.php` — bloqueo por `TrainingAccessDeniedException` (sin acceso, perfil marcado); idempotencia (sesión pendiente se devuelve sin cambios); generación respetando restricciones/equipamiento; progresión de carga/duración según RPE reportado; rotación evita repetir el foco de la sesión completada inmediatamente anterior. Ampliado sustancialmente en Hito 8.4 (foco declarado, objetivo/nivel, anti-repetición, A/B/C) — ver sección dedicada más abajo. |
 
 ## Cobertura del primer flujo conversacional de Training (Hito 5)
 
@@ -131,6 +131,46 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 | **19. usuario sin sesión activa** | `ExecutionReportFlowTest.php` — sin `WorkoutSession` pendiente, un mensaje con palabra clave de training cae al flujo normal de generación (nueva sesión), nunca crea un `ExerciseLog` fantasma. |
 | **20. bloqueado por acceso** | `ExecutionReportFlowTest.php` — con una sesión pendiente pero sin `TrainingAccess` vigente, el reporte se bloquea con el mensaje de activación, sin tocar `ExerciseLog`. |
 | **21. bloqueado por safety** | `ExecutionReportFlowTest.php` — una señal de riesgo en el mismo mensaje del reporte bloquea antes de intentar extraer nada, sin llamar al proveedor de IA. |
+
+## Cobertura de Hito 8.3 (onboarding ampliado, "hecho", skip_reason)
+
+28 tests nuevos, repartidos en los archivos ya existentes de Training (sin archivos de test nuevos):
+
+| Categoría | Dónde |
+|---|---|
+| **nombre + training_location + equipo amplio en un solo mensaje** | `OnboardingConversationServiceTest.php` — "Me llamo Ana, entreno en un gimnasio y tengo de todo" extrae `name`/`training_location`/`equipment_fully_equipped` los tres a la vez, sin inventar una lista de equipo. |
+| **equipo específico vs. amplio** | `OnboardingConversationServiceTest.php` — "solo pesas" deja `available_equipment=['pesas']` y `equipment_fully_equipped=null` (nunca `true`) — la declaración de "todo" y la mención de equipo puntual se distinguen. |
+| **validación de rango en datos físicos** | `OnboardingConversationServiceTest.php` — edad/peso/estatura fuera de un rango plausible se descartan, nunca se persisten tal cual. |
+| **prompt explícito para equipo ambiguo** | `OnboardingConversationServiceTest.php` — aserción directa sobre el contenido del prompt enviado al proveedor de IA (mismo patrón que la independencia restrictions/safety_signal_text del Hito 5.1/D026). |
+| **`isOnboardingComplete`/`firstMissingOnboardingField` con `Contact`** | `TrainingProfileTest.php` — `training_location` bloquea; edad/sexo/peso/estatura nunca bloquean; el nombre (`Contact.customer_name`) es el primer campo verificado, antes que cualquier columna de `TrainingProfile`. |
+| **"preguntar una sola vez" los datos físicos** | `TrainingConversationFlowTest.php` — turno 3 del flujo progresivo: el usuario declina ("prefiero no decir esos datos") y el onboarding queda completo de todos modos; secuencia completa de 7 turnos (antes 5) con exactamente 1 llamada de IA por turno, sin excepción. |
+| **fix real de "hecho"** | `ExecutionReportServiceTest.php` (aserción de prompt) + `ExecutionReportFlowTest.php` (flujo completo) — una confirmación sin detalle produce un reporte con `exercise_name: null`/`sets: []` en vez de `reports: []`; verificado de punta a punta que la sesión **nunca** se reenvía (`WorkoutSession.status` permanece `scheduled`, no se reenvía ningún video) y en cambio se pide la aclaración de series/repeticiones ya existente. |
+| **`skip_reason`** | `ExecutionReportServiceTest.php` — solo se valida cuando `not_performed=true`; se descarta si el LLM lo envía junto a `not_performed=false`; un valor fuera del enum se descarta. `ExecutionReportFlowTest.php` — "no pude" (`cant_do`)/"no quiero" (`dont_want`) distinguibles de punta a punta; sin razón dada, `skip_reason` queda `null`, nunca inventado. |
+
+## Cobertura de Hito 8.4 (objetivos específicos y personalización real por foco muscular)
+
+35 tests nuevos netos (ver D034) — 10 en `TrainingEngineTest.php` (primer archivo con cobertura dedicada a `selectExercises()`/`progressionFor()` más allá de lo heredado de Hito 4), 9 en `OnboardingConversationServiceTest.php`, 4 en `TrainingProfileTest.php`, 1 en `ExerciseTest.php`; 2 tests existentes ajustados por consecuencia directa (`TrainingEngineTest`: `goal` fijado explícitamente donde antes era aleatorio; `TrainingConversationFlowTest`: turnos reordenados/ampliados para el nuevo campo obligatorio `primary_focus`).
+
+| Categoría | Dónde |
+|---|---|
+| **foco simple** | `TrainingEngineTest.php` — con `primary_focus=['glutes']`, un ejercicio con `primary_muscle=glutes` es priorizado sobre el pool general. |
+| **foco compuesto ("piernas")** | `TrainingEngineTest.php` — `primary_focus=[quads,hamstrings,glutes,calves]` selecciona los 3 ejercicios que matchean cualquiera de esos valores, no solo uno. |
+| **foco + objetivo combinados** | `TrainingEngineTest.php` — un ejercicio de foco es seleccionado Y prescrito con los `GOAL_DEFAULTS` del objetivo vigente (verificado sobre `WorkoutExercise.prescribed_sets`/`rest_seconds` reales, no solo el ejercicio elegido). |
+| **foco insuficiente (fallback)** | `TrainingEngineTest.php` — con `Log::spy()`, se verifica que `TRAINING_FOCUS_FALLBACK` se registra exactamente una vez cuando el catálogo elegible no alcanza la garantía mínima, y la sesión se genera igual (nunca se bloquea). |
+| **garantía de mayoría (≥2 de 3)** | `TrainingEngineTest.php` — con exactamente 2 candidatos de foco disponibles, ambos terminan seleccionados. |
+| **anti-repetición nunca gana sobre mejor foco/nivel** | `TrainingEngineTest.php` — un ejercicio usado en la sesión inmediatamente anterior es desempatado (nunca excluido por otra razón) frente a 3 alternativas igual de válidas en foco y nivel. |
+| **prioridad de `difficulty_level`** | `TrainingEngineTest.php` — con más candidatos que cupos, los que coinciden exactamente con `experience_level` ganan sobre uno de nivel distinto. |
+| **`equipment_fully_equipped` como elegibilidad (2 tests dedicados)** | `TrainingEngineTest.php` — con `training_location=gym` explícito en ambos: `equipment_fully_equipped=true` resuelve un equipo EFECTIVO amplio (3 ejercicios que exigen equipo distinto y no enumerado son los 3 elegibles, sin enumerar nada); `equipment_fully_equipped=false`, mismo `training_location=gym`, exige enumeración explícita (`available_equipment`) — un ejercicio no enumerado queda excluido pese al mismo lugar. Cubre un fix real encontrado en la revisión (el flag nunca se consultaba antes de este hito) y confirma que `training_location` no es lo que decide la elegibilidad de equipo. |
+| **A/B/C — trazabilidad causal, no solo diferencia** | `TrainingEngineTest.php` — 3 perfiles distintos en goal/experience_level/primary_focus/split_type/training_location/sessions_per_week sobre el mismo catálogo, con aserciones que atribuyen CADA diferencia de salida a su variable causante: `primary_focus` → qué ejercicio de foco entra; `experience_level` → por qué el ejercicio de foco del otro perfil queda excluido del pool general pese a ser elegible; `split_type` → qué grupos musculares entran al pool general (dos ejercicios elegibles y de nivel correcto quedan fuera de la sesión de C solo por su `muscle_group` frente a la rotación `push_pull_legs`); `goal` → los 3 valores de prescripción (`prescribed_sets`/`prescribed_reps`/`rest_seconds`) vía `GOAL_DEFAULTS`. Documenta explícitamente, dentro del propio test, que `training_location`/`sessions_per_week` se verifican como correctamente persistidos pero **no son consumidos por `TrainingEngine` todavía** — evita sugerir una causalidad inexistente. |
+| **traducción de lenguaje natural al vocabulario `MuscleFocus`** | `OnboardingConversationServiceTest.php` — "quiero aumentar glúteos" → `['glutes']`; "todo por igual" → `[]` (respuesta válida, no `null`); un valor fuera del vocabulario cerrado se descarta sin tumbar los demás válidos del mismo array; foco compuesto ("piernas") + secundario de menor énfasis en el mismo mensaje. |
+| **`ask_primary_focus` en `resolveQuestion()`** | `OnboardingConversationServiceTest.php` — mismo mecanismo genérico ya probado para otros campos (usa la redacción de la IA solo si `next_action` coincide con el campo realmente pendiente; fallback canónico en caso contrario). |
+| **el prompt nunca expone `primary_focus`/`secondary_focus` como términos de cara al usuario** | `OnboardingConversationServiceTest.php` — aserción directa sobre el contenido del prompt enviado al proveedor de IA. |
+| **`primary_focus` en `firstMissingOnboardingField`** | `TrainingProfileTest.php` — `null` bloquea, `[]` no; se pregunta justo después de `experience_level` y antes de `training_location`; `secondary_focus` nunca bloquea, ni siquiera en `null`. |
+| **`Exercise::toSnapshot()` ampliado** | `ExerciseTest.php` — incluye `primary_muscle`/`secondary_muscles` congelados junto al resto de campos ya existentes. |
+
+**Qué queda fuera de esta cobertura, explícitamente** (ver D034): ninguno de estos tests demuestra personalización por foco contra el catálogo **real** de producción — el único `Exercise` activo hoy no tiene `primary_muscle`/`secondary_muscles` poblados. Toda la cobertura anterior usa `Exercise::factory()->withPrimaryMuscle()`/`withSecondaryMuscles()` explícitos; la validación en producción depende del catálogo real de Hito 9.
+
+**No cubierto por este hito** (explícitamente fuera de alcance, ver D033): ningún test verifica que `TrainingEngine` use los nuevos campos — eso es Hito 8.4, todavía no implementado.
 
 ## Cobertura de validación E2E con el payload real de Meta (Hito 7)
 
