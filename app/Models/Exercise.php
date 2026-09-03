@@ -102,6 +102,26 @@ class Exercise extends Model
     }
 
     /**
+     * Hito 9.3 (ExerciseResource) — estado de revisión DERIVADO de
+     * `is_active`+`contraindications`, deliberadamente sin columna nueva:
+     * - `pending_review`: nunca revisado (`contraindications=null`).
+     * - `active`: aprobado y en uso.
+     * - `inactive`: fue revisado alguna vez (`contraindications!==null`)
+     *   pero ya no está activo — ej. el proveedor dejó de devolverlo.
+     *
+     * Único lugar que calcula esto — Filament (y cualquier otro
+     * consumidor futuro) lo lee de aquí, nunca reimplementa la regla.
+     */
+    public function reviewStatus(): string
+    {
+        return match (true) {
+            $this->is_active => 'active',
+            $this->contraindications === null => 'pending_review',
+            default => 'inactive',
+        };
+    }
+
+    /**
      * Hito 9.1/9.2 — única vía para activar un Exercise de proveedor.
      * Rechaza explícitamente activar cualquier ejercicio cuyas
      * `contraindications` sigan en `null` ("todavía no revisado" — mismo
