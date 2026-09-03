@@ -198,12 +198,33 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 | Categoría | Dónde |
 |---|---|
 | **Formato del mensaje de técnica** | `ExerciseMessageFormatterTest.php` (nuevo, 9 tests) — nombre+prescripción numerados; prescripción por duración vs. reps/carga; `instructions`+`important_points` combinados como viñetas, acotados a 4; `breathing_cue`/`common_mistakes` (máx. 2) solo si existen; ninguna sección vacía cuando el campo es `null`; el video siempre se menciona, con o sin técnica. |
-| **Backfill real de `instructions` (text→json)** | `InstructionsMigrationBackfillTest.php` (nuevo, contra MariaDB real, no simulado) — un valor de texto plano (como el Exercise real de producción) sobrevive como array de un elemento; un valor ya JSON válido no se envuelve dos veces. |
+| **Backfill real de `instructions` (text→json)** | `InstructionsMigrationBackfillTest.php` (nuevo, contra MySQL real, no simulado) — un valor de texto plano (como el Exercise real de producción) sobrevive como array de un elemento; un valor ya JSON válido no se envuelve dos veces. |
 | **Normalización de la técnica de YMove** | `YMoveExerciseNormalizerTest.php` — `importantPoints[]` se mapea; `common_mistakes`/`breathing_cue` siempre `[]`/`null` para YMove, incluso con `instructions`/`importantPoints` ricos — nunca inventados. |
 | **Importer: refresco vs. preservación** | `ExerciseImporterTest.php` — `important_points` se guarda al crear; un re-sync refresca `instructions`/`important_points` pero preserva `common_mistakes`/`breathing_cue` curados a mano, igual que `contraindications`. |
 | **Asimetría de activación** | `ExerciseTest.php` — un solo test verifica los 3 casos juntos: `contraindications=null` bloquea, `instructions=[]` bloquea, `important_points`/`common_mistakes`/`breathing_cue` en `null` no bloquean. |
 | **No interferencia con `TrainingEngine`** | `TrainingEngineTest.php` — con competencia real por cupos (más candidatos que espacios), un ejercicio con más técnica pero peor ajuste de dificultad nunca desplaza a uno mejor rankeado. |
 | **Integración real por WhatsApp** | Extensión de `TrainingConversationFlowTest.php` — el mensaje saliente contiene el nombre, las instrucciones reales del snapshot y la respiración, y el video se sigue enviando. |
+
+## Cobertura de Hito 9.3 (sincronización completa del catálogo)
+
+22 tests nuevos netos (ver D038) — `tests/Feature/ExerciseCatalog/ExerciseFullSyncTest.php` (18, nuevo) + 4 en archivos existentes.
+
+| Categoría | Dónde |
+|---|---|
+| **Paginación completa real** | `ExerciseFullSyncTest.php` — recorre todas las páginas usando `pagination.totalPages` reportado por el proveedor, nunca un número asumido; sync completo sobre el catálogo entero reporta `created`/`updated`/`unchanged` con exactitud. |
+| **Idempotencia y no-duplicación** | La misma corrida dos veces no crea nada nuevo y reporta todo `unchanged`; el mismo `provider_exercise_id` nunca se duplica entre páginas ni entre corridas. |
+| **Actualización real** | Un ejercicio se reporta `updated` solo cuando su metadata de proveedor cambió de verdad (nunca por ruido de `synced_at`/reordenamiento de JSON del `provider_metadata` — hallazgo real, ver D038). |
+| **Ausente-en-una-página, presente-en-otra** | No se desactiva un ejercicio activo que simplemente aparece en una página posterior a la que ya se revisó. |
+| **Fallo parcial nunca reconcilia** | Un error de la API a mitad de la sincronización (`ProviderSyncException`) detiene la corrida sin tocar ningún `is_active` — una respuesta incompleta nunca se trata como "el ejercicio desapareció". Probado tanto sin filtro de músculo como acotado a uno. |
+| **Reconciliación acotada por músculo** | 4 variantes: pagina más de una página para un solo músculo; nunca desactiva un ejercicio activo de otro músculo; sigue pidiendo `includeVideos=false` y el filtro de músculo correcto; un error a mitad de camino estando acotado a un músculo tampoco desactiva nada. |
+| **`provider_has_video`** | Se persiste desde la metadata del proveedor y se refresca en cada re-sync, sin ninguna relación con `is_active`. |
+| **Cero video, siempre** | `includeVideos=false` en cada página consultada; ningún `video_url` de proveedor queda persistido tras un sync completo. |
+| **Reconocimiento de un lote ya importado** | Un ejercicio importado antes por `importSelected()` se reconoce por `provider`+`provider_exercise_id` en el sync completo, sin duplicarse. |
+| **`searchPaged()` del adapter** | `YMoveExerciseProviderTest.php` — expone la paginación real (`page`/`totalPages`/`total`) que YMove reporta; lanza `ProviderSyncException` en vez de devolver una página vacía cuando el proveedor falla (para que un error nunca se confunda con "fin del catálogo"). |
+| **Comando reescrito** | `ExerciseImporterTest.php` — `exercises:sync` corre ahora sobre `fullSync()` (antes tenía un defecto real de una sola página por corrida, nunca ejecutado en producción, ver D038); sigue filtrando por `--muscle` correctamente. |
+| **`hasVideo` en la normalización** | `YMoveExerciseNormalizerTest.php` — `true`/`false`/ausente se mapean sin inventar el valor cuando el proveedor no lo informa. |
+
+**Sincronización real ejecutada contra la cuenta real de YMove** (no un doble de prueba, ver D038): 1068 ejercicios, 1067 con video, 1 sin video, 0 errores, 0 cuota de video consumida — cierra el gap que D036 dejó explícito ("ningún test llama a la API real de YMove").
 
 ## Cobertura de validación E2E con el payload real de Meta (Hito 7)
 

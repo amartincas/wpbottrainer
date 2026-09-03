@@ -5,9 +5,12 @@ namespace App\ExerciseCatalog\Providers\YMove;
 use App\ExerciseCatalog\Contracts\ExerciseProviderInterface;
 use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\ExerciseCatalog\DTOs\ProviderSearchCriteria;
+use App\ExerciseCatalog\DTOs\ProviderSearchPage;
 use App\ExerciseCatalog\DTOs\ResolvedMedia;
 use App\ExerciseCatalog\Enums\MediaVariant;
+use App\ExerciseCatalog\Exceptions\ProviderSyncException;
 use App\Training\Enums\MuscleFocus;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 
@@ -32,20 +35,7 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
 
     public function search(ProviderSearchCriteria $criteria): Collection
     {
-        $query = [
-            'hasVideo' => $criteria->hasVideoOnly ? 'true' : 'false',
-            'includeVideos' => 'true',
-        ];
-
-        if ($criteria->muscleFocus !== null) {
-            $query['muscleGroup'] = $criteria->muscleFocus->value;
-        }
-
-        if ($criteria->page !== null) {
-            $query['page'] = $criteria->page;
-        }
-
-        $response = $this->client()->get('/exercises', $query);
+        $response = $this->client()->get('/exercises', $this->buildBrowseQuery($criteria));
 
         if ($response->failed()) {
             return collect();
@@ -59,27 +49,14 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
 
     public function find(string $providerExerciseId): ?ProviderExerciseData
     {
-        // La API pública auditada expone el detalle vía el listado
-        // filtrado (no hay un endpoint /exercises/{id} confirmado en la
-        // prueba técnica real) — se busca sin filtro de músculo y se
-        // localiza por id. Aceptable para el volumen de MVP (sección 9 del
-        // diseño); revisar si el catálogo real crece mucho más.
-        $response = $this->client()->get('/exercises', [
-            'includeVideos' => 'true',
-        ]);
-
-        if ($response->failed()) {
-            return null;
-        }
-
-        $raw = collect($response->json('data', []))->firstWhere('id', $providerExerciseId);
-
-        return $raw !== null ? new ProviderExerciseData($providerExerciseId, $raw) : null;
+        // Metadata únicamente (modo browse) — usado por la importación de
+        // catálogo. Nunca debe pedir video: ver findWithVideo() para eso.
+        return $this->fetchAndLocate($providerExerciseId, includeVideos: false);
     }
 
     public function resolveMedia(string $providerExerciseId, MediaVariant $variant = MediaVariant::Default): ?ResolvedMedia
     {
-        $data = $this->find($providerExerciseId);
+        $data = $this->findWithVideo($providerExerciseId);
 
         if ($data === null) {
             return null;
@@ -94,6 +71,38 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         return new ResolvedMedia($videoUrl, 'video/mp4', $this->extractExpiry($videoUrl));
     }
 
+    public function searchPaged(ProviderSearchCriteria $criteria): ProviderSearchPage
+    {
+        $page = $criteria->page ?? 1;
+        $query = $this->buildBrowseQuery($criteria);
+        $query['page'] = $page;
+
+        $response = $this->client()->get('/exercises', $query);
+
+        if ($response->failed()) {
+            // A diferencia de search(), NUNCA se silencia como colección
+            // vacía — eso confundiría un fallo real de la API con "fin
+            // del catálogo" en una sincronización completa.
+            throw new ProviderSyncException(
+                "YMove respondió con error al pedir la página {$page}: HTTP {$response->status()}."
+            );
+        }
+
+        $items = collect($response->json('data', []))
+            ->filter(fn (array $raw) => isset($raw['id']))
+            ->map(fn (array $raw) => new ProviderExerciseData($raw['id'], $raw))
+            ->values();
+
+        $pagination = $response->json('pagination');
+
+        return new ProviderSearchPage(
+            items: $items,
+            page: (int) ($pagination['page'] ?? $page),
+            totalPages: isset($pagination['totalPages']) ? (int) $pagination['totalPages'] : null,
+            totalItems: isset($pagination['total']) ? (int) $pagination['total'] : null,
+        );
+    }
+
     public function isAvailable(): bool
     {
         try {
@@ -105,7 +114,10 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
 
     public function variants(string $providerExerciseId): array
     {
-        $data = $this->find($providerExerciseId);
+        // Enumerar variantes de video (fondo blanco/gimnasio) requiere el
+        // arreglo `videos[]`, que el modo browse no trae — igual que
+        // resolveMedia(), esta es una ruta que SÍ puede consumir cuota.
+        $data = $this->findWithVideo($providerExerciseId);
 
         if ($data === null) {
             return [];
@@ -126,7 +138,63 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         return [];
     }
 
-    private function client(): \Illuminate\Http\Client\PendingRequest
+    /**
+     * Query compartida por search()/searchPaged() — siempre modo browse
+     * (nunca cuota de video: ver docs/DECISIONS.md sobre el default de
+     * `includeVideos` según fecha de creación de la key, nunca confiado).
+     * `hasVideo` es tri-estado: `null` no envía el parámetro en absoluto
+     * (YMove entonces no filtra, trae todo — con y sin video).
+     */
+    private function buildBrowseQuery(ProviderSearchCriteria $criteria): array
+    {
+        $query = ['includeVideos' => 'false'];
+
+        if ($criteria->hasVideo !== null) {
+            $query['hasVideo'] = $criteria->hasVideo ? 'true' : 'false';
+        }
+
+        if ($criteria->muscleFocus !== null) {
+            $query['muscleGroup'] = $criteria->muscleFocus->value;
+        }
+
+        if ($criteria->page !== null) {
+            $query['page'] = $criteria->page;
+        }
+
+        return $query;
+    }
+
+    /**
+     * Igual que find(), pero con video incluido — SOLO para las dos rutas
+     * del contrato que legítimamente lo necesitan (resolveMedia/variants).
+     * Nunca invocada desde la importación de catálogo.
+     */
+    private function findWithVideo(string $providerExerciseId): ?ProviderExerciseData
+    {
+        return $this->fetchAndLocate($providerExerciseId, includeVideos: true);
+    }
+
+    private function fetchAndLocate(string $providerExerciseId, bool $includeVideos): ?ProviderExerciseData
+    {
+        // La API pública auditada expone el detalle vía el listado
+        // filtrado (no hay un endpoint /exercises/{id} confirmado en la
+        // prueba técnica real) — se busca sin filtro de músculo y se
+        // localiza por id. Aceptable para el volumen de MVP (sección 9 del
+        // diseño); revisar si el catálogo real crece mucho más.
+        $response = $this->client()->get('/exercises', [
+            'includeVideos' => $includeVideos ? 'true' : 'false',
+        ]);
+
+        if ($response->failed()) {
+            return null;
+        }
+
+        $raw = collect($response->json('data', []))->firstWhere('id', $providerExerciseId);
+
+        return $raw !== null ? new ProviderExerciseData($providerExerciseId, $raw) : null;
+    }
+
+    private function client(): PendingRequest
     {
         return Http::withHeaders([
             'X-API-Key' => config('services.ymove.api_key'),

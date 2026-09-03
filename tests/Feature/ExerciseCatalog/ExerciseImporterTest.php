@@ -4,6 +4,8 @@ use App\ExerciseCatalog\DTOs\ProviderSearchCriteria;
 use App\ExerciseCatalog\Importer\ExerciseImporter;
 use App\ExerciseCatalog\ProviderRegistry;
 use App\Models\Exercise;
+use App\Models\User;
+use App\Training\Enums\MuscleFocus;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
 
@@ -29,7 +31,7 @@ it('imports a new exercise as inactive with unreviewed contraindications, never 
     expect($exercise->provider)->toBe('ymove');
     expect($exercise->provider_exercise_id)->toBe('abc-123');
     expect($exercise->name)->toBe('Barbell Hip Thrust');
-    expect($exercise->primary_muscle)->toBe(\App\Training\Enums\MuscleFocus::Glutes);
+    expect($exercise->primary_muscle)->toBe(MuscleFocus::Glutes);
     expect($exercise->difficulty_level)->toBeNull();
     expect($exercise->is_active)->toBeFalse();
     expect($exercise->contraindications)->toBeNull();
@@ -82,7 +84,7 @@ it('re-syncing an already-imported exercise updates its metadata but never touch
     $importer = new ExerciseImporter(new ProviderRegistry);
     $importer->importSearch('ymove', new ProviderSearchCriteria);
 
-    $reviewer = \App\Models\User::factory()->create();
+    $reviewer = User::factory()->create();
     $exercise = Exercise::where('provider_exercise_id', 'abc-123')->first();
     $exercise->update(['contraindications' => []]);
     $exercise->activate($reviewer);
@@ -96,24 +98,37 @@ it('re-syncing an already-imported exercise updates its metadata but never touch
     expect($exercise->contraindications)->toBe([]); // preservada, no reseteada a null
 });
 
+/**
+ * Hito 9.3 — el comando ahora corre sobre ExerciseImporter::fullSync(),
+ * que pagina de verdad usando la paginación real del proveedor (antes,
+ * `importSearch()` solo pedía una página — riesgo real de desactivación
+ * masiva con cualquier músculo de más de ~20 ejercicios, nunca ejecutado
+ * en producción, corregido aquí). El fake necesita `pagination` para que
+ * el comando sepa cuándo detenerse.
+ */
 it('deactivates exercises no longer returned by the provider, without deleting them', function () {
-    Http::fake(['exercise-api.ymove.app/*' => Http::sequence()
-        ->push(['data' => [
-            ['id' => 'keep-me', 'title' => 'Stays', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']],
-            ['id' => 'remove-me', 'title' => 'Goes away', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']],
-        ]], 200)
-        ->push(['data' => [
-            ['id' => 'keep-me', 'title' => 'Stays', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']],
-        ]], 200),
-    ]);
+    $phase = ['before'];
+    Http::fake(function ($request) use (&$phase) {
+        parse_str((string) parse_url((string) $request->url(), PHP_URL_QUERY), $query);
+        $page = (int) ($query['page'] ?? 1);
+        $data = $phase[0] === 'before'
+            ? [
+                ['id' => 'keep-me', 'title' => 'Stays', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']],
+                ['id' => 'remove-me', 'title' => 'Goes away', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']],
+            ]
+            : [['id' => 'keep-me', 'title' => 'Stays', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']]];
 
-    $importer = new ExerciseImporter(new ProviderRegistry);
-    $imported = $importer->importSearch('ymove', new ProviderSearchCriteria);
-    foreach ($imported as $exercise) {
+        return Http::response(['data' => $page === 1 ? $data : [], 'pagination' => ['page' => $page, 'totalPages' => 1]], 200);
+    });
+
+    Artisan::call('exercises:sync', ['provider' => 'ymove']);
+    foreach (['keep-me', 'remove-me'] as $id) {
+        $exercise = Exercise::where('provider_exercise_id', $id)->first();
         $exercise->update(['contraindications' => []]);
-        $exercise->activate(\App\Models\User::factory()->create());
+        $exercise->activate(User::factory()->create());
     }
 
+    $phase[0] = 'after';
     Artisan::call('exercises:sync', ['provider' => 'ymove']);
 
     expect(Exercise::where('provider_exercise_id', 'keep-me')->first()->is_active)->toBeTrue();
@@ -122,12 +137,136 @@ it('deactivates exercises no longer returned by the provider, without deleting t
 });
 
 it('only imports for the muscle focus requested, when the sync command is scoped', function () {
-    fakeYMoveSearchResponse([
-        ['id' => 'glute-1', 'title' => 'Glute exercise', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight'],
-    ]);
+    Http::fake(function ($request) {
+        parse_str((string) parse_url((string) $request->url(), PHP_URL_QUERY), $query);
+        $page = (int) ($query['page'] ?? 1);
+        $data = $page === 1 ? [['id' => 'glute-1', 'title' => 'Glute exercise', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']]] : [];
+
+        return Http::response(['data' => $data, 'pagination' => ['page' => $page, 'totalPages' => 1]], 200);
+    });
 
     Artisan::call('exercises:sync', ['provider' => 'ymove', '--muscle' => ['glutes']]);
 
     Http::assertSent(fn ($request) => str_contains((string) $request->url(), 'muscleGroup=glutes'));
     expect(Exercise::where('provider_exercise_id', 'glute-1')->exists())->toBeTrue();
+});
+
+/**
+ * Hito 9.3 — importSelected(): importa EXACTAMENTE una lista aprobada de
+ * provider_exercise_id, sin depender de find() (inviable en un catálogo
+ * grande y paginado). Fake que distingue por página y por presencia de
+ * `muscleGroup` en la query, para poder simular por separado la búsqueda
+ * "con hint de músculo" y la pasada final sin filtro.
+ */
+function fakeYMovePagedCatalog(array $scopedByPage, array $unscopedByPage = []): void
+{
+    Http::fake(function ($request) use ($scopedByPage, $unscopedByPage) {
+        parse_str((string) parse_url((string) $request->url(), PHP_URL_QUERY), $query);
+        $page = (int) ($query['page'] ?? 1);
+        $pages = isset($query['muscleGroup']) ? $scopedByPage : $unscopedByPage;
+
+        return Http::response(['data' => $pages[$page] ?? []], 200);
+    });
+}
+
+function ymoveStub(string $id, string $title = 'Some exercise'): array
+{
+    return ['id' => $id, 'title' => $title, 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'instructions' => ['Paso 1']];
+}
+
+it('importSelected finds a target id on the first page', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [1 => [ymoveStub('id-a')]]);
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-a']);
+
+    expect($result->imported)->toHaveCount(1);
+    expect($result->notFound)->toBe([]);
+    expect($result->pagesConsulted)->toBe(1);
+    expect(Exercise::where('provider_exercise_id', 'id-a')->exists())->toBeTrue();
+});
+
+it('importSelected finds a target id only present on a later page', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [
+        1 => [ymoveStub('unrelated-1')],
+        2 => [ymoveStub('id-b')],
+    ]);
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-b']);
+
+    expect($result->imported)->toHaveCount(1);
+    expect($result->imported->first()->provider_exercise_id)->toBe('id-b');
+    expect($result->notFound)->toBe([]);
+    expect($result->pagesConsulted)->toBe(2);
+});
+
+it('importSelected finds several ids spread across different pages, importing nothing else', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [
+        1 => [ymoveStub('id-a'), ymoveStub('extra-1')],
+        2 => [ymoveStub('id-b')],
+        3 => [ymoveStub('id-c'), ymoveStub('extra-2')],
+    ]);
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-a', 'id-b', 'id-c']);
+
+    expect($result->imported->pluck('provider_exercise_id')->all())->toEqualCanonicalizing(['id-a', 'id-b', 'id-c']);
+    expect($result->notFound)->toBe([]);
+    expect(Exercise::whereIn('provider_exercise_id', ['extra-1', 'extra-2'])->exists())->toBeFalse();
+    expect(Exercise::count())->toBe(3);
+});
+
+it('importSelected reports an id as not found after exhausting all applicable pages, without inventing it', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [
+        1 => [ymoveStub('something-else')],
+        2 => [], // catálogo agotado
+    ]);
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['ghost-id']);
+
+    expect($result->imported)->toHaveCount(0);
+    expect($result->notFound)->toBe(['ghost-id']);
+    expect(Exercise::where('provider_exercise_id', 'ghost-id')->exists())->toBeFalse();
+});
+
+it('importSelected never imports an exercise outside the target list, even when it appears in a consulted page', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [1 => [ymoveStub('id-a'), ymoveStub('not-requested')]]);
+
+    (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-a']);
+
+    expect(Exercise::where('provider_exercise_id', 'not-requested')->exists())->toBeFalse();
+});
+
+it('importSelected treats a muscle hint as an optimization only, falling back to the unscoped catalog for correctness', function () {
+    fakeYMovePagedCatalog(
+        scopedByPage: [1 => []], // el hint de "glutes" no lo tiene — se agota de inmediato
+        unscopedByPage: [1 => [ymoveStub('id-a')]], // pero SÍ está en el catálogo sin filtrar
+    );
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected(
+        'ymove',
+        ['id-a'],
+        [MuscleFocus::Glutes],
+    );
+
+    expect($result->imported)->toHaveCount(1);
+    expect($result->notFound)->toBe([]);
+    Http::assertSent(fn ($request) => str_contains((string) $request->url(), 'muscleGroup=glutes'));
+    Http::assertSent(fn ($request) => ! str_contains((string) $request->url(), 'muscleGroup'));
+});
+
+it('importSelected reports duplicate ids found in the input request, without importing them twice', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [1 => [ymoveStub('id-a')]]);
+
+    $result = (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-a', 'id-a']);
+
+    expect($result->imported)->toHaveCount(1);
+    expect($result->duplicatesInRequest)->toBe(['id-a']);
+});
+
+it('importSelected always requests catalog pages in browse mode, never requesting video', function () {
+    fakeYMovePagedCatalog(scopedByPage: [], unscopedByPage: [1 => [ymoveStub('id-a')]]);
+
+    (new ExerciseImporter(new ProviderRegistry))->importSelected('ymove', ['id-a']);
+
+    Http::assertSent(fn ($request) => str_contains((string) $request->url(), 'includeVideos=false'));
+    Http::assertNotSent(fn ($request) => str_contains((string) $request->url(), 'includeVideos=true'));
 });

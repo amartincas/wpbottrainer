@@ -132,6 +132,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
             exerciseType: array_values(array_filter($data['exerciseType'] ?? [], 'is_string')),
             videoDurationSeconds: $data['videoDurationSecs'] ?? null,
             rawMetadata: $data,
+            hasVideo: isset($data['hasVideo']) ? (bool) $data['hasVideo'] : null,
         );
     }
 

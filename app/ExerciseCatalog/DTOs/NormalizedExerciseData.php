@@ -28,6 +28,12 @@ use App\Training\Enums\TrackingType;
  * siempre `[]`/`null` desde un Normalizer; solo existen si un humano los
  * cura después (`App\ExerciseCatalog\Importer\ExerciseImporter` nunca los
  * toca en un re-sync, ver docs/DECISIONS.md).
+ *
+ * Hito 9.3 (sincronización completa) — `hasVideo`: señal de disponibilidad
+ * de video que el proveedor reporta en modo browse (sin costo de cuota,
+ * distinta de si YA resolvimos un video real vía MediaResolver). Se
+ * refresca en cada re-sync como cualquier otro campo de metadata —
+ * `null` si el proveedor no informa el concepto.
  */
 final readonly class NormalizedExerciseData
 {
@@ -59,5 +65,6 @@ final readonly class NormalizedExerciseData
         public array $exerciseType,
         public ?int $videoDurationSeconds,
         public array $rawMetadata,
+        public ?bool $hasVideo = null,
     ) {}
 }

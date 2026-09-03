@@ -5,6 +5,7 @@ namespace App\ExerciseCatalog\Providers;
 use App\ExerciseCatalog\Contracts\ExerciseProviderInterface;
 use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\ExerciseCatalog\DTOs\ProviderSearchCriteria;
+use App\ExerciseCatalog\DTOs\ProviderSearchPage;
 use App\ExerciseCatalog\DTOs\ResolvedMedia;
 use App\ExerciseCatalog\Enums\MediaVariant;
 use Illuminate\Support\Collection;
@@ -33,6 +34,11 @@ class NullExerciseProvider implements ExerciseProviderInterface
     public function find(string $providerExerciseId): ?ProviderExerciseData
     {
         return null;
+    }
+
+    public function searchPaged(ProviderSearchCriteria $criteria): ProviderSearchPage
+    {
+        return new ProviderSearchPage(items: collect(), page: $criteria->page ?? 1, totalPages: 0, totalItems: 0);
     }
 
     public function resolveMedia(string $providerExerciseId, MediaVariant $variant = MediaVariant::Default): ?ResolvedMedia

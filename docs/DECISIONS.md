@@ -715,6 +715,39 @@ Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar
 
 ---
 
+### D038 — Hito 9.3: sincronización completa del catálogo YMove (1068 ejercicios) + `provider_has_video`
+
+**CONTEXTO**: cerrar Hito 9.3 requería pasar de un import selectivo (53 candidatos curados a mano) a un inventario de referencia real del catálogo completo del proveedor — la base para cualquier curación futura, nunca un atajo para activar en masa.
+
+**DECISIÓN TOMADA**:
+1. **`ExerciseImporter::fullSync()`** (nuevo) es la única vía de sincronización completa — recorre TODAS las páginas usando la paginación real que YMove reporta (`searchPaged()`), nunca un número asumido. Todo ejercicio nuevo nace `is_active=false`/`contraindications=null`, exactamente igual que `importSearch()`/`importSelected()` — un inventario de referencia nunca es un catálogo aprobado.
+2. **Reconciliación de bajas solo tras un recorrido 100% completo y sin errores**: si el proveedor falla a mitad de camino, la corrida se detiene de inmediato (`ProviderSyncException`) y jamás reconcilia — una respuesta incompleta nunca se trata como "el ejercicio desapareció". `exercises:sync --muscle=X` se reescribió sobre `fullSync()` por el mismo motivo (ver punto 4).
+3. **`provider_has_video`** (columna nueva, nullable): señal cruda del proveedor sobre disponibilidad de video, separada por completo de `is_active` (aprobación de WpbotTrainer) y de `video_url` (siempre `null` para un ejercicio de proveedor). Se refresca en cada re-sync como cualquier otro campo de metadata — nunca curada, puede cambiar libremente sin tocar `is_active`.
+4. **`hasVideo` tri-estado en `ProviderSearchCriteria`** (antes `hasVideoOnly: bool`, siempre filtraba): `null` (nuevo default) trae el catálogo completo, con y sin video; `true`/`false` filtran explícitamente cuando corresponde (`importSelected()` sigue pidiendo `true` explícito, coherente con que sus candidatos siempre se buscaron entre ejercicios con video).
+5. **`includeVideos=false` en toda ruta de sincronización, sin excepción** — confirmado en la corrida real: 1068 ejercicios recibidos, 0 cuota de video consumida.
+
+**Dos defectos reales encontrados y corregidos durante la construcción, nunca ejecutados en producción**:
+- `YMoveExerciseProvider::search()`/`find()` tenían `includeVideos=true` hardcodeado desde Hito 9.1 — contradecía la política de modo browse recién auditada. `find()` además no servía para localizar un id específico en un catálogo de 1068 (solo miraba la primera página) — reemplazado por `ExerciseImporter::importSelected()` para ese caso de uso.
+- `exercises:sync --muscle=X` (comando, Hito 9.1) pedía una sola página por `importSearch()` — con cualquier músculo de más de ~20 ejercicios (la mayoría), habría desactivado en masa ejercicios reales que simplemente no cabían en esa página. Corregido reescribiendo el comando sobre `fullSync()`, con reconciliación acotada al mismo músculo solicitado.
+
+**Hallazgo de infraestructura, no de código**: comparar `provider_metadata` (JSON) con `wasChanged()` daba un falso "actualizado" en cada re-sync — MySQL 8.0 reordena las claves de un objeto JSON al almacenarlo (nunca los elementos de un array JSON). Corregido excluyendo `provider_metadata` de la comparación de cambio significativo — es metadata opaca de diagnóstico, nunca parte del contrato normalizado.
+
+**No se tocó**: `TrainingEngine` sigue sin conocer YMove ni ningún proveedor (`MultiProviderIsolationArchTest`, 69/69 en el módulo). No se activó ningún ejercicio automáticamente. No se implementó curación, generación de rutinas, ni ningún proveedor adicional — explícitamente fuera de alcance de este hito.
+
+**IMPACTO**: `app/ExerciseCatalog/Importer/ExerciseImporter.php` (+`fullSync()`, +`importSelected()`, `upsert()` ahora reporta `created`/`updated`/`unchanged`), `app/ExerciseCatalog/Contracts/ExerciseProviderInterface.php` (+`searchPaged()`), `app/ExerciseCatalog/Providers/YMove/YMoveExerciseProvider.php` (`searchPaged()`, fix de `includeVideos`, `find()` ya no se usa para import selectivo), `app/ExerciseCatalog/Providers/NullExerciseProvider.php` (+`searchPaged()`), `app/ExerciseCatalog/DTOs/{ProviderSearchPage,FullSyncResult,SelectedImportResult}.php` (nuevos), `app/ExerciseCatalog/Exceptions/ProviderSyncException.php` (nuevo), `app/ExerciseCatalog/DTOs/ProviderSearchCriteria.php` (`hasVideoOnly: bool` → `hasVideo: ?bool`), `app/ExerciseCatalog/DTOs/NormalizedExerciseData.php` (+`hasVideo`), `app/ExerciseCatalog/Providers/YMove/YMoveExerciseNormalizer.php` (mapea `hasVideo`), `app/Models/Exercise.php` (+`provider_has_video`), `app/Console/Commands/SyncExercisesFromProvider.php` (reescrito sobre `fullSync()`), `database/migrations/2026_09_04_000003_add_provider_has_video_to_exercises_table.php` (nuevo).
+
+**Tests**: `ExerciseFullSyncTest.php` (nuevo, 18 tests: paginación completa, creación, actualización real, idempotencia, no-duplicación, ausente-en-una-página-presente-en-otra, error-mid-sync sin desactivar, desactivación solo tras recorrido limpio sin borrar, preservación de curación humana, no-autoactivación, `includeVideos=false` siempre, cero `video_url` persistida, reconciliación acotada por músculo en sus 4 variantes, `provider_has_video` persistido y refrescado), +2 en `YMoveExerciseProviderTest` (`searchPaged` expone paginación real, lanza excepción en vez de vaciar ante fallo), +2 en `ExerciseImporterTest` (comando reescrito), +1 en `YMoveExerciseNormalizerTest` (`hasVideo`). **387 passed (22 fallos preexistentes de Fortify, sin cambio)** tras este hito.
+
+**Sincronización real ejecutada** (no un doble de prueba): 1068 ejercicios recibidos y creados, 0 actualizados/sin cambios (primera corrida completa), 1067 con `provider_has_video=true`, 1 con `provider_has_video=false`, 0 desactivados, 0 errores, 54 páginas, 78s, cuota de video consumida: 0. Todos quedaron `is_active=false`.
+
+**JUSTIFICACIÓN**: un inventario de referencia completo es la base indispensable para cualquier curación futura real (detectar cobertura, encontrar reemplazos de calidad sin gastar cuota) — pero solo tiene valor si la reconciliación de bajas es imposible de disparar por accidente (el defecto real de `--muscle` encontrado durante esta misma construcción es la prueba de por qué esa garantía debe probarse explícitamente, no darse por sentada).
+
+**RIESGOS**:
+- El catálogo real ahora tiene 1068 filas `is_active=false` esperando curación — ningún flujo de administración (Filament) existe todavía para revisarlas en lote; la curación sigue siendo manual vía `Exercise::activate()`.
+- `provider_has_video` puede cambiar de `true` a `false` en un re-sync futuro sin que eso dispare ninguna alerta — un ejercicio ya activado podría quedar con video no disponible sin que nadie lo note hasta el envío real (donde `MediaResolver` ya degrada a `null` sin bloquear, pero sin aviso proactivo).
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

@@ -108,6 +108,29 @@ it('discards a muscleGroup value it does not recognize instead of guessing', fun
     expect($normalized->primaryMuscle)->toBeNull();
 });
 
+/**
+ * Hito 9.3 (sincronización completa) — `hasVideo` es la señal cruda que
+ * YMove reporta en modo browse, sin costo de cuota. Nunca se inventa
+ * cuando el proveedor no la informa.
+ */
+it('maps hasVideo true/false/absent into the normalized contract without inventing it', function () {
+    $normalizer = new YMoveExerciseNormalizer;
+
+    $withVideo = $normalizer->normalize(new ProviderExerciseData('id-8', [
+        'id' => 'id-8', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'cable', 'hasVideo' => true,
+    ]));
+    $withoutVideo = $normalizer->normalize(new ProviderExerciseData('id-9', [
+        'id' => 'id-9', 'title' => 'Something else', 'muscleGroup' => 'back', 'equipment' => 'cable', 'hasVideo' => false,
+    ]));
+    $absent = $normalizer->normalize(new ProviderExerciseData('id-10', [
+        'id' => 'id-10', 'title' => 'Yet another', 'muscleGroup' => 'back', 'equipment' => 'cable',
+    ]));
+
+    expect($withVideo->hasVideo)->toBeTrue();
+    expect($withoutVideo->hasVideo)->toBeFalse();
+    expect($absent->hasVideo)->toBeNull();
+});
+
 it('preserves the full raw payload as opaque metadata, never as the normalized contract', function () {
     $raw = new ProviderExerciseData('id-5', [
         'id' => 'id-5', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'cable',

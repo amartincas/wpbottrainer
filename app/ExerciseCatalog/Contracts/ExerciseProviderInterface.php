@@ -4,8 +4,10 @@ namespace App\ExerciseCatalog\Contracts;
 
 use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\ExerciseCatalog\DTOs\ProviderSearchCriteria;
+use App\ExerciseCatalog\DTOs\ProviderSearchPage;
 use App\ExerciseCatalog\DTOs\ResolvedMedia;
 use App\ExerciseCatalog\Enums\MediaVariant;
+use App\ExerciseCatalog\Exceptions\ProviderSyncException;
 use Illuminate\Support\Collection;
 
 /**
@@ -38,11 +40,33 @@ interface ExerciseProviderInterface
      */
     public function search(ProviderSearchCriteria $criteria): Collection;
 
+    /**
+     * Metadata de UN ejercicio — igual que `search()`, nunca incluye video
+     * (modo browse, sin costo de cuota). Es la ruta que usa la importación
+     * de catálogo; para video, ver `resolveMedia()`.
+     */
     public function find(string $providerExerciseId): ?ProviderExerciseData;
 
     /**
+     * Igual que `search()`, pero exponiendo la paginación real que el
+     * proveedor reporta (página actual, total de páginas, total de
+     * ítems) — necesario para una sincronización COMPLETA del catálogo
+     * que deba distinguir "llegué al final real" de "esta página vino
+     * vacía por un error de la API". `search()` sigue siendo suficiente
+     * para búsquedas puntuales o import selectivo.
+     *
+     * @throws ProviderSyncException si el proveedor falla — nunca debe
+     *                               devolver una página vacía en su lugar; a diferencia de search(),
+     *                               aquí silenciar el fallo permitiría confundirlo con "fin del
+     *                               catálogo" y disparar una reconciliación de bajas incorrecta.
+     */
+    public function searchPaged(ProviderSearchCriteria $criteria): ProviderSearchPage;
+
+    /**
      * URL fresca del recurso de video, resuelta en el momento — nunca debe
-     * cachearse ni persistirse más allá de un único envío.
+     * cachearse ni persistirse más allá de un único envío. Es la ÚNICA vía
+     * del contrato que puede consumir cuota de video del proveedor; nunca
+     * se invoca desde la importación de catálogo.
      */
     public function resolveMedia(string $providerExerciseId, MediaVariant $variant = MediaVariant::Default): ?ResolvedMedia;
 
