@@ -172,6 +172,39 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 
 **No cubierto por este hito** (explícitamente fuera de alcance, ver D033): ningún test verifica que `TrainingEngine` use los nuevos campos — eso es Hito 8.4, todavía no implementado.
 
+## Cobertura de Hito 9.0 (cierre de consumidores reales) + 9.1 (provider abstraction)
+
+36 tests nuevos netos (ver D036). 9.0 en los archivos ya existentes de Training; 9.1 en un directorio nuevo, `tests/Feature/ExerciseCatalog/`.
+
+| Categoría | Dónde |
+|---|---|
+| **`sessions_per_week` → `split_type`** | `TrainingProfileTest.php` — las 3 franjas de `deriveSplitTypeFromSessionsPerWeek()` (≤3/4/5+). |
+| **`training_location=outdoor` restringe a sin equipo** | `TrainingEngineTest.php` — excluye un ejercicio con equipo aunque el perfil declare `equipment_fully_equipped=true`; un perfil de gimnasio con el mismo ejercicio no se ve afectado (aísla que la regla es específica de `outdoor`). |
+| **`secondary_focus` aislado** | `TrainingEngineTest.php` — `primary_focus=[]`, solo `secondary_focus` activo, con más candidatos generales que cupos: prueba que gana por su nivel, no por casualidad. Cierra el gap de cobertura señalado en la revisión de Hito 9. |
+| **Contrato sin fugas de proveedor** | `ProviderRegistryTest.php` — `NullExerciseProvider` (nunca registrado en producción) satisface `ExerciseProviderInterface` completo sin conocer YMove; `ProviderRegistry` resuelve `ymove` desde config y lanza para una clave desconocida. |
+| **Normalización real de YMove** | `YMoveExerciseNormalizerTest.php` — shape real auditado (incluido `difficulty: null`, caso observado en producción, nunca inventado); mapeo de músculo/equipo; heurística de `tracking_type` por palabra clave; `movement_pattern` siempre `null` (sin heurística); metadata cruda preservada sin filtrar al contrato normalizado. |
+| **Adapter de YMove** | `YMoveExerciseProviderTest.php` — `Http::fake()` sobre el shape HTTP real (nunca la API real): filtro de búsqueda por músculo, degradación a colección vacía en error, resolución de variante por defecto vs. `white-background`, disponibilidad, listado de variantes. |
+| **`MediaResolver`** | `MediaResolverTest.php` — un ejercicio manual (`provider=null`) resuelve su propia `video_url` sin ninguna llamada de red (`Http::assertNothingSent()`); un ejercicio de proveedor resuelve fresco cada vez; fallo del proveedor o proveedor desconocido degradan a `null`, nunca lanzan. |
+| **Importer + curación obligatoria** | `ExerciseImporterTest.php` — un ejercicio nuevo entra `is_active=false`/`contraindications=null`; un re-sync actualiza metadata sin tocar `is_active`/`contraindications` ya revisados; un `provider_exercise_id` que deja de aparecer se desactiva sin borrarse; el comando `exercises:sync --muscle=` filtra por foco. |
+| **Invariante `Exercise` de proveedor** | `ExerciseTest.php` — guardar un `Exercise` con `provider` y `video_url` a la vez lanza `DomainException` (a nivel de modelo, no solo documentado); un ejercicio manual conserva su `video_url` propia; `activate()` lanza si `contraindications` sigue en `null`, y solo activa tras una revisión explícita (incluida `[]`, nunca asumida). |
+| **Aislamiento arquitectónico multi-proveedor** | `MultiProviderIsolationArchTest.php` — `arch()` sobre `TrainingEngine`/`TrainingHandler`/`MediaResolver`: ninguno puede usar `App\ExerciseCatalog\Providers`; más una comprobación literal de que el texto "ymove" no aparece en ninguno de los tres archivos. |
+
+**Qué NO demuestra esta cobertura, explícitamente** (ver D036): ningún test llama a la API real de YMove (todo vía `Http::fake()`/`Http::sequence()`); no se importó ni activó ningún ejercicio real; la matriz de cobertura mínima del catálogo (Hito 9, sección 12 del diseño) queda para el paso de import estratégico, todavía no ejecutado.
+
+## Cobertura de Hito 9.2 (técnica de ejecución por ejercicio)
+
+16 tests nuevos netos (ver D037).
+
+| Categoría | Dónde |
+|---|---|
+| **Formato del mensaje de técnica** | `ExerciseMessageFormatterTest.php` (nuevo, 9 tests) — nombre+prescripción numerados; prescripción por duración vs. reps/carga; `instructions`+`important_points` combinados como viñetas, acotados a 4; `breathing_cue`/`common_mistakes` (máx. 2) solo si existen; ninguna sección vacía cuando el campo es `null`; el video siempre se menciona, con o sin técnica. |
+| **Backfill real de `instructions` (text→json)** | `InstructionsMigrationBackfillTest.php` (nuevo, contra MariaDB real, no simulado) — un valor de texto plano (como el Exercise real de producción) sobrevive como array de un elemento; un valor ya JSON válido no se envuelve dos veces. |
+| **Normalización de la técnica de YMove** | `YMoveExerciseNormalizerTest.php` — `importantPoints[]` se mapea; `common_mistakes`/`breathing_cue` siempre `[]`/`null` para YMove, incluso con `instructions`/`importantPoints` ricos — nunca inventados. |
+| **Importer: refresco vs. preservación** | `ExerciseImporterTest.php` — `important_points` se guarda al crear; un re-sync refresca `instructions`/`important_points` pero preserva `common_mistakes`/`breathing_cue` curados a mano, igual que `contraindications`. |
+| **Asimetría de activación** | `ExerciseTest.php` — un solo test verifica los 3 casos juntos: `contraindications=null` bloquea, `instructions=[]` bloquea, `important_points`/`common_mistakes`/`breathing_cue` en `null` no bloquean. |
+| **No interferencia con `TrainingEngine`** | `TrainingEngineTest.php` — con competencia real por cupos (más candidatos que espacios), un ejercicio con más técnica pero peor ajuste de dificultad nunca desplaza a uno mejor rankeado. |
+| **Integración real por WhatsApp** | Extensión de `TrainingConversationFlowTest.php` — el mensaje saliente contiene el nombre, las instrucciones reales del snapshot y la respiración, y el video se sigue enviando. |
+
 ## Cobertura de validación E2E con el payload real de Meta (Hito 7)
 
 `tests/Feature/MetaWebhookTrainingE2ETest.php` (6 tests) — a diferencia de todos los tests anteriores (que construyen `ProcessWhatsAppMessage` directamente en PHP), estos hacen `postJson('/api/whatsapp/webhook/{token}')` con la estructura **completa** que Meta realmente envía (`object`, `entry[].id`, `changes[].field`, `contacts`, `messages[].timestamp`) — ejercitando el parseo real de `WhatsAppController` de punta a punta. Posible en tests porque `QUEUE_CONNECTION=sync` (`phpunit.xml`) ejecuta el Job dentro de la misma petición.

@@ -9,6 +9,7 @@ use App\Core\Memory\ContextBuilder;
 use App\Core\Memory\ContextFragment;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\HandlerInterface;
+use App\ExerciseCatalog\MediaResolver;
 use App\Models\Contact;
 use App\Models\Tenant;
 use App\Models\TrainingProfile;
@@ -22,6 +23,7 @@ use App\Training\Enums\SplitType;
 use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
+use App\Training\Support\ExerciseMessageFormatter;
 use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\TrainingAccessDeniedException;
@@ -66,6 +68,8 @@ class TrainingHandler implements HandlerInterface
         private readonly ExecutionReportRecorder $reportRecorder,
         private readonly ContextBuilder $contextBuilder,
         private readonly AlertService $alerts,
+        private readonly MediaResolver $mediaResolver,
+        private readonly ExerciseMessageFormatter $messageFormatter,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -217,23 +221,35 @@ class TrainingHandler implements HandlerInterface
             'elapsed_ms' => (int) round((microtime(true) - $engineStartedAt) * 1000),
         ]);
 
-        $this->reply($from, $this->buildWorkoutMessage($session), $tenant);
+        // Hito 9.2: cabecera mínima de sesión — la prescripción y la técnica
+        // de cada ejercicio ya van en su propio mensaje (ExerciseMessageFormatter),
+        // así que repetirlas aquí sería fragmentación redundante, no menos.
+        $this->reply($from, '🔥 Tu entrenamiento de hoy', $tenant);
 
-        foreach ($session->workoutExercises as $workoutExercise) {
-            $videoUrl = $workoutExercise->exercise_snapshot['video_url'] ?? null;
+        foreach ($session->workoutExercises as $index => $workoutExercise) {
+            $this->reply($from, $this->messageFormatter->format($workoutExercise, $index + 1), $tenant);
 
-            if ($videoUrl !== null) {
+            // Hito 9.1: la URL de video NUNCA viene del snapshot histórico
+            // (que puede describir un ejercicio de proveedor sin video_url
+            // propio, por diseño) — se resuelve fresca en este mismo
+            // instante, vía MediaResolver. Un fallo de resolución (ejercicio
+            // borrado, proveedor caído, etc.) omite SOLO el video de este
+            // ejercicio — nunca bloquea el resto del mensaje ya enviado.
+            $exercise = $workoutExercise->exercise;
+            $resolvedMedia = $exercise !== null ? $this->mediaResolver->resolve($exercise) : null;
+
+            if ($resolvedMedia !== null) {
                 $videoStartedAt = microtime(true);
                 $sent = WhatsAppService::sendWhatsAppVideo(
                     $from,
-                    $videoUrl,
+                    $resolvedMedia->url,
                     $tenant,
                     $workoutExercise->exercise_snapshot['name'] ?? null,
                 );
 
                 Log::info($sent ? 'TRAINING_VIDEO_SENT' : 'TRAINING_VIDEO_SEND_FAILED', [
                     'workout_exercise_id' => $workoutExercise->id,
-                    'video_url' => $videoUrl,
+                    'provider' => $exercise->provider,
                     'elapsed_ms' => (int) round((microtime(true) - $videoStartedAt) * 1000),
                 ]);
             }
@@ -350,6 +366,13 @@ class TrainingHandler implements HandlerInterface
             }
         }
 
+        // Hito 9.0: sessions_per_week por sí solo no cambiaba nada en
+        // TrainingEngine — su único efecto real es derivar split_type,
+        // determinísticamente, cada vez que se captura o se actualiza.
+        if ($extracted['sessions_per_week'] !== null) {
+            $updates['split_type'] = TrainingProfile::deriveSplitTypeFromSessionsPerWeek($extracted['sessions_per_week']);
+        }
+
         if ($updates !== []) {
             $profile->update($updates);
         }
@@ -362,30 +385,6 @@ class TrainingHandler implements HandlerInterface
             : self::ACCESS_REQUIRED_MESSAGE;
 
         $this->reply($from, $message, $tenant);
-    }
-
-    private function buildWorkoutMessage(WorkoutSession $session): string
-    {
-        $lines = ['💪 Aquí está tu entrenamiento de hoy:', ''];
-
-        foreach ($session->workoutExercises as $index => $workoutExercise) {
-            $name = $workoutExercise->exercise_snapshot['name'] ?? 'Ejercicio';
-            $lines[] = ($index + 1).". {$name}";
-
-            if ($workoutExercise->prescribed_duration_seconds !== null) {
-                $lines[] = "   {$workoutExercise->prescribed_sets} series x {$workoutExercise->prescribed_duration_seconds} segundos";
-            } else {
-                $loadText = $workoutExercise->prescribed_load !== null
-                    ? ' @ '.rtrim(rtrim((string) $workoutExercise->prescribed_load, '0'), '.').'kg'
-                    : '';
-                $lines[] = "   {$workoutExercise->prescribed_sets} series x {$workoutExercise->prescribed_reps} repeticiones{$loadText}";
-            }
-        }
-
-        $lines[] = '';
-        $lines[] = 'Te envío los videos de cada ejercicio a continuación. ¡Vamos con todo! 🔥';
-
-        return implode("\n", $lines);
     }
 
     private function stripAudioPrefix(string $body): string

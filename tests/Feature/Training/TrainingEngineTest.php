@@ -129,7 +129,10 @@ it('never selects an exercise that needs equipment the profile does not have', f
 });
 
 it('includes an exercise that needs equipment the profile does have', function () {
-    $contact = makeReadyContact(['available_equipment' => ['barbell']]);
+    // Hito 9.0: training_location fijado explícitamente — es aleatorio por
+    // defecto en el factory, y "outdoor" excluiría este mismo ejercicio por
+    // una razón completamente distinta a la que este test verifica.
+    $contact = makeReadyContact(['available_equipment' => ['barbell'], 'training_location' => TrainingLocation::Gym]);
 
     $needsBarbell = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => ['barbell']]);
 
@@ -547,4 +550,90 @@ it('produces genuinely different sessions and demonstrates WHICH variable causes
     expect(collect($idsA)->sort()->values()->all())->not->toBe(collect($idsB)->sort()->values()->all());
     expect(collect($idsA)->sort()->values()->all())->not->toBe(collect($idsC)->sort()->values()->all());
     expect(collect($idsB)->sort()->values()->all())->not->toBe(collect($idsC)->sort()->values()->all());
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Hito 9.0 — cierre de consumidores reales de TrainingProfile.
+// ─────────────────────────────────────────────────────────────────────────
+
+it('restricts an outdoor profile to no-equipment exercises, even if the profile declares owning equipment', function () {
+    // Lo que el usuario POSEE (equipment_fully_equipped=true) no es lo
+    // mismo que lo que tiene consigo entrenando al aire libre.
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Outdoor,
+        'equipment_fully_equipped' => true,
+        'available_equipment' => [],
+    ]);
+
+    $needsBarbell = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => ['barbell']]);
+    $bodyweight = Exercise::factory()->create(['muscle_group' => 'legs', 'equipment_needed' => []]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+    $selectedIds = $session->workoutExercises->pluck('exercise_id')->all();
+
+    expect($selectedIds)->not->toContain($needsBarbell->id);
+    expect($selectedIds)->toContain($bodyweight->id);
+});
+
+it('does not restrict a gym or home profile the same way — outdoor is the only location with a hard equipment consequence', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Gym,
+        'available_equipment' => ['barbell'],
+        'equipment_fully_equipped' => false,
+    ]);
+
+    $needsBarbell = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => ['barbell']]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($needsBarbell->id);
+});
+
+it('prioritizes an exercise matching only secondary_focus over the general pool, with no primary_focus match available', function () {
+    // Aísla secondary_focus: primary_focus=[] (sin candidatos posibles en
+    // ese nivel, por diseño), secondary_focus=[chest] es la única señal de
+    // foco activa. Más candidatos generales que cupos, para probar que el
+    // de secondary_focus SIEMPRE gana por su nivel, no por casualidad.
+    $contact = makeReadyContact(['primary_focus' => [], 'secondary_focus' => [MuscleFocus::Chest->value]]);
+
+    $secondaryFocusExercise = Exercise::factory()->withPrimaryMuscle(MuscleFocus::Chest)->create(['muscle_group' => 'chest']);
+    Exercise::factory()->create(['muscle_group' => 'legs']);
+    Exercise::factory()->create(['muscle_group' => 'back']);
+    Exercise::factory()->create(['muscle_group' => 'core']);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($secondaryFocusExercise->id);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Hito 9.2 — la técnica de ejecución es presentación pura: no debe influir
+// en absoluto en qué ejercicio elige TrainingEngine.
+// ─────────────────────────────────────────────────────────────────────────
+
+it('never lets rich technique content override a real ranking criterion (difficulty match) when there is genuine competition for slots', function () {
+    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Intermediate]);
+
+    // 4 candidatos elegibles para solo 3 cupos — hay competencia real.
+    // A/B/D coinciden con el nivel del perfil (rank 0); C NO coincide
+    // (rank 1) pero tiene MÁS técnica que cualquiera de los otros tres.
+    // Si la técnica influyera en el ranking, C podría desplazar a alguno
+    // de los otros — esta prueba confirma que nunca ocurre.
+    $matchA = Exercise::factory()->create(['muscle_group' => 'chest', 'difficulty_level' => 'intermediate']);
+    $matchB = Exercise::factory()->create(['muscle_group' => 'chest', 'difficulty_level' => 'intermediate']);
+    $matchD = Exercise::factory()->create(['muscle_group' => 'chest', 'difficulty_level' => 'intermediate']);
+    $mismatchButRichTechnique = Exercise::factory()->create([
+        'muscle_group' => 'chest',
+        'difficulty_level' => 'advanced', // no coincide con el perfil (intermediate)
+        'instructions' => ['Paso 1', 'Paso 2', 'Paso 3'],
+        'important_points' => ['Punto clave 1', 'Punto clave 2'],
+        'common_mistakes' => ['Error 1', 'Error 2'],
+        'breathing_cue' => 'Inhala al bajar, exhala al subir',
+    ]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+    $selectedIds = $session->workoutExercises->pluck('exercise_id')->all();
+
+    expect($selectedIds)->toEqualCanonicalizing([$matchA->id, $matchB->id, $matchD->id]);
+    expect($selectedIds)->not->toContain($mismatchButRichTechnique->id);
 });

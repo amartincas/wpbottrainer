@@ -1,0 +1,135 @@
+<?php
+
+use App\Models\Exercise;
+use App\Models\WorkoutExercise;
+use App\Models\WorkoutSession;
+use App\Training\Support\ExerciseMessageFormatter;
+
+/**
+ * Hito 9.2 — el formateador nunca lee del `Exercise` en vivo ni de ningún
+ * proveedor: crea el `WorkoutExercise` con un `exercise_snapshot` explícito
+ * en cada test, exactamente como lo produce `Exercise::toSnapshot()` en
+ * producción, para probar el contrato real, no un atajo.
+ */
+function makeWorkoutExerciseWithSnapshot(array $snapshotOverrides = [], array $prescriptionOverrides = []): WorkoutExercise
+{
+    $exercise = Exercise::factory()->create();
+    $session = WorkoutSession::factory()->create();
+
+    $snapshot = array_merge($exercise->toSnapshot(), $snapshotOverrides);
+
+    return WorkoutExercise::factory()->create(array_merge([
+        'workout_session_id' => $session->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $snapshot,
+        'prescribed_sets' => 3,
+        'prescribed_reps' => 10,
+        'prescribed_load' => null,
+        'prescribed_duration_seconds' => null,
+    ], $prescriptionOverrides));
+}
+
+it('shows the exercise name and prescription with a numbered header', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(['name' => 'Flexiones']);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 2);
+
+    expect($text)->toContain('2. *Flexiones* — 3 series x 10 repeticiones');
+});
+
+it('shows a duration-based prescription for time-based exercises', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        ['name' => 'Plancha'],
+        ['prescribed_sets' => 3, 'prescribed_reps' => null, 'prescribed_duration_seconds' => 30],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('3 series x 30 segundos');
+});
+
+it('shows instructions as technique bullets', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot([
+        'instructions' => ['Manos a la anchura de los hombros', 'Cuerpo alineado'],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('📋 Técnica:');
+    expect($text)->toContain('- Manos a la anchura de los hombros');
+    expect($text)->toContain('- Cuerpo alineado');
+});
+
+it('shows important_points merged into the same technique section', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot([
+        'instructions' => ['Baja controlando'],
+        'important_points' => ['Mantén el core activado'],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('- Baja controlando');
+    expect($text)->toContain('- Mantén el core activado');
+});
+
+it('caps the combined technique bullets to avoid an excessively long message', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot([
+        'instructions' => ['Paso 1', 'Paso 2', 'Paso 3'],
+        'important_points' => ['Punto 1', 'Punto 2', 'Punto 3'],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+    $bulletCount = substr_count($text, "\n- ");
+
+    expect($bulletCount)->toBeLessThanOrEqual(4);
+});
+
+it('shows breathing_cue only when it exists', function () {
+    $withCue = makeWorkoutExerciseWithSnapshot(['breathing_cue' => 'Inhala al bajar, exhala al subir']);
+    $withoutCue = makeWorkoutExerciseWithSnapshot(['breathing_cue' => null]);
+
+    $formatter = new ExerciseMessageFormatter;
+
+    expect($formatter->format($withCue, 1))->toContain('🫁 Respiración: Inhala al bajar, exhala al subir');
+    expect($formatter->format($withoutCue, 1))->not->toContain('🫁 Respiración');
+});
+
+it('shows common_mistakes only when they exist, capped for brevity', function () {
+    $withMistakes = makeWorkoutExerciseWithSnapshot(['common_mistakes' => ['Arquear la espalda', 'Bajar muy rápido', 'Un tercero']]);
+    $withoutMistakes = makeWorkoutExerciseWithSnapshot(['common_mistakes' => null]);
+
+    $formatter = new ExerciseMessageFormatter;
+    $textWithMistakes = $formatter->format($withMistakes, 1);
+
+    expect($textWithMistakes)->toContain('⚠️ Evita:');
+    expect($textWithMistakes)->toContain('- Arquear la espalda');
+    expect($textWithMistakes)->not->toContain('Un tercero'); // acotado a 2
+    expect($formatter->format($withoutMistakes, 1))->not->toContain('⚠️ Evita');
+});
+
+it('never produces an empty section header when a field is null', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot([
+        'instructions' => [],
+        'important_points' => null,
+        'common_mistakes' => null,
+        'breathing_cue' => null,
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('📋 Técnica:');
+    expect($text)->not->toContain('🫁 Respiración');
+    expect($text)->not->toContain('⚠️ Evita');
+    // El nombre/prescripción y la referencia al video siguen presentes.
+    expect($text)->toContain('🎥 Video a continuación');
+});
+
+it('always mentions the video, regardless of how much technique content exists', function () {
+    $rich = makeWorkoutExerciseWithSnapshot(['instructions' => ['Paso 1'], 'breathing_cue' => 'Respira normal']);
+    $bare = makeWorkoutExerciseWithSnapshot(['instructions' => [], 'important_points' => null, 'common_mistakes' => null, 'breathing_cue' => null]);
+
+    $formatter = new ExerciseMessageFormatter;
+
+    expect($formatter->format($rich, 1))->toContain('🎥 Video a continuación');
+    expect($formatter->format($bare, 1))->toContain('🎥 Video a continuación');
+});

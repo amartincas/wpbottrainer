@@ -35,4 +35,11 @@ return [
         ],
     ],
 
+    // Hito 9.1 — App\ExerciseCatalog\Providers\YMove\YMoveExerciseProvider.
+    // La API key nunca se loguea ni se persiste — ver docs/DECISIONS.md.
+    'ymove' => [
+        'api_key' => env('YMOVE_API_KEY'),
+        'base_url' => env('YMOVE_BASE_URL', 'https://exercise-api.ymove.app/api/v2'),
+    ],
+
 ];

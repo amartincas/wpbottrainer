@@ -9,6 +9,7 @@ use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
+use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
@@ -421,7 +422,7 @@ class TrainingEngine
     }
 
     /**
-     * Filtro duro de elegibilidad (nunca un puntaje): seguridad y
+     * Filtro duro de elegibilidad (nunca un puntaje): seguridad, ubicación y
      * equipamiento. `equipment_fully_equipped` (Hito 8.3) hace que CUALQUIER
      * ejercicio sea elegible en cuanto a equipo — declarar acceso amplio
      * significa que no vale la pena enumerar qué tiene exactamente.
@@ -432,6 +433,16 @@ class TrainingEngine
         $contraindications = $exercise->contraindications ?? [];
 
         if (array_intersect($restrictions, $contraindications) !== []) {
+            return false;
+        }
+
+        // Hito 9.0: training_location no tenía ningún consumidor real —
+        // "outdoor" es la única ubicación con una consecuencia dura y
+        // honesta de modelar: lo que el usuario POSEE (available_equipment/
+        // equipment_fully_equipped) no es lo mismo que lo que tiene CONSIGO
+        // en un parque. Un ejercicio que exige equipo queda inelegible sin
+        // importar esos dos campos.
+        if ($profile->training_location === TrainingLocation::Outdoor && $exercise->equipment_needed !== []) {
             return false;
         }
 

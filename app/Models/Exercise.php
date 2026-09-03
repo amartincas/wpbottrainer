@@ -8,12 +8,17 @@ use App\Training\Enums\TrackingType;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'name',
     'slug',
+    'description',
     'instructions',
+    'important_points',
+    'common_mistakes',
+    'breathing_cue',
     'video_url',
     'muscle_group',
     'primary_muscle',
@@ -24,6 +29,14 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'contraindications',
     'tracking_type',
     'is_active',
+    'provider',
+    'provider_exercise_id',
+    'provider_metadata',
+    'exercise_type',
+    'video_duration_seconds',
+    'synced_at',
+    'contraindications_reviewed_at',
+    'contraindications_reviewed_by',
 ])]
 class Exercise extends Model
 {
@@ -32,6 +45,9 @@ class Exercise extends Model
     protected function casts(): array
     {
         return [
+            'instructions' => 'array',
+            'important_points' => 'array',
+            'common_mistakes' => 'array',
             'primary_muscle' => MuscleFocus::class,
             'secondary_muscles' => 'array',
             'movement_pattern' => MovementPattern::class,
@@ -39,12 +55,88 @@ class Exercise extends Model
             'contraindications' => 'array',
             'tracking_type' => TrackingType::class,
             'is_active' => 'boolean',
+            'provider_metadata' => 'array',
+            'exercise_type' => 'array',
+            'video_duration_seconds' => 'integer',
+            'synced_at' => 'datetime',
+            'contraindications_reviewed_at' => 'datetime',
         ];
+    }
+
+    /**
+     * Hito 9.1 — invariante estructural, no solo documentada: un Exercise
+     * de proveedor (`provider` no nulo) NUNCA puede tener `video_url`
+     * directo. La URL siempre se resuelve fresca en el momento del envío
+     * (ver App\ExerciseCatalog\MediaResolver) — persistirla, aunque sea de
+     * paso, es exactamente lo que Hito 9 prohíbe explícitamente. Se aplica
+     * a nivel de modelo, no solo por convención del Importer, para que
+     * ninguna otra vía de escritura pueda violarla accidentalmente.
+     */
+    protected static function booted(): void
+    {
+        static::saving(function (Exercise $exercise) {
+            if ($exercise->provider !== null && $exercise->video_url !== null) {
+                throw new \DomainException(
+                    "Exercise con provider='{$exercise->provider}' no puede tener video_url directo — usar MediaResolver."
+                );
+            }
+        });
     }
 
     public function workoutExercises(): HasMany
     {
         return $this->hasMany(WorkoutExercise::class);
+    }
+
+    /**
+     * Hito 9.1: quién revisó (y confirmó, aunque sea vacía) la lista de
+     * contraindicaciones de este ejercicio — mismo patrón que
+     * TrainingProfile.safetyReviewedBy(). Nullable: un ejercicio recién
+     * importado de un proveedor (o nunca revisado) no tiene uno.
+     */
+    public function contraindicationsReviewedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'contraindications_reviewed_by');
+    }
+
+    /**
+     * Hito 9.1/9.2 — única vía para activar un Exercise de proveedor.
+     * Rechaza explícitamente activar cualquier ejercicio cuyas
+     * `contraindications` sigan en `null` ("todavía no revisado" — mismo
+     * convenio null/[] que `restrictions`/`available_equipment`/
+     * `primary_focus`). `[]` SÍ es válido: significa que un humano ya
+     * revisó y confirmó que no hay ninguna contraindicación conocida —
+     * nunca se asume solo porque el proveedor no la informó.
+     *
+     * `instructions` vacío (`null` o `[]`) TAMBIÉN bloquea — a diferencia
+     * de `contraindications`, aquí no existe un "revisado, confirmado sin
+     * nada" válido: sin pasos no hay "cómo ejecutar" que mostrarle al
+     * usuario, el ejercicio simplemente no está listo.
+     *
+     * `important_points`/`common_mistakes`/`breathing_cue` en `null`
+     * NUNCA bloquean — asimetría deliberada (ver docs/DECISIONS.md): son
+     * contenido opcional, editable por un administrador cuando exista
+     * información confiable, nunca inventado solo para poder activar.
+     */
+    public function activate(User $reviewer): void
+    {
+        if ($this->contraindications === null) {
+            throw new \DomainException(
+                "Exercise {$this->id} no puede activarse sin contraindications revisadas — ver docs/DECISIONS.md."
+            );
+        }
+
+        if (empty($this->instructions)) {
+            throw new \DomainException(
+                "Exercise {$this->id} no puede activarse sin instructions — ver docs/DECISIONS.md."
+            );
+        }
+
+        $this->update([
+            'is_active' => true,
+            'contraindications_reviewed_by' => $reviewer->id,
+            'contraindications_reviewed_at' => now(),
+        ]);
     }
 
     /**
@@ -60,16 +152,34 @@ class Exercise extends Model
      * un usuario) puedan verificarse directamente sobre el snapshot
      * persistido, sin depender de que el Exercise original no haya
      * cambiado desde entonces.
+     *
+     * Hito 9.1: incluye `provider`/`provider_exercise_id` por la misma
+     * razón — nunca `video_url` de proveedor (siempre null por diseño,
+     * ver `booted()` arriba); el video se resuelve en caliente al enviar,
+     * nunca se congela en el histórico.
+     *
+     * Hito 9.2: incluye la información técnica de ejecución
+     * (`important_points`/`common_mistakes`/`breathing_cue`, además de
+     * `instructions` ya existente) — `App\Training\Support\
+     * ExerciseMessageFormatter` lee EXCLUSIVAMENTE de este snapshot
+     * congelado, nunca del `Exercise` en vivo, para que una mejora futura
+     * de la técnica de un ejercicio no reescriba retroactivamente lo que
+     * un usuario ya recibió.
      */
     public function toSnapshot(): array
     {
         return [
             'name' => $this->name,
             'instructions' => $this->instructions,
+            'important_points' => $this->important_points,
+            'common_mistakes' => $this->common_mistakes,
+            'breathing_cue' => $this->breathing_cue,
             'video_url' => $this->video_url,
             'muscle_group' => $this->muscle_group,
             'primary_muscle' => $this->primary_muscle?->value,
             'secondary_muscles' => $this->secondary_muscles,
+            'provider' => $this->provider,
+            'provider_exercise_id' => $this->provider_exercise_id,
         ];
     }
 }

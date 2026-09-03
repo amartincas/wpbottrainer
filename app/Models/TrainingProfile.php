@@ -128,6 +128,29 @@ class TrainingProfile extends Model
     }
 
     /**
+     * Hito 9.0: `sessions_per_week` no tenía ningún consumidor real en
+     * `TrainingEngine` — se capturaba y persistía, pero no cambiaba nada
+     * (hallazgo explícito, ver docs/DECISIONS.md). Esta es su única
+     * consecuencia real: deriva el `split_type` determinísticamente, sin
+     * IA, cuando el onboarding captura/actualiza la frecuencia semanal.
+     *
+     * HEURÍSTICA DE PRODUCTO documentada como tal (mismo criterio que
+     * GOAL_DEFAULTS de TrainingEngine) — no una prescripción científica
+     * universal, revisable en cualquier momento sin migración: pocos días
+     * favorecen entrenar todo el cuerpo cada vez (full_body); más días
+     * permiten separar grupos musculares para dar más recuperación entre
+     * sesiones del mismo grupo (upper_lower / push_pull_legs).
+     */
+    public static function deriveSplitTypeFromSessionsPerWeek(int $sessionsPerWeek): SplitType
+    {
+        return match (true) {
+            $sessionsPerWeek <= 3 => SplitType::FullBody,
+            $sessionsPerWeek === 4 => SplitType::UpperLower,
+            default => SplitType::PushPullLegs, // 5+
+        };
+    }
+
+    /**
      * Onboarding mínimo completo (Hito 5, ampliado en Hito 8.3 y 8.4):
      * nombre (`Contact.customer_name` — identidad, no vive en este modelo),
      * objetivo, nivel, zona a priorizar (`primary_focus`), lugar de

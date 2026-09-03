@@ -193,3 +193,13 @@ it('never lets secondary_focus block onboarding, even when null', function () {
 
     expect($profile->isOnboardingComplete($contact))->toBeTrue();
 });
+
+// ── Hito 9.0: sessions_per_week → split_type (cierre de consumidor real) ──
+
+it('derives split_type from sessions_per_week deterministically, without AI', function () {
+    expect(TrainingProfile::deriveSplitTypeFromSessionsPerWeek(1))->toBe(SplitType::FullBody);
+    expect(TrainingProfile::deriveSplitTypeFromSessionsPerWeek(3))->toBe(SplitType::FullBody);
+    expect(TrainingProfile::deriveSplitTypeFromSessionsPerWeek(4))->toBe(SplitType::UpperLower);
+    expect(TrainingProfile::deriveSplitTypeFromSessionsPerWeek(5))->toBe(SplitType::PushPullLegs);
+    expect(TrainingProfile::deriveSplitTypeFromSessionsPerWeek(7))->toBe(SplitType::PushPullLegs);
+});

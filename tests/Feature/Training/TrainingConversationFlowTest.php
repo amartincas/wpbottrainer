@@ -208,7 +208,11 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
     TrainingProfile::factory()->create(['contact_id' => $contact->id, 'restrictions' => [], 'available_equipment' => []]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
-    $chest = Exercise::factory()->create(['muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4']);
+    $chest = Exercise::factory()->create([
+        'muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4',
+        'instructions' => ['Manos a la anchura de los hombros', 'Cuerpo alineado'],
+        'breathing_cue' => 'Inhala al bajar, exhala al subir',
+    ]);
     $legs = Exercise::factory()->create(['muscle_group' => 'legs', 'name' => 'Sentadilla', 'video_url' => 'https://videos.example.test/squat.mp4']);
     $back = Exercise::factory()->create(['muscle_group' => 'back', 'name' => 'Remo', 'video_url' => 'https://videos.example.test/row.mp4']);
 
@@ -220,8 +224,14 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
     expect($session)->not->toBeNull();
     expect($session->workoutExercises)->toHaveCount(3);
 
-    // El texto del entrenamiento se envió.
+    // La cabecera mínima de sesión se envió.
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'entrenamiento de hoy'));
+
+    // El texto de técnica de cada ejercicio se envió, con sus instrucciones
+    // reales tomadas del snapshot — nunca hardcodeadas en TrainingHandler.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Flexiones')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'Manos a la anchura de los hombros')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'Inhala al bajar, exhala al subir'));
 
     // Un video por cada ejercicio con exercise_snapshot.video_url.
     foreach ([$chest, $legs, $back] as $exercise) {
