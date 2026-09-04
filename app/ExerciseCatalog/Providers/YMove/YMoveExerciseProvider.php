@@ -7,12 +7,14 @@ use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\ExerciseCatalog\DTOs\ProviderSearchCriteria;
 use App\ExerciseCatalog\DTOs\ProviderSearchPage;
 use App\ExerciseCatalog\DTOs\ResolvedMedia;
+use App\ExerciseCatalog\Enums\MediaResolutionReason;
 use App\ExerciseCatalog\Enums\MediaVariant;
 use App\ExerciseCatalog\Exceptions\ProviderSyncException;
-use App\Training\Enums\MuscleFocus;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Hito 9.1 — único lugar del sistema que sabe que existe
@@ -50,13 +52,14 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
     public function find(string $providerExerciseId): ?ProviderExerciseData
     {
         // Metadata únicamente (modo browse) — usado por la importación de
-        // catálogo. Nunca debe pedir video: ver findWithVideo() para eso.
-        return $this->fetchAndLocate($providerExerciseId, includeVideos: false);
+        // catálogo. Nunca debe pedir video: ver resolveMedia()/variants()
+        // para eso.
+        return $this->fetchById($providerExerciseId, includeVideos: false, operation: 'find');
     }
 
     public function resolveMedia(string $providerExerciseId, MediaVariant $variant = MediaVariant::Default): ?ResolvedMedia
     {
-        $data = $this->findWithVideo($providerExerciseId);
+        $data = $this->fetchById($providerExerciseId, includeVideos: true, operation: 'resolveMedia');
 
         if ($data === null) {
             return null;
@@ -65,6 +68,12 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         $videoUrl = $this->pickVideoUrl($data->raw, $variant);
 
         if ($videoUrl === null) {
+            // El ejercicio SÍ se localizó y el proveedor SÍ respondió con
+            // éxito: esto no es un fallo de fetch (fetchById() ya lo
+            // habría logueado distinto, incluida la cuota excedida — ver
+            // ahí), es un dato real — este ejercicio no tiene video.
+            $this->logResolutionEvent($providerExerciseId, 'resolveMedia', 'video', MediaResolutionReason::HasNoVideo);
+
             return null;
         }
 
@@ -77,11 +86,9 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         $query = $this->buildBrowseQuery($criteria);
         $query['page'] = $page;
 
-        // A diferencia de fetchPage()/fetchAndLocate(), esta ruta respeta
-        // el filtro completo del criteria (muscleFocus/hasVideo) — por
-        // eso arma su propia query en vez de reutilizar fetchPage(), que
-        // es deliberadamente sin filtro (localizar un id concreto en TODO
-        // el catálogo). Misma forma de parseo/excepción que fetchPage().
+        // Ruta exclusiva de SINCRONIZACIÓN del catálogo completo — respeta
+        // el filtro completo del criteria (muscleFocus/hasVideo). Nunca
+        // usada para resolver UN ejercicio individual: ver fetchById().
         $response = $this->client()->get('/exercises', $query);
 
         if ($response->failed()) {
@@ -93,19 +100,7 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
             );
         }
 
-        $items = collect($response->json('data', []))
-            ->filter(fn (array $raw) => isset($raw['id']))
-            ->map(fn (array $raw) => new ProviderExerciseData($raw['id'], $raw))
-            ->values();
-
-        $pagination = $response->json('pagination');
-
-        return new ProviderSearchPage(
-            items: $items,
-            page: (int) ($pagination['page'] ?? $page),
-            totalPages: isset($pagination['totalPages']) ? (int) $pagination['totalPages'] : null,
-            totalItems: isset($pagination['total']) ? (int) $pagination['total'] : null,
-        );
+        return $this->parsePage($response, $page);
     }
 
     public function isAvailable(): bool
@@ -122,18 +117,24 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         // Enumerar variantes de video (fondo blanco/gimnasio) requiere el
         // arreglo `videos[]`, que el modo browse no trae — igual que
         // resolveMedia(), esta es una ruta que SÍ puede consumir cuota.
-        $data = $this->findWithVideo($providerExerciseId);
+        $data = $this->fetchById($providerExerciseId, includeVideos: true, operation: 'variants');
 
         if ($data === null) {
             return [];
         }
 
-        return collect($data->raw['videos'] ?? [])
+        $tags = collect($data->raw['videos'] ?? [])
             ->pluck('tag')
             ->filter()
             ->unique()
             ->values()
             ->all();
+
+        if ($tags === []) {
+            $this->logResolutionEvent($providerExerciseId, 'variants', 'video', MediaResolutionReason::HasNoVideo);
+        }
+
+        return $tags;
     }
 
     public function alternatives(string $providerExerciseId): array
@@ -170,89 +171,79 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
     }
 
     /**
-     * Igual que find(), pero con video incluido — SOLO para las dos rutas
-     * del contrato que legítimamente lo necesitan (resolveMedia/variants).
-     * Nunca invocada desde la importación de catálogo.
-     */
-    private function findWithVideo(string $providerExerciseId): ?ProviderExerciseData
-    {
-        return $this->fetchAndLocate($providerExerciseId, includeVideos: true);
-    }
-
-    /**
-     * Hito 9.3 (fix post-E2E) — hallazgo real: esta función solo miraba la
-     * página 1 (~20 de 1068 ítems del catálogo real), así que un id fuera
-     * de esa página SIEMPRE resolvía a null (video ausente en WhatsApp sin
-     * ningún error visible). La API pública auditada no expone un endpoint
-     * /exercises/{id} — localizar por id sigue siendo "listar y buscar",
-     * pero ahora recorre tantas páginas como YMove reporte de verdad
-     * (nunca un número asumido), en dos fases para no gastar cuota de más:
+     * Hito 9.3 (corrección post-deploy) — hallazgo real en la
+     * documentación oficial de YMove: SÍ existe un endpoint directo por
+     * id, `GET /exercises/{id}` (acepta UUID o slug) — la suposición
+     * anterior ("no hay endpoint por id, hay que listar y buscar") era
+     * incorrecta. Esta es ahora la ÚNICA vía para resolver UN ejercicio
+     * individual — nunca recorre el catálogo paginado. `searchPaged()`
+     * (arriba) se mantiene intacta para `fullSync()`, que sí necesita el
+     * catálogo completo; ambas rutas son independientes a propósito:
      *
-     *  Fase 1 — SIEMPRE en modo browse (includeVideos=false, gratis), sin
-     *  importar si el llamador quiere video: localizar en qué página vive
-     *  el id nunca cuesta cuota.
-     *  Fase 2 — solo si $includeVideos=true: UNA única llamada adicional,
-     *  acotada a esa página exacta (≈20 ítems), nunca al catálogo completo.
+     *   CATÁLOGO (fullSync)      → searchPaged() → paginación
+     *   EJERCICIO INDIVIDUAL     → fetchById()   → GET /exercises/{id}
      *
-     * Un fallo real de HTTP (ProviderSyncException, ver searchPaged())
-     * se traduce a null aquí — find()/resolveMedia()/variants() prometían
-     * ese contrato desde antes de este fix, y ninguno de sus llamadores
-     * (MediaResolver incluido) espera una excepción.
+     * `includeVideos=false` en este mismo endpoint (equivalente a
+     * `excludeVideos=1` según la documentación) evita el costo de cuota
+     * — usado por `find()`. `includeVideos=true` (el único caso que
+     * cuesta cuota) lo usan `resolveMedia()`/`variants()`.
+     *
+     * Un fallo real de HTTP se traduce a null aquí — find()/resolveMedia()/
+     * variants() siguen prometiendo ese contrato, ningún llamador
+     * (MediaResolver incluido) espera una excepción. Cada causa de
+     * `null` se distingue en los logs (ver logResolutionEvent()),
+     * incluida la respuesta 200-pero-sin-video que YMove entrega cuando
+     * la cuenta superó su cupo mensual (`_warning.reason =
+     * "monthly_exercise_cap"`, ver más abajo) — sin este chequeo sería
+     * indistinguible de "el ejercicio genuinamente no tiene video".
      */
-    private function fetchAndLocate(string $providerExerciseId, bool $includeVideos): ?ProviderExerciseData
+    private function fetchById(string $providerExerciseId, bool $includeVideos, string $operation): ?ProviderExerciseData
     {
-        $page = 1;
-        $found = null;
-        $totalPages = null;
-
-        do {
-            try {
-                $result = $this->fetchPage($page, includeVideos: false);
-            } catch (ProviderSyncException) {
-                return null;
-            }
-
-            $found = $result->items->firstWhere('providerExerciseId', $providerExerciseId);
-            $totalPages = $result->totalPages;
-            $page++;
-        } while ($found === null && $totalPages !== null && $page <= $totalPages);
-
-        if ($found === null) {
-            return null;
-        }
-
-        if (! $includeVideos) {
-            return $found;
-        }
+        $phase = $includeVideos ? 'video' : 'browse';
 
         try {
-            $withVideo = $this->fetchPage($page - 1, includeVideos: true);
-        } catch (ProviderSyncException) {
+            $response = $this->client()->get('/exercises/'.rawurlencode($providerExerciseId), [
+                'includeVideos' => $includeVideos ? 'true' : 'false',
+            ]);
+        } catch (\Throwable $e) {
+            $this->logResolutionEvent($providerExerciseId, $operation, $phase, MediaResolutionReason::UnexpectedError, error: $e->getMessage());
+
             return null;
         }
 
-        return $withVideo->items->firstWhere('providerExerciseId', $providerExerciseId);
-    }
-
-    /**
-     * Una sola página cruda del catálogo — extraído de searchPaged() para
-     * que fetchAndLocate() pueda reutilizar exactamente la misma forma de
-     * pedir/parsear una página (incluida la excepción en fallo real) sin
-     * duplicar lógica.
-     */
-    private function fetchPage(int $page, bool $includeVideos): ProviderSearchPage
-    {
-        $response = $this->client()->get('/exercises', [
-            'includeVideos' => $includeVideos ? 'true' : 'false',
-            'page' => $page,
-        ]);
-
         if ($response->failed()) {
-            throw new ProviderSyncException(
-                "YMove respondió con error al pedir la página {$page}: HTTP {$response->status()}."
-            );
+            $this->logHttpFailure($providerExerciseId, $operation, $phase, $response->status());
+
+            return null;
         }
 
+        $raw = $response->json('data');
+
+        if (! is_array($raw) || ! isset($raw['id'])) {
+            $this->logResolutionEvent($providerExerciseId, $operation, $phase, MediaResolutionReason::ExerciseNotFound);
+
+            return null;
+        }
+
+        // Hito 9.3 (corrección post-deploy) — hallazgo real de la
+        // documentación de YMove: al superar el cupo mensual de video,
+        // la API responde 200 con la metadata completa pero SIN
+        // videoUrl/videoHlsUrl/videoDurationSecs, marcando
+        // `_warning.reason = "monthly_exercise_cap"`. Sin este chequeo
+        // explícito, pickVideoUrl() simplemente no encontraría video y
+        // esto se clasificaría (incorrectamente) como
+        // provider_has_no_video — una causa completamente distinta.
+        if ($includeVideos && $response->json('_warning.reason') === 'monthly_exercise_cap') {
+            $this->logResolutionEvent($providerExerciseId, $operation, 'video', MediaResolutionReason::QuotaExceeded);
+
+            return null;
+        }
+
+        return new ProviderExerciseData($raw['id'], $raw);
+    }
+
+    private function parsePage(Response $response, int $page): ProviderSearchPage
+    {
         $items = collect($response->json('data', []))
             ->filter(fn (array $raw) => isset($raw['id']))
             ->map(fn (array $raw) => new ProviderExerciseData($raw['id'], $raw))
@@ -314,5 +305,50 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         }
 
         return (new \DateTimeImmutable)->setTimestamp((int) $params['expires']);
+    }
+
+    // ── Hito 9.3 (corrección post-deploy, observabilidad) ────────────────
+
+    /**
+     * Clasifica un fallo HTTP de fetchById() — 404 (id inexistente) y 429
+     * (cuota) tienen cada uno su propio motivo; cualquier otro código es
+     * un error genérico. Nunca se confunden entre sí en los logs.
+     */
+    private function logHttpFailure(string $providerExerciseId, string $operation, string $phase, int $httpStatus): void
+    {
+        $reason = match ($httpStatus) {
+            404 => MediaResolutionReason::ExerciseNotFound,
+            429 => MediaResolutionReason::QuotaExceeded,
+            default => MediaResolutionReason::HttpError,
+        };
+
+        $this->logResolutionEvent($providerExerciseId, $operation, $phase, $reason, httpStatus: $httpStatus);
+    }
+
+    /**
+     * Único punto de logging estructurado de este Adapter para fallos/
+     * causas de resolución de media. Deliberadamente NUNCA incluye la
+     * URL de video (firmada, con token) ni la API key — solo
+     * identificadores y el motivo clasificado.
+     */
+    private function logResolutionEvent(
+        string $providerExerciseId,
+        string $operation,
+        string $phase,
+        MediaResolutionReason $reason,
+        ?int $httpStatus = null,
+        ?string $error = null,
+    ): void {
+        $level = $reason === MediaResolutionReason::HasNoVideo ? 'info' : 'warning';
+
+        Log::{$level}('EXERCISE_MEDIA_RESOLUTION', array_filter([
+            'provider' => $this->key(),
+            'provider_exercise_id' => $providerExerciseId,
+            'operation' => $operation,
+            'phase' => $phase,
+            'reason' => $reason->value,
+            'http_status' => $httpStatus,
+            'error' => $error,
+        ], fn ($value) => $value !== null));
     }
 }

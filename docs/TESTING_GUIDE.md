@@ -232,7 +232,7 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 
 | Categoría | Dónde |
 |---|---|
-| **Localización más allá de la página 1** | `YMoveExerciseProviderTest.php` (+5) — `resolveMedia()` encuentra un ejercicio en la página 2 paginando en modo browse (gratis) y solo entonces pide video de esa única página exacta (nunca la 1, nunca el catálogo completo); un ejercicio en la página 1 no dispara ninguna página de más; `find()` también se beneficia (metadata más allá de página 1, sin pedir video jamás); un id inexistente agota `totalPages` real sin loop infinito; sin `pagination` en la respuesta, se detiene tras una sola página (compatibilidad hacia atrás). |
+| **Localización más allá de la página 1** | `YMoveExerciseProviderTest.php` (+5 en su momento) — **superseded**: esta cobertura asumía que había que paginar para resolver un id individual. La documentación oficial de YMove reveló un endpoint directo por id (`GET /exercises/{id}`) — ver D041 y la sección "Cobertura de la corrección: endpoint directo por id" más abajo, que reemplaza estos tests por completo. |
 | **Generación de contenido en español — validación de fidelidad** | `ExerciseSpanishContentGeneratorTest.php` (nuevo, 8) — genera y valida `name`/`instructions`/`important_points`; nunca menciona un proveedor concreto en el prompt (agnosticismo real, no solo declarado); `important_points` vacío se preserva tal cual; JSON inválido se rechaza (`SpanishContentGenerationException`); una traducción que fusiona/inventa pasos o puntos importantes se rechaza por conteo exacto de elementos, no solo por confiar en el prompt; `name` vacío se rechaza; tolera fences de markdown igual que `OnboardingConversationService`. |
 | **`Exercise::toSnapshot()` prefiere español cuando existe** | `ExerciseTest.php` (+3) — usa el original si `*_es` es `null`; prefiere `*_es` sin perder ni sobreescribir las columnas originales; distingue `important_points_es=[]` (traducido, confirmado vacío) de `null` (todavía sin traducir). |
 | **Acción de Filament "Generar contenido en español"** | `ExerciseResourceTest.php` (+5) — genera y guarda desde la acción de tabla sin activar el ejercicio ni tocar `is_active`/`reviewStatus()`; una traducción que falla la validación de fidelidad no guarda nada y notifica el error; oculta para un ejercicio ya activo; oculta para un usuario no-super-admin; los campos `*_es` son editables directamente desde el formulario de edición, independientemente de la acción de generación. |
@@ -240,6 +240,27 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 | **Confirmación explícita: contenido en español sobrevive a re-sync y a activación, `provider_has_video` sigue independiente** | `ExerciseImporterTest.php` (+1) — un solo test de extremo a extremo: genera contenido `*_es`, activa el ejercicio (`activate()` no lo toca), corre un segundo `importSearch()` que sí cambia metadata real y `hasVideo`, y confirma que `name_es`/`instructions_es`/`important_points_es`/`is_active` siguen intactos mientras `provider_has_video` refleja el nuevo valor del proveedor sin relación alguna con `is_active`; y que `toSnapshot()` ya devuelve el español mientras el ejercicio está activo. |
 
 **Qué NO demuestra esta cobertura, explícitamente**: ningún test ejecuta un LLM real — las dos reglas nuevas del prompt de onboarding y el `ExerciseSpanishContentGenerator` son instrucciones a un LLM, verificadas aquí solo en que (a) el prompt realmente las contiene y (b) el código aplica/valida correctamente cualquier forma de respuesta ya validada que el LLM podría dar — nunca que un LLM real seguirá la instrucción en todos los casos reales. Confirmación de eso solo puede venir de una prueba E2E real posterior (fuera de alcance de este fix, por la restricción explícita de cero cuota adicional).
+
+## Cobertura de la corrección: endpoint directo por id + observabilidad (ver D041, supersede D040)
+
+24 tests en `YMoveExerciseProviderTest.php` (reemplaza la cobertura anterior de D040/paginación — ver nota en la sección de D039 arriba), **100% con mocks — cero llamadas reales a YMove**.
+
+| Categoría | Dónde |
+|---|---|
+| **`find()` usa el endpoint directo** | `GET /exercises/{id}?includeVideos=false`, nunca `/exercises?page=N` — verificado por URL exacta y por `Http::assertSentCount(1)`. |
+| **Resuelve un id "lejano" con una sola solicitud** | Un id que en el mecanismo anterior habría requerido recorrer varias páginas ahora se resuelve en 1 solicitud — el concepto de "página" ya no aplica a la resolución individual. |
+| **`resolveMedia()` usa el endpoint directo con video** | `GET /exercises/{id}?includeVideos=true`; produce el `ResolvedMedia` esperado (URL por defecto y variante `white-background`); 1 sola solicitud, sin dependencia de ningún hint. |
+| **`variants()` usa el mismo endpoint directo** | Mismo shape de respuesta (`videos[]`), 1 sola solicitud. |
+| **`find()` nunca pide video; `resolveMedia()`/`variants()` sí** | Misma garantía de antes, verificada ahora sobre el endpoint directo. |
+| **Logging: sin video** | Ejercicio encontrado, respuesta exitosa, sin `videoUrl`/`videos[]` → `reason=provider_has_no_video`, nivel `info`. |
+| **Logging: cuota excedida — dos formas reales según la documentación de YMove** | (a) HTTP 429 directo; (b) HTTP 200 con `_warning.reason=monthly_exercise_cap` y campos de video ausentes — ambas producen `reason=provider_quota_exceeded`, **nunca** `provider_has_no_video` (test explícito de la distinción). |
+| **Logging: no encontrado** | HTTP 404 → `reason=provider_exercise_not_found` con `http_status=404`, para `find()` y `resolveMedia()`. |
+| **Logging: error HTTP genérico** | HTTP 503 → `reason=provider_http_error`, nunca confundido con cuota ni con no-encontrado. |
+| **Nunca se loguean secretos** | El contexto del log nunca contiene la API key, el header `X-API-Key`, ni un fragmento de URL firmada (`token=`). |
+| **Vocabulario sin hardcode de proveedor** | Ningún valor ni nombre de `MediaResolutionReason::cases()` contiene "ymove" — reutilizable por cualquier Adapter futuro. |
+| **Regresión: `searchPaged()`/`fullSync()` intactos** | Los tests existentes de `searchPaged()` (paginación real, excepción en fallo) y de `ExerciseFullSyncTest`/`ExerciseImporterTest` (sincronización completa) no cambiaron — la corrección solo afecta la resolución de UN ejercicio individual. |
+
+**Qué NO demuestra esta cobertura, explícitamente**: el shape de la respuesta 200-con-video (con `videoUrl`/`videos[]`) del endpoint `/exercises/{id}` no se verificó en vivo — solo el shape de la respuesta browse (`includeVideos=false`, confirmado en vivo, sin costo de cuota). Verificar el shape exacto con video requeriría una llamada `includeVideos=true` real, explícitamente prohibida mientras la cuenta esté sobre su cupo (114/100).
 
 ## Cobertura de validación E2E con el payload real de Meta (Hito 7)
 

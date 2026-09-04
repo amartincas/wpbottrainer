@@ -24,14 +24,17 @@ it('returns null for a manual exercise with no video_url at all', function () {
 });
 
 it('resolves a provider exercise\'s video fresh, through the provider, every time', function () {
+    // Hito 9.3 (corrección post-deploy) — resolveMedia() ahora usa el
+    // endpoint directo GET /exercises/{id}, que responde con un solo
+    // objeto (`data: {...}`), no un arreglo como el listado paginado.
     Http::fake(['exercise-api.ymove.app/*' => Http::response([
-        'data' => [[
+        'data' => [
             'id' => 'abc-123',
             'title' => 'Some exercise',
             'muscleGroup' => 'glutes',
             'equipment' => 'bodyweight',
             'videoUrl' => 'https://cdn.ymove.example/fresh.mp4?token=xyz',
-        ]],
+        ],
     ], 200)]);
 
     $exercise = Exercise::factory()->fromProvider('ymove', 'abc-123')->create();
