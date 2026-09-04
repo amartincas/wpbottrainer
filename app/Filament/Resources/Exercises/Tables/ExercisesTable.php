@@ -13,11 +13,15 @@ use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
 use Filament\Actions\Action;
 use Filament\Actions\EditAction;
+use Filament\Forms\Components\Checkbox;
+use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
+use Filament\Forms\Components\Textarea;
 use Filament\Notifications\Notification;
 use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Filters\Filter;
 use Filament\Tables\Filters\SelectFilter;
 use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
@@ -174,37 +178,143 @@ class ExercisesTable
                     ->query(fn ($query, array $data) => $data['value']
                         ? $query->whereJsonContains('equipment_needed', $data['value'])
                         : $query),
+                // Hito 9.3 (curación de lotes) — filtro genérico y
+                // reutilizable, deliberadamente SIN ningún id hardcodeado:
+                // sirve para acotar la tabla a cualquier lote puntual de
+                // curación (ej. los candidatos aprobados de una ronda) sin
+                // mezclarlo con el resto del catálogo pending_review, y sin
+                // introducir una columna/tabla nueva de "batch" — el propio
+                // administrador pega los ids que le interesan en cada
+                // sesión. No persiste nada; se pierde al recargar sin el
+                // parámetro de filtro.
+                Filter::make('specific_ids')
+                    ->label('IDs específicos')
+                    ->schema([
+                        Textarea::make('ids')
+                            ->label('IDs a incluir (separados por coma, espacio o salto de línea)')
+                            ->helperText('Útil para revisar un lote de curación puntual sin mezclarlo con el resto del catálogo pendiente.')
+                            ->rows(2),
+                    ])
+                    ->query(function ($query, array $data) {
+                        $raw = $data['ids'] ?? null;
+
+                        // Texto vacío/en blanco: filtro no aplicado, se
+                        // muestra el catálogo normal.
+                        if (blank($raw)) {
+                            return $query;
+                        }
+
+                        $ids = collect(preg_split('/[\s,]+/', trim($raw)))
+                            ->filter(fn ($value) => ctype_digit($value))
+                            ->map(fn ($value) => (int) $value)
+                            ->values()
+                            ->all();
+
+                        // Texto no vacío pero sin ningún id numérico válido:
+                        // NUNCA debe devolver el catálogo sin acotar — eso
+                        // ampliaría accidentalmente el conjunto sobre el que
+                        // se trabaja, justo lo que este filtro existe para
+                        // evitar. `whereIn('id', [])` compila a `0 = 1`
+                        // (comportamiento nativo de Laravel, ver
+                        // Grammar::whereIn()) — cero resultados garantizados,
+                        // nunca "sin filtro". El indicador de abajo deja
+                        // explícito por qué la tabla quedó vacía.
+                        return $query->whereIn('id', $ids);
+                    })
+                    ->indicateUsing(function (array $data) {
+                        $raw = $data['ids'] ?? null;
+
+                        if (blank($raw)) {
+                            return [];
+                        }
+
+                        $hasValidIds = collect(preg_split('/[\s,]+/', trim($raw)))
+                            ->contains(fn ($value) => ctype_digit($value));
+
+                        return $hasValidIds
+                            ? ['specific_ids' => 'IDs específicos: '.Str::limit(trim($raw), 60)]
+                            : ['specific_ids' => '⚠️ Ningún ID numérico válido en el texto ingresado — no se muestra ningún ejercicio.'];
+                    }),
             ])
             ->defaultSort('synced_at', 'desc')
             ->recordActions([
                 EditAction::make(),
 
-                // Curación mínima en línea — la revisión completa (incluir
-                // important_points/common_mistakes/breathing_cue/movement
-                // pattern) vive en la página de edición; esta acción existe
-                // para el caso común de "solo reviso contraindicaciones y
-                // activo" sin salir de la lista. La regla de negocio (qué
-                // bloquea activar) vive ÚNICAMENTE en Exercise::activate() —
-                // esta acción nunca la reimplementa, solo captura la
-                // revisión y delega.
+                // Hito 9.3 (curación de seguridad, post-validación de UX) —
+                // ANTES esta acción guardaba contraindications Y activaba en
+                // el mismo clic, con el modal pre-rellenando `null` como `[]`
+                // (ver TagsInput::setUp() en el vendor — afterStateHydrated
+                // fuerza [] para cualquier estado no-array). Eso hacía
+                // trivial confirmar sin haber revisado nada de verdad.
+                // Separada ahora en dos acciones: esta SOLO guarda
+                // contraindications, nunca activa — la decisión de
+                // seguridad queda deliberadamente aislada de la decisión de
+                // publicar. Nunca usa IA, nunca asume `[]` por defecto: el
+                // checkbox `reviewed_consciously` (regla `accepted`) bloquea
+                // el guardado entero si el administrador no confirma
+                // explícitamente, sea cual sea el contenido de
+                // contraindications — así la coerción del vendor a `[]` en
+                // el campo de tags nunca llega a persistirse sola.
+                Action::make('reviewSafety')
+                    ->label('Revisar seguridad')
+                    ->color('warning')
+                    ->icon('heroicon-o-shield-exclamation')
+                    ->visible(fn (Exercise $record): bool => Auth::user()?->is_super_admin && ! $record->is_active)
+                    ->schema([
+                        Placeholder::make('current_status')
+                            ->label('Estado actual')
+                            ->content(fn (Exercise $record): string => match (true) {
+                                $record->contraindications === null => '⚠️ Pendiente de revisión de seguridad — nunca se ha decidido para este ejercicio.',
+                                $record->contraindications === [] => '✅ Revisado — sin contraindicaciones registradas.',
+                                default => '✅ Revisado — contraindicaciones registradas: '.implode(', ', $record->contraindications),
+                            }),
+                        TagsInput::make('contraindications')
+                            ->label('Contraindicaciones')
+                            ->helperText('Añade una por cada contraindicación real. Si tras revisar no encuentras ninguna, déjalo vacío — deberás confirmarlo abajo igualmente.')
+                            ->placeholder('Ej. hernia discal'),
+                        Checkbox::make('reviewed_consciously')
+                            ->label('Confirmo que revisé este ejercicio y que las contraindicaciones de arriba (o la ausencia de ellas) reflejan mi decisión, no una casilla vacía sin revisar.')
+                            ->default(false)
+                            ->required()
+                            ->rule('accepted'),
+                    ])
+                    ->fillForm(fn (Exercise $record): array => [
+                        // Deliberadamente SIN "?? []" — si el modelo trae
+                        // null, que llegue null al formulario. El Placeholder
+                        // de arriba ya deja claro el estado real
+                        // independientemente de cómo el componente de tags
+                        // lo renderice internamente.
+                        'contraindications' => $record->contraindications,
+                        'reviewed_consciously' => false,
+                    ])
+                    ->requiresConfirmation()
+                    ->modalDescription('Esto SOLO guarda la revisión de seguridad — el ejercicio sigue pendiente de activación. Usa "Activar" por separado después.')
+                    ->action(function (Exercise $record, array $data): void {
+                        $record->update(['contraindications' => $data['contraindications']]);
+
+                        Notification::make()
+                            ->title('Revisión de seguridad guardada')
+                            ->body('El ejercicio sigue pendiente de activación.')
+                            ->success()
+                            ->send();
+                    }),
+
+                // La regla de negocio (qué bloquea activar) vive ÚNICAMENTE
+                // en Exercise::activate() — esta acción nunca la
+                // reimplementa, solo delega. Ya no expone ni edita
+                // contraindications: eso es responsabilidad exclusiva de
+                // "Revisar seguridad", de ahí que solo sea visible cuando ya
+                // se decidió (contraindications !== null).
                 Action::make('activate')
                     ->label('Activar')
                     ->color('success')
                     ->icon('heroicon-o-check-circle')
                     ->visible(fn (Exercise $record): bool => Auth::user()?->is_super_admin
-                        && $record->reviewStatus() !== 'active')
+                        && $record->reviewStatus() !== 'active'
+                        && $record->contraindications !== null)
                     ->requiresConfirmation()
-                    ->schema([
-                        TagsInput::make('contraindications')
-                            ->label('Contraindicaciones (Enter para cada una; deja vacío y confirma si revisaste y no hay ninguna)')
-                            ->placeholder('Ej. hernia discal'),
-                    ])
-                    ->fillForm(fn (Exercise $record): array => [
-                        'contraindications' => $record->contraindications ?? [],
-                    ])
-                    ->action(function (Exercise $record, array $data): void {
-                        $record->update(['contraindications' => $data['contraindications']]);
-
+                    ->modalDescription('Activa el ejercicio con las contraindicaciones ya guardadas. Para cambiarlas, usa "Revisar seguridad" primero.')
+                    ->action(function (Exercise $record): void {
                         try {
                             /** @var User $user */
                             $user = Auth::user();

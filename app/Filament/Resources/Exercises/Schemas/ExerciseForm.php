@@ -63,12 +63,33 @@ class ExerciseForm
                     Text::make(fn ($record) => 'Última generación/edición: '.($record?->content_translated_at?->diffForHumans() ?? 'nunca')),
                 ]),
 
+            // Hito 9.3 (curación de seguridad, post-validación de UX) —
+            // ANTES este campo era un TagsInput editable directamente desde
+            // el guardado estándar del formulario. Riesgo verificado
+            // empíricamente (ver tests): el propio TagsInput del vendor
+            // (Filament\Forms\Components\TagsInput::setUp() →
+            // afterStateHydrated) fuerza cualquier estado no-array — es
+            // decir, `null` — a `[]` al hidratarse en el navegador. Eso
+            // significa que simplemente abrir esta página y pulsar "Save"
+            // sin tocar nada convertía silenciosamente "nunca revisado" en
+            // "revisado, sin contraindicaciones", sin ninguna decisión
+            // consciente de por medio. Se retira el campo editable de aquí
+            // por completo — un campo fuera del schema nunca se dehidrata
+            // ni se guarda, así que el "Save" estándar ya no puede tocar
+            // contraindications de ninguna forma. La única vía de edición
+            // ahora es la acción "Revisar seguridad" (en la lista o en el
+            // encabezado de esta página), que exige una confirmación
+            // explícita del administrador antes de guardar cualquier valor,
+            // incluido `[]`.
             Section::make('Seguridad — requerido para activar')
+                ->description('Solo lectura aquí — usa la acción "Revisar seguridad" (en la lista o en el encabezado de esta página) para cambiar esto.')
                 ->schema([
-                    TagsInput::make('contraindications')
-                        ->label('Contraindicaciones')
-                        ->helperText('Preservado en cada re-sincronización — nunca lo sobreescribe el proveedor. Déjalo vacío (guardar sin ninguna) para confirmar "revisado, sin contraindicaciones" — distinto de no haberlo revisado todavía.')
-                        ->placeholder('Ej. hernia discal'),
+                    Text::make(fn ($record) => match (true) {
+                        $record === null => '—',
+                        $record->contraindications === null => '⚠️ Pendiente de revisión de seguridad — nunca se ha decidido para este ejercicio.',
+                        $record->contraindications === [] => '✅ Revisado — sin contraindicaciones registradas.',
+                        default => '✅ Revisado — contraindicaciones registradas: '.implode(', ', $record->contraindications),
+                    }),
                 ]),
 
             Section::make('Técnica curada (opcional — nunca bloquea la activación)')

@@ -86,7 +86,18 @@ class GrokService implements AiServiceInterface
                 'content' => $userMessage,
             ];
 
+            // Hito 9.3 (curación de seguridad) — hallazgo real durante la
+            // curación manual: sin timeout explícito, esta llamada heredaba
+            // el default de Laravel (30s), insuficiente para una
+            // traducción de varios pasos vía ExerciseSpanishContentGenerator
+            // — falla real observada: "cURL error 28: Operation timed out
+            // after 30002 milliseconds". Se sube a 90s y se agregan 2
+            // reintentos ante un fallo transitorio de conexión (timeout
+            // incluido) antes de darse por vencido. analyzeImage() no se
+            // tocó — tiene su propio timeout(30) deliberado para visión.
             $response = Http::withToken($this->apiKey)
+                ->timeout(90)
+                ->retry(2, 2000)
                 ->post('https://api.x.ai/v1/chat/completions', [
                     'model' => $this->model,
                     'messages' => $messages,

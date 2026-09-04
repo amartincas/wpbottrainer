@@ -106,7 +106,13 @@ it('the syncProvider action is hidden from non-super-admin users', function () {
 
 it('activation still defers entirely to Exercise::activate() — Filament never invents a weaker rule', function () {
     $admin = User::factory()->create(['is_super_admin' => true]);
-    $exercise = Exercise::factory()->fromProvider('ymove')->create(['instructions' => []]);
+    // contraindications ya revisado ([]) para aislar la regla que se prueba
+    // aquí (instructions vacío) de la nueva visibilidad de "activate" —
+    // ver los tests dedicados de esa visibilidad más abajo.
+    $exercise = Exercise::factory()->fromProvider('ymove')->create([
+        'instructions' => [],
+        'contraindications' => [],
+    ]);
 
     Livewire::actingAs($admin)
         ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
@@ -117,18 +123,179 @@ it('activation still defers entirely to Exercise::activate() — Filament never 
     expect($exercise->fresh()->is_active)->toBeFalse();
 });
 
-it('activation succeeds through the table action once contraindications are captured, using the real domain rule', function () {
+it('activation succeeds once contraindications were captured through the separate "reviewSafety" step, using the real domain rule', function () {
     $admin = User::factory()->create(['is_super_admin' => true]);
     $exercise = Exercise::factory()->fromProvider('ymove')->create(['instructions' => ['Paso 1']]);
 
     Livewire::actingAs($admin)
         ->test(ListExercises::class)
-        ->callTableAction('activate', $exercise, data: ['contraindications' => ['hernia discal']]);
+        ->callTableAction('reviewSafety', $exercise, data: [
+            'contraindications' => ['hernia discal'],
+            'reviewed_consciously' => true,
+        ])
+        ->assertHasNoTableActionErrors();
+
+    // "reviewSafety" nunca activa por su cuenta.
+    expect($exercise->fresh()->is_active)->toBeFalse();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->callTableAction('activate', $exercise);
 
     $exercise->refresh();
     expect($exercise->is_active)->toBeTrue();
     expect($exercise->contraindications)->toBe(['hernia discal']);
     expect($exercise->contraindications_reviewed_by)->toBe($admin->id);
+});
+
+// ── Hito 9.3 (curación de seguridad, post-validación de UX) ─────────────
+// "Revisar seguridad" y "Activar" separados: la revisión de seguridad
+// nunca activa, y activar nunca vuelve a pedir/tocar contraindications.
+// Ver docs/DECISIONS.md.
+
+it('the safety review is rejected without an explicit confirmation checkbox — even to save an empty list — and nothing is persisted', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+    expect($exercise->contraindications)->toBeNull();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->callTableAction('reviewSafety', $exercise, data: [
+            'contraindications' => [],
+            'reviewed_consciously' => false,
+        ])
+        ->assertHasTableActionErrors(['reviewed_consciously']);
+
+    // Nada se guardó: sigue exactamente en el mismo estado "pendiente".
+    expect($exercise->fresh()->contraindications)->toBeNull();
+});
+
+it('the safety review saves an empty contraindications list once explicitly confirmed, and never activates', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->callTableAction('reviewSafety', $exercise, data: [
+            'contraindications' => [],
+            'reviewed_consciously' => true,
+        ])
+        ->assertHasNoTableActionErrors();
+
+    $fresh = $exercise->fresh();
+    expect($fresh->contraindications)->toBe([]);
+    expect($fresh->is_active)->toBeFalse();
+    expect($fresh->reviewStatus())->toBe('inactive'); // revisado, todavía no activo
+});
+
+it('the safety review saves a real list of contraindications once explicitly confirmed, and never activates', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->callTableAction('reviewSafety', $exercise, data: [
+            'contraindications' => ['hernia discal', 'lesión de hombro'],
+            'reviewed_consciously' => true,
+        ])
+        ->assertHasNoTableActionErrors();
+
+    $fresh = $exercise->fresh();
+    expect($fresh->contraindications)->toBe(['hernia discal', 'lesión de hombro']);
+    expect($fresh->is_active)->toBeFalse();
+});
+
+it('the "reviewSafety" action is hidden once the exercise is already active', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableActionHidden('reviewSafety', $exercise);
+});
+
+it('the "activate" table action is hidden while contraindications is still null, and appears once reviewed', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create(['instructions' => ['Paso 1']]);
+    expect($exercise->contraindications)->toBeNull();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableActionHidden('activate', $exercise);
+
+    $exercise->update(['contraindications' => []]);
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableActionVisible('activate', $exercise);
+});
+
+it('the "activate" header action on the edit page is hidden while contraindications is still null', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+    expect($exercise->contraindications)->toBeNull();
+
+    Livewire::actingAs($admin)
+        ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
+        ->assertActionHidden('activate');
+
+    $exercise->update(['contraindications' => []]);
+
+    Livewire::actingAs($admin)
+        ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
+        ->assertActionVisible('activate');
+});
+
+it('saving the standard edit form without touching contraindications never changes it — the field is no longer editable there', function () {
+    // Prueba empírica del riesgo señalado: Filament\Forms\Components\
+    // TagsInput::setUp() fuerza cualquier estado no-array (es decir, null)
+    // a [] al hidratarse (ver afterStateHydrated en el vendor). Antes de
+    // este cambio, contraindications era un TagsInput editable en este
+    // mismo formulario — abrir la página y guardar sin tocar nada
+    // convertía silenciosamente "nunca revisado" en "revisado, sin
+    // contraindicaciones". Ahora el campo no forma parte del schema del
+    // formulario estándar en absoluto, así que "save" nunca lo dehidrata.
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create(['name_es' => 'Sin editar todavía']);
+    expect($exercise->contraindications)->toBeNull();
+
+    Livewire::actingAs($admin)
+        ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
+        ->fillForm(['name_es' => 'Editado'])
+        ->call('save')
+        ->assertHasNoFormErrors();
+
+    $fresh = $exercise->fresh();
+    expect($fresh->contraindications)->toBeNull();
+    expect($fresh->name_es)->toBe('Editado');
+});
+
+it('filters the table to an ad-hoc list of specific ids, without mixing in the rest of the pending catalog', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $included = Exercise::factory()->fromProvider('ymove')->create();
+    $excluded = Exercise::factory()->fromProvider('ymove')->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->filterTable('specific_ids', ['ids' => (string) $included->id])
+        ->assertCanSeeTableRecords([$included])
+        ->assertCanNotSeeTableRecords([$excluded]);
+});
+
+it('never widens the "specific_ids" filter to the full catalog when the text is non-blank but has no valid numeric id', function () {
+    // Fix: antes, un texto no vacío que no producía ningún id numérico
+    // válido (ej. un rango "1-53" sin comas/espacios, o texto no numérico)
+    // devolvía la query SIN acotar — mostrando el catálogo completo, justo
+    // lo que este filtro existe para evitar. Ahora debe devolver cero
+    // resultados, nunca ampliar el conjunto.
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $anyExercise = Exercise::factory()->fromProvider('ymove')->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->filterTable('specific_ids', ['ids' => '1-53'])
+        ->assertCanNotSeeTableRecords([$anyExercise])
+        ->assertCountTableRecords(0);
 });
 
 it('deactivation is available from the table for an active exercise', function () {
@@ -226,6 +393,38 @@ it('the generateSpanishContent action is hidden from non-super-admin users', fun
     Livewire::actingAs($user)
         ->test(ListExercises::class)
         ->assertTableActionHidden('generateSpanishContent', $exercise);
+});
+
+it('running "generateSpanishContent" from the edit page header refreshes the open form, so a later Save cannot overwrite it with stale empty fields', function () {
+    // Hallazgo real durante la curación manual (ID 55): la acción
+    // actualizaba el modelo directamente pero el formulario ya abierto en
+    // esa misma página seguía en blanco; un "Save" posterior enviaba ese
+    // formulario vacío y borraba la traducción recién generada.
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $tenant = Tenant::factory()->create();
+    $exercise = Exercise::factory()->fromProvider('ymove')->create([
+        'name' => 'Squat',
+        'instructions' => ['Bend your knees.'],
+        'important_points' => [],
+    ]);
+
+    fakeSpanishContentAiResponse(['name' => 'Sentadilla', 'instructions' => ['Dobla las rodillas.'], 'important_points' => []]);
+
+    $test = Livewire::actingAs($admin)
+        ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
+        ->callAction('generateSpanishContent', data: ['tenant_id' => $tenant->id]);
+
+    // El formulario ya visible en pantalla debe reflejar la traducción
+    // recién generada, no el estado vacío de antes de generar.
+    $test->assertFormSet(['name_es' => 'Sentadilla']);
+
+    // Con el formulario ya sincronizado, un "Save" posterior (aunque no
+    // toque nada más) debe conservar la traducción, nunca borrarla.
+    $test->call('save')->assertHasNoFormErrors();
+
+    $fresh = $exercise->fresh();
+    expect($fresh->name_es)->toBe('Sentadilla');
+    expect($fresh->instructions_es)->toBe(['Dobla las rodillas.']);
 });
 
 it('Spanish content fields are editable directly from the edit form, independent of the generation action', function () {
