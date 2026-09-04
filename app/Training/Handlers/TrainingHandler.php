@@ -128,7 +128,7 @@ class TrainingHandler implements HandlerInterface
             $pendingFieldBeforeTurn = $profile->firstMissingOnboardingField($contact);
 
             $aiCallStartedAt = microtime(true);
-            $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant);
+            $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant, $pendingFieldBeforeTurn);
             $aiCallElapsedMs = (int) round((microtime(true) - $aiCallStartedAt) * 1000);
             $extracted = $result['extracted'];
 
@@ -276,7 +276,7 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
-     * @param array{workout_session_id: int, unreported_exercises: array} $activeSessionData
+     * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
      * @return bool true if this message was handled as a report attempt
      *              (successfully or not) and no further processing should
      *              happen this turn; false to let the caller fall through

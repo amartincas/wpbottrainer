@@ -77,6 +77,11 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         $query = $this->buildBrowseQuery($criteria);
         $query['page'] = $page;
 
+        // A diferencia de fetchPage()/fetchAndLocate(), esta ruta respeta
+        // el filtro completo del criteria (muscleFocus/hasVideo) — por
+        // eso arma su propia query en vez de reutilizar fetchPage(), que
+        // es deliberadamente sin filtro (localizar un id concreto en TODO
+        // el catálogo). Misma forma de parseo/excepción que fetchPage().
         $response = $this->client()->get('/exercises', $query);
 
         if ($response->failed()) {
@@ -174,24 +179,93 @@ class YMoveExerciseProvider implements ExerciseProviderInterface
         return $this->fetchAndLocate($providerExerciseId, includeVideos: true);
     }
 
+    /**
+     * Hito 9.3 (fix post-E2E) — hallazgo real: esta función solo miraba la
+     * página 1 (~20 de 1068 ítems del catálogo real), así que un id fuera
+     * de esa página SIEMPRE resolvía a null (video ausente en WhatsApp sin
+     * ningún error visible). La API pública auditada no expone un endpoint
+     * /exercises/{id} — localizar por id sigue siendo "listar y buscar",
+     * pero ahora recorre tantas páginas como YMove reporte de verdad
+     * (nunca un número asumido), en dos fases para no gastar cuota de más:
+     *
+     *  Fase 1 — SIEMPRE en modo browse (includeVideos=false, gratis), sin
+     *  importar si el llamador quiere video: localizar en qué página vive
+     *  el id nunca cuesta cuota.
+     *  Fase 2 — solo si $includeVideos=true: UNA única llamada adicional,
+     *  acotada a esa página exacta (≈20 ítems), nunca al catálogo completo.
+     *
+     * Un fallo real de HTTP (ProviderSyncException, ver searchPaged())
+     * se traduce a null aquí — find()/resolveMedia()/variants() prometían
+     * ese contrato desde antes de este fix, y ninguno de sus llamadores
+     * (MediaResolver incluido) espera una excepción.
+     */
     private function fetchAndLocate(string $providerExerciseId, bool $includeVideos): ?ProviderExerciseData
     {
-        // La API pública auditada expone el detalle vía el listado
-        // filtrado (no hay un endpoint /exercises/{id} confirmado en la
-        // prueba técnica real) — se busca sin filtro de músculo y se
-        // localiza por id. Aceptable para el volumen de MVP (sección 9 del
-        // diseño); revisar si el catálogo real crece mucho más.
-        $response = $this->client()->get('/exercises', [
-            'includeVideos' => $includeVideos ? 'true' : 'false',
-        ]);
+        $page = 1;
+        $found = null;
+        $totalPages = null;
 
-        if ($response->failed()) {
+        do {
+            try {
+                $result = $this->fetchPage($page, includeVideos: false);
+            } catch (ProviderSyncException) {
+                return null;
+            }
+
+            $found = $result->items->firstWhere('providerExerciseId', $providerExerciseId);
+            $totalPages = $result->totalPages;
+            $page++;
+        } while ($found === null && $totalPages !== null && $page <= $totalPages);
+
+        if ($found === null) {
             return null;
         }
 
-        $raw = collect($response->json('data', []))->firstWhere('id', $providerExerciseId);
+        if (! $includeVideos) {
+            return $found;
+        }
 
-        return $raw !== null ? new ProviderExerciseData($providerExerciseId, $raw) : null;
+        try {
+            $withVideo = $this->fetchPage($page - 1, includeVideos: true);
+        } catch (ProviderSyncException) {
+            return null;
+        }
+
+        return $withVideo->items->firstWhere('providerExerciseId', $providerExerciseId);
+    }
+
+    /**
+     * Una sola página cruda del catálogo — extraído de searchPaged() para
+     * que fetchAndLocate() pueda reutilizar exactamente la misma forma de
+     * pedir/parsear una página (incluida la excepción en fallo real) sin
+     * duplicar lógica.
+     */
+    private function fetchPage(int $page, bool $includeVideos): ProviderSearchPage
+    {
+        $response = $this->client()->get('/exercises', [
+            'includeVideos' => $includeVideos ? 'true' : 'false',
+            'page' => $page,
+        ]);
+
+        if ($response->failed()) {
+            throw new ProviderSyncException(
+                "YMove respondió con error al pedir la página {$page}: HTTP {$response->status()}."
+            );
+        }
+
+        $items = collect($response->json('data', []))
+            ->filter(fn (array $raw) => isset($raw['id']))
+            ->map(fn (array $raw) => new ProviderExerciseData($raw['id'], $raw))
+            ->values();
+
+        $pagination = $response->json('pagination');
+
+        return new ProviderSearchPage(
+            items: $items,
+            page: (int) ($pagination['page'] ?? $page),
+            totalPages: isset($pagination['totalPages']) ? (int) $pagination['totalPages'] : null,
+            totalItems: isset($pagination['total']) ? (int) $pagination['total'] : null,
+        );
     }
 
     private function client(): PendingRequest

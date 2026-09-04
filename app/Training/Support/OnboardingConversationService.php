@@ -79,10 +79,10 @@ class OnboardingConversationService
     /**
      * Extract + Narrate en una sola llamada.
      *
-     * @param array<string, mixed>|null $knownProfile el ContextFragment
-     *        `training_profile` actual (campos ya respondidos, incluido el
-     *        nombre desde Contact), para que la IA no vuelva a preguntar lo
-     *        que ya sabe.
+     * @param  array<string, mixed>|null  $knownProfile  el ContextFragment
+     *                                                   `training_profile` actual (campos ya respondidos, incluido el
+     *                                                   nombre desde Contact), para que la IA no vuelva a preguntar lo
+     *                                                   que ya sabe.
      * @return array{
      *     extracted: array{
      *         name: ?string, goal: ?string, experience_level: ?string,
@@ -96,7 +96,20 @@ class OnboardingConversationService
      *     response: ?string,
      * }
      */
-    public function extractAndRespond(string $messageBody, ?array $knownProfile, Tenant $tenant): array
+    /**
+     * @param  string|null  $pendingField  el campo que TrainingProfile::
+     *                                     firstMissingOnboardingField() determinó como pendiente ANTES
+     *                                     de este turno (name/goal/experience_level/primary_focus/...).
+     *                                     Hito 9.3 (fix post-E2E) — sin esto, la IA no tenía forma de
+     *                                     saber a QUÉ pregunta estaba respondiendo el usuario: un
+     *                                     mensaje corto y ambiguo ("piernas", "no") se interpretaba sin
+     *                                     contexto y a veces no se extraía a ningún campo. $pendingField
+     *                                     es una SEÑAL para la extracción, nunca autoridad — el código
+     *                                     sigue siendo el único que decide qué falta de verdad
+     *                                     (TrainingProfile::firstMissingOnboardingField()), exactamente
+     *                                     igual que antes de este fix.
+     */
+    public function extractAndRespond(string $messageBody, ?array $knownProfile, Tenant $tenant, ?string $pendingField = null): array
     {
         $empty = $this->emptyResult();
 
@@ -106,7 +119,7 @@ class OnboardingConversationService
 
         try {
             $ai = AIServiceFactory::make($tenant);
-            $raw = $ai->getResponse($messageBody, $this->buildCombinedPrompt($knownProfile ?? []), []);
+            $raw = $ai->getResponse($messageBody, $this->buildCombinedPrompt($knownProfile ?? [], $pendingField), []);
 
             return $this->parseCombinedJson($raw);
         } catch (\Throwable $e) {
@@ -137,6 +150,24 @@ class OnboardingConversationService
         $expectedAction = self::NEXT_ACTION_MAP[$realMissingField] ?? null;
 
         return $expectedAction !== null && $aiNextAction === $expectedAction && $this->isUsableResponse($aiResponse);
+    }
+
+    /**
+     * Hito 9.3 (fix post-E2E). Sin esta línea, la IA extraía el mensaje del
+     * usuario sin saber a qué pregunta respondía — un "piernas" o un "no"
+     * sueltos, sin ese contexto, a veces no se lograban clasificar en
+     * ningún campo. Devuelve cadena vacía si no hay campo pendiente
+     * reconocido (nunca bloquea la extracción por esto).
+     */
+    private function buildPendingFieldContext(?string $pendingField): string
+    {
+        $label = self::PENDING_FIELD_LABELS[$pendingField] ?? null;
+
+        if ($label === null) {
+            return '';
+        }
+
+        return "\nLa pregunta que ACABAS de hacerle al usuario, a la que este mensaje probablemente responde, es sobre: {$label}.\n";
     }
 
     private function isUsableResponse(?string $response): bool
@@ -175,15 +206,34 @@ class OnboardingConversationService
         ];
     }
 
-    private function buildCombinedPrompt(array $knownProfile): string
+    /**
+     * Hito 9.3 (fix post-E2E): etiqueta humana de cada campo, SOLO para que
+     * la IA sepa a qué pregunta está respondiendo el mensaje actual — nunca
+     * se le muestra al usuario (eso lo sigue decidiendo resolveQuestion()/
+     * FALLBACK_QUESTIONS). Reutiliza las mismas claves que NEXT_ACTION_MAP.
+     */
+    private const PENDING_FIELD_LABELS = [
+        'name' => 'cómo se llama / cómo quiere que le llamen',
+        'goal' => 'su objetivo general de entrenamiento (perder peso, ganar músculo, condición física general, o resistencia)',
+        'experience_level' => 'su nivel de experiencia entrenando',
+        'primary_focus' => 'si quiere priorizar alguna zona del cuerpo en especial',
+        'training_location' => 'dónde va a entrenar',
+        'available_equipment' => 'qué equipo tiene disponible',
+        'restrictions' => 'si tiene alguna lesión, dolor o limitación física',
+        'sessions_per_week' => 'cuántos días a la semana puede entrenar',
+        'physical_stats' => 'sus datos físicos (edad/sexo/peso/estatura), opcionales',
+    ];
+
+    private function buildCombinedPrompt(array $knownProfile, ?string $pendingField = null): string
     {
         $known = json_encode($knownProfile);
+        $pendingContext = $this->buildPendingFieldContext($pendingField);
 
         return <<<PROMPT
 Eres un entrenador personal cercano, escribiendo por WhatsApp en español, ayudando a un usuario a configurar su perfil de entrenamiento.
 
 Perfil ya conocido (no lo repitas ni lo cambies si ya está aquí, salvo que el usuario lo corrija explícitamente): {$known}
-
+{$pendingContext}
 Del mensaje del usuario, extrae ÚNICAMENTE lo que menciona explícitamente. NUNCA inventes ni asumas un valor que no fue mencionado.
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin explicación) con esta forma exacta:
@@ -231,6 +281,8 @@ Reglas de "extracted":
   Si el usuario menciona una zona con MENOR énfasis o de forma secundaria junto a la principal (ej. "sobre todo glúteos, y algo de espalda también"), la principal va en "primary_focus" y la secundaria en "secondary_focus" — NUNCA reveles ni menciones estos dos términos técnicos al usuario, son solo para uso interno.
 - Puedes extraer VARIOS campos de un mismo mensaje si el usuario los menciona juntos (ej. "Me llamo Ana, entreno en un gimnasio y tengo de todo" → name, training_location y equipment_fully_equipped los tres a la vez).
 - Los datos físicos (age/sex/weight_kg/height_cm) son opcionales para el usuario — si responde "prefiero no decir" o cambia de tema, dejas esos campos en null, nunca insistas ni los inventes.
+- Si la pregunta pendiente indicada arriba es sobre el OBJETIVO GENERAL ("goal") y el usuario responde mencionando una o más zonas del cuerpo a priorizar (una respuesta de tipo "foco", ej. "piernas", "quiero trabajar glúteos") SIN mencionar ninguno de los 4 objetivos generales de la lista cerrada, extrae esas zonas en "primary_focus"/"secondary_focus" según corresponda (usando la tabla de traducción de más abajo) y deja "goal" en null — el objetivo general sigue sin responderse, nunca lo inventes ni lo fuerces a partir de una respuesta de foco. Esto aplica de forma general a cualquier zona del cuerpo, no solo a los ejemplos mencionados aquí.
+- Si la pregunta pendiente indicada arriba es sobre RESTRICCIONES/lesiones ("restrictions") y el usuario responde con cualquier negación natural (de cualquier forma: "no", "no tengo", "ninguna", "ninguno", "nada", "no la verdad", o equivalente), SIN mencionar ninguna lesión o limitación real, interpreta esto como una respuesta explícita de "sin restricciones" y usa restrictions: [] — nunca lo dejes en null en este caso (null significa "todavía no respondió", no "respondió que no tiene ninguna"). Esta regla es sobre el PATRÓN semántico de una negación directa a esa pregunta, no una lista fija de frases — reconoce cualquier forma natural equivalente en español.
 
 Reglas de "next_action": indica cuál de estos campos pendientes sigue sin responderse, en este orden de prioridad: name, goal, experience_level, primary_focus, training_location, available_equipment, restrictions, sessions_per_week, y por último (opcional) datos físicos. Usa "complete_onboarding" solo si ya no falta nada de lo anterior. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
 

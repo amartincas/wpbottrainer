@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Exercise;
+use App\Models\User;
 use App\Training\Enums\TrackingType;
 
 it('casts array and boolean fields correctly', function () {
@@ -55,7 +56,7 @@ it('produces a snapshot with exactly the fields shown to the user', function () 
 it('rejects saving an Exercise that has both a provider and a direct video_url', function () {
     $exercise = Exercise::factory()->fromProvider('ymove')->make(['video_url' => 'https://ymove.example/video.mp4']);
 
-    expect(fn () => $exercise->save())->toThrow(\DomainException::class);
+    expect(fn () => $exercise->save())->toThrow(DomainException::class);
 });
 
 it('allows a manual exercise (no provider) to keep its own stable video_url', function () {
@@ -75,15 +76,15 @@ it('starts a provider-imported exercise as inactive with unreviewed contraindica
 
 it('refuses to activate an exercise whose contraindications were never reviewed', function () {
     $exercise = Exercise::factory()->fromProvider('ymove')->create();
-    $reviewer = \App\Models\User::factory()->create();
+    $reviewer = User::factory()->create();
 
-    expect(fn () => $exercise->activate($reviewer))->toThrow(\DomainException::class);
+    expect(fn () => $exercise->activate($reviewer))->toThrow(DomainException::class);
     expect($exercise->fresh()->is_active)->toBeFalse();
 });
 
 it('activates an exercise only after a human explicitly confirms contraindications, even an empty list', function () {
     $exercise = Exercise::factory()->fromProvider('ymove')->create(['contraindications' => null]);
-    $reviewer = \App\Models\User::factory()->create();
+    $reviewer = User::factory()->create();
 
     // Un humano revisa y confirma que no hay ninguna conocida — [] es una
     // respuesta válida y completa, nunca asumida automáticamente.
@@ -99,14 +100,14 @@ it('activates an exercise only after a human explicitly confirms contraindicatio
 // ── Hito 9.2: técnica de ejecución — asimetría de curación, punto 7 ─────
 
 it('blocks activation when contraindications or instructions are missing, but never for the optional technique fields', function () {
-    $reviewer = \App\Models\User::factory()->create();
+    $reviewer = User::factory()->create();
 
     // contraindications = null → NO puede activarse.
     $missingContraindications = Exercise::factory()->fromProvider('ymove')->create([
         'contraindications' => null,
         'instructions' => ['Paso 1'],
     ]);
-    expect(fn () => $missingContraindications->activate($reviewer))->toThrow(\DomainException::class);
+    expect(fn () => $missingContraindications->activate($reviewer))->toThrow(DomainException::class);
 
     // instructions = [] → NO puede activarse (aunque contraindications ya
     // esté revisado).
@@ -114,7 +115,7 @@ it('blocks activation when contraindications or instructions are missing, but ne
         'contraindications' => [],
         'instructions' => [],
     ]);
-    expect(fn () => $missingInstructions->activate($reviewer))->toThrow(\DomainException::class);
+    expect(fn () => $missingInstructions->activate($reviewer))->toThrow(DomainException::class);
 
     // important_points / common_mistakes / breathing_cue en null → SÍ
     // puede activarse — son contenido opcional, nunca bloquean.
@@ -128,4 +129,52 @@ it('blocks activation when contraindications or instructions are missing, but ne
     $readyDespiteMissingTechnique->activate($reviewer);
 
     expect($readyDespiteMissingTechnique->fresh()->is_active)->toBeTrue();
+});
+
+// ── Hito 9.3 (fix post-E2E): contenido en español, preferido en snapshot ──
+
+it('snapshot uses the original English content when no Spanish translation exists yet', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create([
+        'name' => 'Squat',
+        'instructions' => ['Bend your knees.'],
+        'important_points' => ['Keep your back straight.'],
+        'name_es' => null,
+        'instructions_es' => null,
+        'important_points_es' => null,
+    ]);
+
+    $snapshot = $exercise->toSnapshot();
+
+    expect($snapshot['name'])->toBe('Squat');
+    expect($snapshot['instructions'])->toBe(['Bend your knees.']);
+    expect($snapshot['important_points'])->toBe(['Keep your back straight.']);
+});
+
+it('snapshot prefers the curated Spanish content once generated, without losing the original English columns', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create([
+        'name' => 'Squat',
+        'instructions' => ['Bend your knees.'],
+        'important_points' => ['Keep your back straight.'],
+        'name_es' => 'Sentadilla',
+        'instructions_es' => ['Dobla las rodillas.'],
+        'important_points_es' => ['Mantén la espalda recta.'],
+    ]);
+
+    $snapshot = $exercise->toSnapshot();
+
+    expect($snapshot['name'])->toBe('Sentadilla');
+    expect($snapshot['instructions'])->toBe(['Dobla las rodillas.']);
+    expect($snapshot['important_points'])->toBe(['Mantén la espalda recta.']);
+    // El original nunca se pierde ni se sobreescribe.
+    expect($exercise->fresh()->name)->toBe('Squat');
+    expect($exercise->fresh()->instructions)->toBe(['Bend your knees.']);
+});
+
+it('snapshot treats an explicitly empty important_points_es ([]) as a real translated answer, not as "not translated yet"', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create([
+        'important_points' => ['English point.'],
+        'important_points_es' => [],
+    ]);
+
+    expect($exercise->toSnapshot()['important_points'])->toBe([]);
 });

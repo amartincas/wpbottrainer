@@ -7,6 +7,7 @@ use App\Training\Enums\TrackingType;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\Textarea;
+use Filament\Forms\Components\TextInput;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Text;
 use Filament\Schemas\Schema;
@@ -44,6 +45,22 @@ class ExerciseForm
                         ->columnSpanFull(),
                     Text::make(fn ($record) => 'Important points: '.($record?->important_points ? implode(' · ', $record->important_points) : '—'))
                         ->columnSpanFull(),
+                ]),
+
+            Section::make('Contenido en español (generado por IA en curación — editable)')
+                ->description('Se genera con la acción "Generar contenido en español" (arriba). Nunca se regenera automáticamente ni se usa en el envío en tiempo real — TrainingHandler/ExerciseMessageFormatter siguen leyendo solo el snapshot ya congelado de cada sesión. Mientras estos campos estén vacíos, el usuario recibe el contenido original tal cual (ver Exercise::toSnapshot()).')
+                ->schema([
+                    TextInput::make('name_es')
+                        ->label('Nombre (ES)')
+                        ->placeholder('Sin generar todavía'),
+                    TagsInput::make('instructions_es')
+                        ->label('Instrucciones (ES)')
+                        ->helperText('Debe tener el mismo número de pasos, en el mismo orden, que "Instructions" arriba.')
+                        ->columnSpanFull(),
+                    TagsInput::make('important_points_es')
+                        ->label('Puntos importantes (ES)')
+                        ->columnSpanFull(),
+                    Text::make(fn ($record) => 'Última generación/edición: '.($record?->content_translated_at?->diffForHumans() ?? 'nunca')),
                 ]),
 
             Section::make('Seguridad — requerido para activar')

@@ -99,6 +99,68 @@ it('re-syncing an already-imported exercise updates its metadata but never touch
 });
 
 /**
+ * Hito 9.3 (fix post-E2E) — comprobación explícita pedida por el usuario
+ * antes de commitear: name_es/instructions_es/important_points_es
+ * sobreviven tanto a un re-sync (fullSync()/upsert() no los incluye en
+ * $attributes, ver ExerciseImporter::upsert()) como a activate() (solo
+ * escribe is_active/contraindications_reviewed_*, nunca contenido) — y
+ * provider_has_video sigue siendo 100% independiente de is_active.
+ */
+it('preserves already-generated Spanish content through both a re-sync and activation, and keeps provider_has_video independent of is_active', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::sequence()
+        ->push(['data' => [[
+            'id' => 'abc-123', 'title' => 'Barbell Hip Thrust', 'muscleGroup' => 'glutes', 'equipment' => 'barbell',
+            'instructions' => ['Step 1'], 'hasVideo' => true,
+        ]]], 200)
+        ->push(['data' => [[
+            'id' => 'abc-123', 'title' => 'Updated Barbell Hip Thrust', 'muscleGroup' => 'glutes', 'equipment' => 'barbell',
+            'instructions' => ['Step 1 updated'], 'hasVideo' => false,
+        ]]], 200),
+    ]);
+
+    $importer = new ExerciseImporter(new ProviderRegistry);
+    $importer->importSearch('ymove', new ProviderSearchCriteria);
+
+    $exercise = Exercise::where('provider_exercise_id', 'abc-123')->first();
+    $exercise->update([
+        'contraindications' => [],
+        'name_es' => 'Empuje de cadera con barra',
+        'instructions_es' => ['Paso 1'],
+        'important_points_es' => [],
+    ]);
+
+    // 3. activate() con contenido español ya generado no lo pierde.
+    $reviewer = User::factory()->create();
+    $exercise->activate($reviewer);
+    $exercise->refresh();
+
+    expect($exercise->is_active)->toBeTrue();
+    expect($exercise->name_es)->toBe('Empuje de cadera con barra');
+    expect($exercise->instructions_es)->toBe(['Paso 1']);
+    expect($exercise->important_points_es)->toBe([]);
+
+    // 4. toSnapshot() ya usa el español mientras está activo.
+    expect($exercise->toSnapshot()['name'])->toBe('Empuje de cadera con barra');
+    expect($exercise->toSnapshot()['instructions'])->toBe(['Paso 1']);
+
+    // 1. un re-sync NO destruye el contenido en español, sin importar que
+    // la metadata original cambie de verdad.
+    $importer->importSearch('ymove', new ProviderSearchCriteria);
+    $exercise->refresh();
+
+    expect($exercise->name)->toBe('Updated Barbell Hip Thrust'); // original sí se refresca
+    expect($exercise->name_es)->toBe('Empuje de cadera con barra'); // español, intacto
+    expect($exercise->instructions_es)->toBe(['Paso 1']);
+    expect($exercise->important_points_es)->toBe([]);
+    expect($exercise->is_active)->toBeTrue(); // revisión humana también intacta
+
+    // 5. provider_has_video siempre refleja al proveedor, sin relación con
+    // is_active ni con el contenido curado — cambió a false en este
+    // re-sync y el ejercicio sigue activo con su traducción intacta.
+    expect($exercise->provider_has_video)->toBeFalse();
+});
+
+/**
  * Hito 9.3 — el comando ahora corre sobre ExerciseImporter::fullSync(),
  * que pagina de verdad usando la paginación real del proveedor (antes,
  * `importSearch()` solo pedía una página — riesgo real de desactivación

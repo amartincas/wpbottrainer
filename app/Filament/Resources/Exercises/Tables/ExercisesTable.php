@@ -2,14 +2,17 @@
 
 namespace App\Filament\Resources\Exercises\Tables;
 
+use App\ExerciseCatalog\Curation\ExerciseSpanishContentGenerator;
 use App\ExerciseCatalog\ProviderRegistry;
 use App\Models\Exercise;
+use App\Models\Tenant;
 use App\Models\User;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
 use Filament\Actions\Action;
 use Filament\Actions\EditAction;
+use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
 use Filament\Notifications\Notification;
 use Filament\Tables\Columns\IconColumn;
@@ -91,6 +94,11 @@ class ExercisesTable
                         'inactive' => 'gray',
                     })
                     ->formatStateUsing(fn (string $state) => str($state)->headline()),
+                IconColumn::make('name_es')
+                    ->label('ES')
+                    ->boolean()
+                    ->state(fn (Exercise $record) => $record->name_es !== null)
+                    ->tooltip(fn (Exercise $record) => $record->content_translated_at?->diffForHumans() ?? 'Sin traducir todavía'),
                 TextColumn::make('synced_at')
                     ->label('Synced')
                     ->since()
@@ -171,6 +179,55 @@ class ExercisesTable
                         $record->update(['is_active' => false]);
 
                         Notification::make()->title('Ejercicio desactivado')->success()->send();
+                    }),
+
+                // Hito 9.3 (fix post-E2E) — genera name_es/instructions_es/
+                // important_points_es mediante IA. Solo disponible para
+                // ejercicios todavía en revisión: nunca reescribe contenido
+                // ya activo sin que un admin lo desactive primero a
+                // propósito. NUNCA activa el ejercicio ni toca is_active —
+                // ver App\ExerciseCatalog\Curation\ExerciseSpanishContentGenerator.
+                Action::make('generateSpanishContent')
+                    ->label('Generar contenido en español')
+                    ->color('info')
+                    ->icon('heroicon-o-language')
+                    ->visible(fn (Exercise $record): bool => Auth::user()?->is_super_admin
+                        && $record->reviewStatus() === 'pending_review')
+                    ->schema([
+                        Select::make('tenant_id')
+                            ->label('Credenciales de IA a usar (por tenant)')
+                            ->helperText('El sistema todavía no tiene una configuración de IA independiente de un tenant — se reutiliza la de un tenant existente. Ver informe Hito 9.3.')
+                            ->options(fn () => Tenant::whereNotNull('ai_api_key')->pluck('name', 'id'))
+                            ->native(false)
+                            ->required(),
+                    ])
+                    ->requiresConfirmation()
+                    ->modalDescription('Genera name/instructions/important_points en español mediante IA, a partir del contenido original. Nunca sobreescribe el original ni activa el ejercicio — queda editable en la página de edición.')
+                    ->action(function (Exercise $record, array $data): void {
+                        $tenant = Tenant::find($data['tenant_id']);
+
+                        try {
+                            $result = app(ExerciseSpanishContentGenerator::class)->generate($record, $tenant);
+
+                            $record->update([
+                                'name_es' => $result->name,
+                                'instructions_es' => $result->instructions,
+                                'important_points_es' => $result->importantPoints,
+                                'content_translated_at' => now(),
+                            ]);
+
+                            Notification::make()
+                                ->title('Contenido en español generado')
+                                ->body('Revísalo y edítalo si hace falta antes de activar el ejercicio.')
+                                ->success()
+                                ->send();
+                        } catch (\Throwable $e) {
+                            Notification::make()
+                                ->title('No se pudo generar el contenido en español')
+                                ->body($e->getMessage())
+                                ->danger()
+                                ->send();
+                        }
                     }),
             ]);
     }

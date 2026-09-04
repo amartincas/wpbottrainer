@@ -11,7 +11,6 @@ use Illuminate\Support\Facades\Http;
  * enviar, comparando `next_action` contra el campo que el código YA
  * determinó que falta (nunca al revés). Ver docs/DECISIONS.md (D026).
  */
-
 function fakeCombinedResponse(array $payload): void
 {
     Http::fake([
@@ -422,3 +421,121 @@ it('the combined prompt never exposes the internal primary_focus/secondary_focus
             && str_contains($systemPrompt, 'Nunca uses los términos técnicos');
     });
 });
+
+// ── Hito 9.3 (fix post-E2E): objetivo vs. foco, y respuestas negativas ──
+
+it('tells the AI which question is pending, so a short ambiguous answer can be classified with context', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'piernas',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'goal',
+    );
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'La pregunta que ACABAS de hacerle al usuario')
+            && str_contains($systemPrompt, 'objetivo general de entrenamiento');
+    });
+});
+
+it('never injects a "pending question" line when no pending field is given (backward compatible)', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return ! str_contains($systemPrompt, 'La pregunta que ACABAS de hacerle al usuario');
+    });
+});
+
+it('the combined prompt explicitly instructs the AI to route a focus-shaped answer to a pending goal question into primary_focus, never into goal', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'piernas',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'goal',
+    );
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'SIN mencionar ninguno de los 4 objetivos generales de la lista cerrada, extrae esas zonas en "primary_focus"')
+            && str_contains($systemPrompt, 'nunca lo inventes ni lo fuerces a partir de una respuesta de foco');
+    });
+});
+
+it('end-to-end: a focus-shaped answer to the pending goal question is extracted as primary_focus, goal stays null, and next_action asks for goal again', function () {
+    // Simula lo que se espera de un LLM que sigue la nueva instrucción del
+    // prompt: no fuerza "piernas" dentro de goal, lo extrae como foco, y
+    // sigue pidiendo el objetivo real.
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['primary_focus' => ['quads', 'hamstrings', 'glutes', 'calves']]),
+        'next_action' => 'ask_goal',
+        'response' => 'Anotado que quieres priorizar piernas. ¿Y cuál es tu objetivo principal: perder peso, ganar músculo, condición física o resistencia?',
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'piernas',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'goal',
+    );
+
+    expect($result['extracted']['goal'])->toBeNull();
+    expect($result['extracted']['primary_focus'])->toBe(['quads', 'hamstrings', 'glutes', 'calves']);
+
+    $service = new OnboardingConversationService;
+    // El campo real pendiente sigue siendo 'goal' (primary_focus no tiene
+    // prioridad sobre goal) — resolveQuestion() debe usar la respuesta de
+    // la IA porque next_action coincide con el campo real pendiente.
+    $question = $service->resolveQuestion('goal', $result['next_action'], $result['response']);
+    expect($question)->toBe($result['response']);
+    expect($service->usedAiResponse('goal', $result['next_action'], $result['response']))->toBeTrue();
+});
+
+it('the combined prompt explicitly instructs the AI to accept a bare negation to the pending restrictions question as restrictions: []', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'no',
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'restrictions',
+    );
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'interpreta esto como una respuesta explícita de "sin restricciones" y usa restrictions: []')
+            && str_contains($systemPrompt, 'no una lista fija de frases');
+    });
+});
+
+// 27. end-to-end, una por cada frase de ejemplo pedida explícitamente (Hito 9.3)
+it('end-to-end: common negative-response phrasings for restrictions are all accepted as restrictions: [], never re-asked as unanswered', function (string $phrase) {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['restrictions' => []]),
+        'next_action' => 'complete_onboarding',
+        'response' => '¡Perfecto!',
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        $phrase,
+        [],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'restrictions',
+    );
+
+    // [] (respondido, sin ninguna) — nunca null (todavía sin responder).
+    expect($result['extracted']['restrictions'])->toBe([]);
+})->with([
+    'no', 'No', 'ninguna', 'ninguno', 'no tengo', 'nada', 'no, ninguna',
+]);

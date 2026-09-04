@@ -13,10 +13,13 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'name',
+    'name_es',
     'slug',
     'description',
     'instructions',
+    'instructions_es',
     'important_points',
+    'important_points_es',
     'common_mistakes',
     'breathing_cue',
     'video_url',
@@ -36,6 +39,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'exercise_type',
     'video_duration_seconds',
     'synced_at',
+    'content_translated_at',
     'contraindications_reviewed_at',
     'contraindications_reviewed_by',
 ])]
@@ -47,7 +51,9 @@ class Exercise extends Model
     {
         return [
             'instructions' => 'array',
+            'instructions_es' => 'array',
             'important_points' => 'array',
+            'important_points_es' => 'array',
             'common_mistakes' => 'array',
             'primary_muscle' => MuscleFocus::class,
             'secondary_muscles' => 'array',
@@ -61,6 +67,7 @@ class Exercise extends Model
             'exercise_type' => 'array',
             'video_duration_seconds' => 'integer',
             'synced_at' => 'datetime',
+            'content_translated_at' => 'datetime',
             'contraindications_reviewed_at' => 'datetime',
         ];
     }
@@ -187,13 +194,26 @@ class Exercise extends Model
      * congelado, nunca del `Exercise` en vivo, para que una mejora futura
      * de la técnica de un ejercicio no reescriba retroactivamente lo que
      * un usuario ya recibió.
+     *
+     * Hito 9.3 (fix post-E2E) — `name`/`instructions`/`important_points`
+     * usan la versión en español curada (`*_es`) cuando existe, con el
+     * original (típicamente inglés, tal cual lo entrega el proveedor)
+     * como fallback si todavía no se generó traducción. Esta es la ÚNICA
+     * pieza de este fix con efecto en el envío real: nunca se llama a la
+     * IA aquí ni en ningún punto del envío — la traducción ya existe,
+     * generada de antemano en curación (ver
+     * App\ExerciseCatalog\Curation\ExerciseSpanishContentGenerator),
+     * este método solo elige cuál de las dos columnas ya guardadas usar.
+     * `ExerciseMessageFormatter`/`TrainingEngine`/`TrainingHandler` no
+     * cambian ni saben que esto ocurre — siguen leyendo el snapshot ya
+     * congelado como siempre.
      */
     public function toSnapshot(): array
     {
         return [
-            'name' => $this->name,
-            'instructions' => $this->instructions,
-            'important_points' => $this->important_points,
+            'name' => $this->name_es ?? $this->name,
+            'instructions' => $this->instructions_es ?? $this->instructions,
+            'important_points' => $this->important_points_es ?? $this->important_points,
             'common_mistakes' => $this->common_mistakes,
             'breathing_cue' => $this->breathing_cue,
             'video_url' => $this->video_url,
