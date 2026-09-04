@@ -262,6 +262,21 @@ No existe todavía ningún test de un proveedor de memoria *real* (Training) por
 
 **Qué NO demuestra esta cobertura, explícitamente**: el shape de la respuesta 200-con-video (con `videoUrl`/`videos[]`) del endpoint `/exercises/{id}` no se verificó en vivo — solo el shape de la respuesta browse (`includeVideos=false`, confirmado en vivo, sin costo de cuota). Verificar el shape exacto con video requeriría una llamada `includeVideos=true` real, explícitamente prohibida mientras la cuenta esté sobre su cupo (114/100).
 
+## Cobertura: equipamiento canónico, candidatos de curación y "video validado" (ver D042)
+
+24 tests nuevos netos, **100% con mocks/factories — cero llamadas reales a YMove**.
+
+| Categoría | Dónde |
+|---|---|
+| **Onboarding acepta vocabulario canónico, descarta texto libre** | `OnboardingConversationServiceTest.php` (+4) — valores válidos de `Equipment` pasan; texto libre en español ("máquinas", "pesas") se descarta a `[]`, reproduciendo el bug real encontrado; `[]` explícito se acepta como respuesta completa; el prompt incluye la tabla de traducción completa (mancuernas→dumbbells, máquina smith→smith_machine, etc.) y la instrucción de omitir en vez de forzar una traducción incorrecta. |
+| **Normalizer cubre el vocabulario oficial completo** | `YMoveExerciseNormalizerTest.php` (+2) — los 13 valores agregados (`mat`, `chair`, `box`, `weighted vest`, `smith machine`, `stability ball`, `wall`, `cone`, `free weights`, `landmine`, `foam roller`, `step`, `towel`) mapean correctamente; un valor crudo fuera incluso del vocabulario oficial degrada a `[]` sin lanzar. |
+| **Backfill local sin llamadas a YMove** | `BackfillExerciseEquipmentTest.php` (nuevo, 4) — re-deriva `equipment_needed` desde `provider_metadata` ya guardado; no cuenta ni toca lo que ya estaba correcto; nunca toca ejercicios de otro proveedor; falla claro (sin tocar datos) ante un proveedor desconocido. |
+| **Registro de video validado** | `MediaResolverTest.php` (+5) — registra el acceso exitoso con provider/provider_exercise_id/variant/resolved_at; nunca para un ejercicio manual; nunca si la resolución falla o devuelve null; se acumula un historial real (2 resoluciones = 2 filas); un fallo al escribir el registro nunca impide que el video ya resuelto se entregue. |
+| **`videoValidated()`/`scopeWithReviewStatus()`** | `ExerciseTest.php` (+4) — falso sin ningún acceso registrado; verdadero tras uno, independiente de `provider_has_video`; funciona igual con o sin eager-loading de la relación; el scope filtra exactamente igual que `reviewStatus()` computa, para los 3 estados. |
+| **Filament: columnas y filtros nuevos** | `ExerciseResourceTest.php` (+5) — columna "video validado" refleja el registro propio, no `provider_has_video`; columna "cobertura activa" cuenta correctamente los ejercicios ya activos del mismo `primary_muscle`; filtro `review_status` (tri-estado); filtro `video_validated`; filtro `equipment` contra el vocabulario ya normalizado, vía `whereJsonContains`. |
+
+**Qué NO demuestra esta cobertura, explícitamente**: no se verificó el backfill de `equipment_needed` contra el catálogo real de 1068 ejercicios (el comando se probó con fixtures, no se ejecutó en producción); no se normalizaron perfiles de usuario ya existentes con equipamiento en texto libre (ver riesgos en D042).
+
 ## Cobertura de validación E2E con el payload real de Meta (Hito 7)
 
 `tests/Feature/MetaWebhookTrainingE2ETest.php` (6 tests) — a diferencia de todos los tests anteriores (que construyen `ProcessWhatsAppMessage` directamente en PHP), estos hacen `postJson('/api/whatsapp/webhook/{token}')` con la estructura **completa** que Meta realmente envía (`object`, `entry[].id`, `changes[].field`, `contacts`, `messages[].timestamp`) — ejercitando el parseo real de `WhatsAppController` de punta a punta. Posible en tests porque `QUEUE_CONNECTION=sync` (`phpunit.xml`) ejecuta el Job dentro de la misma petición.

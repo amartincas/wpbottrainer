@@ -57,7 +57,17 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         'chest' => 'chest', 'back' => 'back', 'shoulders' => 'shoulders',
     ];
 
-    /** @var array<string, Equipment[]> */
+    /**
+     * Hito 9.3 (post-deploy, corrección) — completo contra el vocabulario
+     * OFICIAL y exhaustivo de YMove (`GET /exercises/equipment`, endpoint
+     * de metadata sin costo de cuota, 22 valores reales confirmados en
+     * vivo). Antes de esta corrección solo cubría 11 — cualquier ejercicio
+     * con uno de los otros 11 caía silenciosamente en `equipment_needed=[]`
+     * ("sin equipo") sin que nada lo señalara. `pull-up bar` de YMove usa
+     * guion, se preserva tal cual apareció en la auditoría original.
+     *
+     * @var array<string, Equipment[]>
+     */
     private const EQUIPMENT_MAP = [
         'bodyweight' => [],
         'barbell' => [Equipment::Barbell],
@@ -71,6 +81,19 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         'bench' => [Equipment::Bench],
         'pull-up bar' => [Equipment::PullUpBar],
         'medicine ball' => [Equipment::MedicineBall],
+        'mat' => [Equipment::Mat],
+        'chair' => [Equipment::Chair],
+        'box' => [Equipment::Box],
+        'weighted vest' => [Equipment::WeightedVest],
+        'smith machine' => [Equipment::SmithMachine],
+        'stability ball' => [Equipment::StabilityBall],
+        'wall' => [Equipment::Wall],
+        'cone' => [Equipment::Cone],
+        'free weights' => [Equipment::FreeWeights],
+        'landmine' => [Equipment::Landmine],
+        'foam roller' => [Equipment::FoamRoller],
+        'step' => [Equipment::Step],
+        'towel' => [Equipment::Towel],
     ];
 
     /**
@@ -98,11 +121,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
 
         $muscleGroupCoarse = self::MUSCLE_GROUP_COARSE_MAP[$muscleGroupKey] ?? ($muscleGroupKey ?? 'core');
 
-        $equipmentRaw = mb_strtolower(trim((string) ($data['equipment'] ?? '')));
-        $equipmentNeeded = array_map(
-            fn (Equipment $e) => $e->value,
-            self::EQUIPMENT_MAP[$equipmentRaw] ?? []
-        );
+        $equipmentNeeded = $this->mapEquipment($data['equipment'] ?? null);
 
         // Pass-through directo — YMove ya devolvió `difficulty: null` en la
         // prueba técnica real (Barbell Hip Thrust); nunca se infiere.
@@ -133,6 +152,27 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
             videoDurationSeconds: $data['videoDurationSecs'] ?? null,
             rawMetadata: $data,
             hasVideo: isset($data['hasVideo']) ? (bool) $data['hasVideo'] : null,
+        );
+    }
+
+    /**
+     * Hito 9.3 (post-deploy) — extraído a método público (antes en línea
+     * dentro de normalize()) para que un backfill local (ej.
+     * `exercises:renormalize-equipment`) pueda re-derivar
+     * `equipment_needed` de ejercicios YA sincronizados a partir del
+     * `equipment` crudo que cada fila ya conserva en `provider_metadata`
+     * — sin volver a llamar a YMove. Misma tabla, mismo resultado que
+     * durante un sync real.
+     *
+     * @return array<int, string> valores de App\Training\Enums\Equipment
+     */
+    public function mapEquipment(?string $rawEquipment): array
+    {
+        $key = mb_strtolower(trim((string) $rawEquipment));
+
+        return array_map(
+            fn (Equipment $e) => $e->value,
+            self::EQUIPMENT_MAP[$key] ?? []
         );
     }
 

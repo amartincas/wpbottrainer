@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Exercise;
+use App\Models\ExerciseVideoAccess;
 use App\Models\User;
 use App\Training\Enums\TrackingType;
 
@@ -177,4 +178,59 @@ it('snapshot treats an explicitly empty important_points_es ([]) as a real trans
     ]);
 
     expect($exercise->toSnapshot()['important_points'])->toBe([]);
+});
+
+// ── Hito 9.3 (post-deploy): videoValidated() y scopeWithReviewStatus() ──
+
+it('videoValidated() is false when no video access has ever been recorded for this exercise', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+
+    expect($exercise->videoValidated())->toBeFalse();
+});
+
+it('videoValidated() is true once a video access exists, and stays true even if provider_has_video is false', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create(['provider_has_video' => false]);
+
+    ExerciseVideoAccess::create([
+        'exercise_id' => $exercise->id,
+        'provider' => 'ymove',
+        'provider_exercise_id' => $exercise->provider_exercise_id,
+        'variant' => 'default',
+        'resolved_at' => now(),
+    ]);
+
+    // Deliberadamente independiente de provider_has_video — son preguntas
+    // distintas (lo que el proveedor dice vs. lo que nosotros comprobamos).
+    expect($exercise->fresh()->videoValidated())->toBeTrue();
+});
+
+it('videoValidated() works correctly whether or not the relation was eager-loaded', function () {
+    $exercise = Exercise::factory()->fromProvider('ymove')->create();
+    ExerciseVideoAccess::create([
+        'exercise_id' => $exercise->id,
+        'provider' => 'ymove',
+        'provider_exercise_id' => $exercise->provider_exercise_id,
+        'variant' => 'default',
+        'resolved_at' => now(),
+    ]);
+
+    $lazy = Exercise::find($exercise->id);
+    $eager = Exercise::with('videoAccesses')->find($exercise->id);
+
+    expect($lazy->videoValidated())->toBeTrue();
+    expect($eager->videoValidated())->toBeTrue();
+});
+
+it('scopeWithReviewStatus filters exactly like reviewStatus() computes, for all three states', function () {
+    $pending = Exercise::factory()->fromProvider('ymove')->create();
+    $active = Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create();
+    $inactive = Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create();
+    $inactive->update(['is_active' => false]);
+
+    expect(Exercise::withReviewStatus('pending_review')->pluck('id'))->toContain($pending->id)
+        ->not->toContain($active->id)->not->toContain($inactive->id);
+    expect(Exercise::withReviewStatus('active')->pluck('id'))->toContain($active->id)
+        ->not->toContain($pending->id)->not->toContain($inactive->id);
+    expect(Exercise::withReviewStatus('inactive')->pluck('id'))->toContain($inactive->id)
+        ->not->toContain($pending->id)->not->toContain($active->id);
 });

@@ -262,17 +262,19 @@ it('extracts name, training_location and equipment_fully_equipped from a single 
 });
 
 it('keeps equipment_fully_equipped false/null when the user names specific equipment instead of declaring broad availability', function () {
-    // "Solo pesas" — equipo específico, no una declaración de "todo".
+    // "Solo pesas" — equipo específico, no una declaración de "todo". Hito
+    // 9.3 (post-deploy): la IA ya traduce al vocabulario cerrado de
+    // Equipment (ver la tabla del prompt), nunca deja "pesas" en español libre.
     fakeCombinedResponse(combinedPayload([
         'extracted' => emptyExtractedForTest([
-            'available_equipment' => ['pesas'],
+            'available_equipment' => ['dumbbells'],
             'equipment_fully_equipped' => null,
         ]),
     ]));
 
     $result = (new OnboardingConversationService)->extractAndRespond('solo pesas', [], Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result['extracted']['available_equipment'])->toBe(['pesas']);
+    expect($result['extracted']['available_equipment'])->toBe(['dumbbells']);
     expect($result['extracted']['equipment_fully_equipped'])->toBeNull();
 });
 
@@ -327,6 +329,60 @@ it('the combined prompt explicitly instructs how to handle broad/ambiguous equip
         return str_contains($systemPrompt, 'tengo de todo')
             && str_contains($systemPrompt, 'equipment_fully_equipped')
             && str_contains($systemPrompt, 'solo pesas');
+    });
+});
+
+// ── Hito 9.3 (post-deploy): available_equipment usa el vocabulario cerrado
+// Equipment — hallazgo real: antes se guardaba texto libre y nunca
+// calzaba contra Exercise.equipment_needed (siempre canónico). ─────────
+
+it('accepts valid canonical Equipment values for available_equipment', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['available_equipment' => ['dumbbells', 'resistance_bands', 'smith_machine']]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['available_equipment'])->toBe(['dumbbells', 'resistance_bands', 'smith_machine']);
+});
+
+it('discards an available_equipment value the LLM left in free-text Spanish instead of the closed vocabulary', function () {
+    // Simula el caso real que causó el bug: la IA (o una versión anterior
+    // del prompt) devuelve la palabra tal cual la dijo el usuario.
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['available_equipment' => ['máquinas', 'pesas']]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    // Ninguno de los dos es un valor válido de Equipment::class — se
+    // descartan, nunca se persiste equipo que TrainingEngine no reconocería.
+    expect($result['extracted']['available_equipment'])->toBe([]);
+});
+
+it('accepts an empty available_equipment as a valid, complete answer — "no tengo nada" is not "not answered"', function () {
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['available_equipment' => []]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond('nada', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['extracted']['available_equipment'])->toBe([]);
+});
+
+it('the combined prompt instructs translating equipment to the closed Equipment vocabulary, covering the full official YMove list', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'mancuernas')
+            && str_contains($systemPrompt, 'dumbbells')
+            && str_contains($systemPrompt, 'máquina smith')
+            && str_contains($systemPrompt, 'smith_machine')
+            && str_contains($systemPrompt, 'omítelo del arreglo');
     });
 });
 

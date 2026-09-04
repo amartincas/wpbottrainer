@@ -1,8 +1,10 @@
 <?php
 
+use App\ExerciseCatalog\Enums\MediaVariant;
 use App\ExerciseCatalog\MediaResolver;
 use App\ExerciseCatalog\ProviderRegistry;
 use App\Models\Exercise;
+use App\Models\ExerciseVideoAccess;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -57,4 +59,72 @@ it('degrades gracefully to null when the exercise references an unknown/unregist
     $exercise = Exercise::factory()->fromProvider('a_provider_that_was_removed', 'abc-123')->create();
 
     expect((new MediaResolver(new ProviderRegistry))->resolve($exercise))->toBeNull();
+});
+
+// ── Hito 9.3 (post-deploy): registro persistente de accesos exitosos ────
+
+it('records a successful provider video resolution in ExerciseVideoAccess', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::response([
+        'data' => ['id' => 'abc-123', 'title' => 'Some exercise', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'videoUrl' => 'https://cdn.ymove.example/fresh.mp4?token=xyz'],
+    ], 200)]);
+
+    $exercise = Exercise::factory()->fromProvider('ymove', 'abc-123')->create();
+
+    (new MediaResolver(new ProviderRegistry))->resolve($exercise, MediaVariant::WhiteBackground);
+
+    expect(ExerciseVideoAccess::count())->toBe(1);
+    $access = ExerciseVideoAccess::first();
+    expect($access->exercise_id)->toBe($exercise->id);
+    expect($access->provider)->toBe('ymove');
+    expect($access->provider_exercise_id)->toBe('abc-123');
+    expect($access->variant)->toBe('white_background');
+    expect($access->resolved_at)->not->toBeNull();
+});
+
+it('never records an access for a manual (non-provider) exercise', function () {
+    $exercise = Exercise::factory()->create(['video_url' => 'https://videos.example.test/demo.mp4']);
+
+    (new MediaResolver(new ProviderRegistry))->resolve($exercise);
+
+    expect(ExerciseVideoAccess::count())->toBe(0);
+});
+
+it('never records an access when resolution fails or returns null', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::response('down', 503)]);
+    $exercise = Exercise::factory()->fromProvider('ymove', 'abc-123')->create();
+
+    (new MediaResolver(new ProviderRegistry))->resolve($exercise);
+
+    expect(ExerciseVideoAccess::count())->toBe(0);
+});
+
+it('appends a new row on every successful resolution, building a real history', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::response([
+        'data' => ['id' => 'abc-123', 'title' => 'Some exercise', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'videoUrl' => 'https://cdn.ymove.example/fresh.mp4?token=xyz'],
+    ], 200)]);
+    $exercise = Exercise::factory()->fromProvider('ymove', 'abc-123')->create();
+    $resolver = new MediaResolver(new ProviderRegistry);
+
+    $resolver->resolve($exercise);
+    $resolver->resolve($exercise);
+
+    expect(ExerciseVideoAccess::where('exercise_id', $exercise->id)->count())->toBe(2);
+});
+
+it('still returns the resolved media even if writing the access log itself fails unexpectedly', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::response([
+        'data' => ['id' => 'abc-123', 'title' => 'Some exercise', 'muscleGroup' => 'glutes', 'equipment' => 'bodyweight', 'videoUrl' => 'https://cdn.ymove.example/fresh.mp4?token=xyz'],
+    ], 200)]);
+
+    // exercise_id apunta a un Exercise que no existe en la BD real -> el
+    // insert en exercise_video_accesses violaría la FK y lanzaría. La
+    // resolución del video en sí NUNCA debe verse afectada por esto.
+    $exercise = Exercise::factory()->fromProvider('ymove', 'abc-123')->make();
+    $exercise->id = 999999;
+    $exercise->exists = true;
+
+    $resolved = (new MediaResolver(new ProviderRegistry))->resolve($exercise);
+
+    expect($resolved)->not->toBeNull();
+    expect($resolved->url)->toBe('https://cdn.ymove.example/fresh.mp4?token=xyz');
 });

@@ -7,6 +7,7 @@ use App\ExerciseCatalog\ProviderRegistry;
 use App\Models\Exercise;
 use App\Models\Tenant;
 use App\Models\User;
+use App\Training\Enums\Equipment;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
@@ -99,6 +100,23 @@ class ExercisesTable
                     ->boolean()
                     ->state(fn (Exercise $record) => $record->name_es !== null)
                     ->tooltip(fn (Exercise $record) => $record->content_translated_at?->diffForHumans() ?? 'Sin traducir todavía'),
+                IconColumn::make('video_validated')
+                    ->label('Video validado')
+                    ->boolean()
+                    // Hito 9.3 (post-deploy) — deliberadamente NO
+                    // provider_has_video (lo que el proveedor DICE tener):
+                    // nuestro propio registro (ExerciseVideoAccess) de
+                    // resoluciones EXITOSAS, la única fuente de verdad
+                    // real de "esto ya se probó y funcionó".
+                    ->state(fn (Exercise $record) => $record->videoValidated())
+                    ->tooltip(fn (Exercise $record) => $record->videoAccesses()->latest('resolved_at')->first()?->resolved_at?->diffForHumans() ?? 'Nunca resuelto con éxito'),
+                TextColumn::make('active_coverage')
+                    ->label('Cobertura activa (mismo foco)')
+                    ->tooltip('Cuántos ejercicios ya ACTIVOS comparten este primary_muscle — útil para priorizar candidatos que diversifiquen el catálogo (números bajos = mayor prioridad).')
+                    ->state(fn (Exercise $record) => $record->primary_muscle === null
+                        ? '—'
+                        : Exercise::where('is_active', true)->where('primary_muscle', $record->primary_muscle->value)->count())
+                    ->toggleable(isToggledHiddenByDefault: true),
                 TextColumn::make('synced_at')
                     ->label('Synced')
                     ->since()
@@ -108,12 +126,35 @@ class ExercisesTable
             ->filters([
                 SelectFilter::make('provider')
                     ->options($providerOptions),
-                TernaryFilter::make('is_active')
-                    ->label('Active status')
-                    ->placeholder('All'),
+                // Hito 9.3 (post-deploy) — tri-estado real (pending_review/
+                // active/inactive), no solo el booleano de is_active.
+                // Nunca reimplementa la regla: delega en
+                // Exercise::scopeWithReviewStatus(), la misma que usa
+                // reviewStatus() para calcular el badge de "Status".
+                SelectFilter::make('review_status')
+                    ->label('Review status')
+                    ->options([
+                        'pending_review' => 'Pending Review',
+                        'active' => 'Active',
+                        'inactive' => 'Inactive',
+                    ])
+                    ->query(fn ($query, array $data) => $data['value']
+                        ? $query->withReviewStatus($data['value'])
+                        : $query),
                 TernaryFilter::make('provider_has_video')
-                    ->label('Has video')
+                    ->label('Has video (según el proveedor)')
                     ->placeholder('All'),
+                // Hito 9.3 (post-deploy) — deliberadamente separado del
+                // filtro anterior: "el proveedor dice que tiene video" vs.
+                // "nosotros ya comprobamos que funciona" son preguntas
+                // distintas (ver Exercise::videoValidated()).
+                TernaryFilter::make('video_validated')
+                    ->label('Video validado (nuestro registro)')
+                    ->placeholder('All')
+                    ->queries(
+                        true: fn ($query) => $query->whereHas('videoAccesses'),
+                        false: fn ($query) => $query->whereDoesntHave('videoAccesses'),
+                    ),
                 SelectFilter::make('difficulty_level')
                     ->label('Difficulty')
                     ->options(fn () => collect(ExperienceLevel::cases())->mapWithKeys(fn ($c) => [$c->value => Str::headline($c->value)])),
@@ -123,6 +164,16 @@ class ExercisesTable
                 SelectFilter::make('movement_pattern')
                     ->label('Movement pattern')
                     ->options(fn () => collect(MovementPattern::cases())->mapWithKeys(fn ($c) => [$c->value => Str::headline($c->value)])),
+                // Hito 9.3 (post-deploy) — equipment_needed ya está
+                // normalizado al vocabulario cerrado Equipment (ver D041/
+                // este mismo hito); un array JSON necesita whereJsonContains,
+                // nunca el where() por igualdad que SelectFilter usa por defecto.
+                SelectFilter::make('equipment_needed')
+                    ->label('Equipment')
+                    ->options(fn () => collect(Equipment::cases())->mapWithKeys(fn ($c) => [$c->value => Str::headline($c->value)]))
+                    ->query(fn ($query, array $data) => $data['value']
+                        ? $query->whereJsonContains('equipment_needed', $data['value'])
+                        : $query),
             ])
             ->defaultSort('synced_at', 'desc')
             ->recordActions([

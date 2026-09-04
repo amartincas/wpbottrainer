@@ -4,6 +4,7 @@ namespace App\Training\Support;
 
 use App\Factories\AIServiceFactory;
 use App\Models\Tenant;
+use App\Training\Enums\Equipment;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\Sex;
@@ -245,7 +246,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin expl
     "primary_focus": ["glutes"|"quads"|"hamstrings"|"calves"|"chest"|"back"|"shoulders"|"biceps"|"triceps"|"abs"|"full_body", ...]|[]|null,
     "secondary_focus": ["glutes"|"quads"|"hamstrings"|"calves"|"chest"|"back"|"shoulders"|"biceps"|"triceps"|"abs"|"full_body", ...]|[]|null,
     "training_location": "home"|"gym"|"outdoor"|null,
-    "available_equipment": ["tag", ...]|[]|null,
+    "available_equipment": ["barbell"|"dumbbells"|"kettlebell"|"cable_machine"|"machine"|"resistance_bands"|"bench"|"pull_up_bar"|"medicine_ball"|"mat"|"chair"|"box"|"weighted_vest"|"smith_machine"|"stability_ball"|"wall"|"cone"|"free_weights"|"landmine"|"foam_roller"|"step"|"towel", ...]|[]|null,
     "equipment_fully_equipped": true|false|null,
     "restrictions": ["tag", ...]|[]|null,
     "sessions_per_week": <entero 1-14>|null,
@@ -264,6 +265,30 @@ Reglas de "extracted":
 - Cualquier lesión, dolor, molestia o limitación física que el usuario mencione (ej. "dolor en la rodilla", "molestia en la espalda") va SIEMPRE en "restrictions", sin importar si también aparece en "safety_signal_text" — son campos independientes, pueden llenarse ambos a la vez o solo uno.
 - "safety_signal_text": SOLO llénalo si el mensaje sugiere una posible urgencia médica real (dolor de pecho, dificultad para respirar, pérdida de conocimiento/desmayo, cirugía muy reciente, entumecimiento/hormigueo severo, lesión grave repentina, o complicación de embarazo). Una molestia o dolor ordinario de entrenamiento (rodilla, espalda, hombro, ciática, etc., sin esos signos) NO es una urgencia — usa null aquí aunque sí llenes "restrictions". Ejemplo: "tengo dolor en las rodillas" → restrictions: ["dolor en las rodillas"], safety_signal_text: null.
 - "equipment_fully_equipped": true SOLO si el usuario indica acceso amplio o completo a equipo SIN enumerar (ej. "tengo de todo", "tengo todo", "lo normal de un gimnasio", "está bien equipado") — en ese caso "available_equipment" puede quedar null o vacío, NUNCA inventes una lista de aparatos. Si el usuario menciona equipo específico (ej. "solo pesas", "tengo mancuernas y bandas", o incluso solo dice "gimnasio" sin más detalle sobre qué tiene), usa "available_equipment" con lo mencionado (o null si solo dijo el lugar, sin hablar de equipo) y deja "equipment_fully_equipped" en null — decir dónde entrena no es lo mismo que declarar que tiene todo el equipo.
+- "available_equipment": traduce cada aparato mencionado a este vocabulario cerrado (igual criterio que "primary_focus" — nunca dejes el término en español libre, nunca inventes un valor fuera de esta lista), usando esta tabla:
+  - "mancuernas"/"pesas" (sin más detalle)/"pesas de mano" → "dumbbells"
+  - "barra"/"barra olímpica" → "barbell"
+  - "máquinas"/"máquina"/"aparatos" (sin más detalle) → "machine"
+  - "máquina smith"/"smith machine" → "smith_machine"
+  - "polea"/"máquina de cable"/"cable" → "cable_machine"
+  - "pesa rusa"/"kettlebell" → "kettlebell"
+  - "bandas elásticas"/"bandas de resistencia"/"ligas" → "resistance_bands"
+  - "banco" → "bench"
+  - "barra de dominadas"/"barra para dominadas" → "pull_up_bar"
+  - "balón medicinal"/"pelota medicinal" → "medicine_ball"
+  - "colchoneta"/"tapete"/"mat" → "mat"
+  - "silla" → "chair"
+  - "cajón"/"caja pliométrica"/"step box" → "box"
+  - "chaleco con peso"/"chaleco lastrado" → "weighted_vest"
+  - "balón suizo"/"pelota de estabilidad"/"fitball" → "stability_ball"
+  - "pared" → "wall"
+  - "cono"/"conos" → "cone"
+  - "pesas libres" (sin especificar mancuernas/barra) → "free_weights"
+  - "landmine"/"anclaje de barra" → "landmine"
+  - "rodillo de espuma"/"foam roller" → "foam_roller"
+  - "escalón"/"step" → "step"
+  - "toalla" → "towel"
+  Si el usuario menciona un aparato que no calza claramente con ninguno de estos (y no es una declaración de "todo"/"nada"), omítelo del arreglo en vez de forzar una traducción incorrecta — es preferible que falte a que sea errónea.
 - "primary_focus": la(s) zona(s) que el usuario indica querer PRIORIZAR especialmente (no es lo mismo que un simple "quiero ponerme en forma", eso es "goal"). Traduce el lenguaje natural a este vocabulario cerrado, usando esta tabla:
   - "glúteos"/"cola"/"pompis" → ["glutes"]
   - "piernas" (sin especificar más) → ["quads", "hamstrings", "glutes", "calves"]
@@ -319,7 +344,7 @@ PROMPT;
                 'primary_focus' => $this->validateMuscleFocusArray($extractedRaw['primary_focus'] ?? null),
                 'secondary_focus' => $this->validateMuscleFocusArray($extractedRaw['secondary_focus'] ?? null),
                 'training_location' => $this->validateEnumValue($extractedRaw['training_location'] ?? null, TrainingLocation::class),
-                'available_equipment' => $this->validateStringArray($extractedRaw['available_equipment'] ?? null),
+                'available_equipment' => $this->validateEquipmentArray($extractedRaw['available_equipment'] ?? null),
                 'equipment_fully_equipped' => $this->validateBool($extractedRaw['equipment_fully_equipped'] ?? null),
                 'restrictions' => $this->validateStringArray($extractedRaw['restrictions'] ?? null),
                 'sessions_per_week' => $this->validateSessionsPerWeek($extractedRaw['sessions_per_week'] ?? null),
@@ -380,6 +405,29 @@ PROMPT;
 
         return array_values(array_unique(array_filter(
             array_map(fn ($v) => is_string($v) ? MuscleFocus::tryFrom($v)?->value : null, $value)
+        )));
+    }
+
+    /**
+     * Hito 9.3 (post-deploy, corrección) — hallazgo real: `available_equipment`
+     * se guardaba como texto libre (lo que la IA escribiera, en el idioma
+     * que fuera), mientras `Exercise.equipment_needed` siempre usó el
+     * vocabulario cerrado `App\Training\Enums\Equipment` (vía cada
+     * ExerciseNormalizerInterface). `TrainingEngine::isEligible()` los
+     * comparaba directamente — "máquinas" nunca podía calzar con
+     * "machine". Mismo criterio que validateMuscleFocusArray(): cualquier
+     * valor que la IA hubiera devuelto fuera de este vocabulario se
+     * descarta silenciosamente, nunca se persiste equipo que el código no
+     * reconoce.
+     */
+    private function validateEquipmentArray(mixed $value): ?array
+    {
+        if (! is_array($value)) {
+            return null;
+        }
+
+        return array_values(array_unique(array_filter(
+            array_map(fn ($v) => is_string($v) ? Equipment::tryFrom($v)?->value : null, $value)
         )));
     }
 

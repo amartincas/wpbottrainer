@@ -142,3 +142,44 @@ it('preserves the full raw payload as opaque metadata, never as the normalized c
     expect($normalized->rawMetadata)->toBe($raw->raw);
     expect($normalized->equipmentNeeded)->toBe(['cable_machine']);
 });
+
+/**
+ * Hito 9.3 (post-deploy) — hallazgo real: EQUIPMENT_MAP solo cubría 11 de
+ * los 22 valores reales que YMove reporta (confirmado en vivo contra
+ * GET /exercises/equipment, endpoint de metadata sin costo). Los otros 11
+ * caían silenciosamente en `equipmentNeeded=[]` ("sin equipo"), aunque no
+ * lo fueran. Verifica los 13 agregados en esta corrección.
+ */
+it('maps the full official YMove equipment vocabulary, not just the original 11', function () {
+    $cases = [
+        'mat' => ['mat'],
+        'chair' => ['chair'],
+        'box' => ['box'],
+        'weighted vest' => ['weighted_vest'],
+        'smith machine' => ['smith_machine'],
+        'stability ball' => ['stability_ball'],
+        'wall' => ['wall'],
+        'cone' => ['cone'],
+        'free weights' => ['free_weights'],
+        'landmine' => ['landmine'],
+        'foam roller' => ['foam_roller'],
+        'step' => ['step'],
+        'towel' => ['towel'],
+    ];
+
+    foreach ($cases as $raw => $expected) {
+        $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-x', [
+            'id' => 'id-x', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => $raw,
+        ]));
+
+        expect($normalized->equipmentNeeded)->toBe($expected, "equipment '{$raw}' debería mapear a {$expected[0]}");
+    }
+});
+
+it('degrades to no-equipment (never crashes) for a raw equipment string outside even the full official vocabulary', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-y', [
+        'id' => 'id-y', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'a brand new gadget ymove never told us about',
+    ]));
+
+    expect($normalized->equipmentNeeded)->toBe([]);
+});

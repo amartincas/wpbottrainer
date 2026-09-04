@@ -6,6 +6,7 @@ use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\TrackingType;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -95,6 +96,48 @@ class Exercise extends Model
     public function workoutExercises(): HasMany
     {
         return $this->hasMany(WorkoutExercise::class);
+    }
+
+    /**
+     * Hito 9.3 (post-deploy) — historial append-only de resoluciones de
+     * video EXITOSAS (ver App\ExerciseCatalog\MediaResolver y la migración
+     * de esta tabla). Nunca confundir con `provider_has_video` (señal
+     * cruda del proveedor, nunca confirmada) — ver videoValidated().
+     */
+    public function videoAccesses(): HasMany
+    {
+        return $this->hasMany(ExerciseVideoAccess::class);
+    }
+
+    /**
+     * Hito 9.3 (post-deploy) — "video validado" según NUESTRO propio
+     * registro (ExerciseVideoAccess), nunca según lo que el proveedor
+     * *dice* tener (`provider_has_video`). Es posible que
+     * `provider_has_video=true` y `videoValidated()=false` a la vez —
+     * significa que el proveedor lo ofrece pero todavía nadie lo probó
+     * con éxito desde este sistema. Único lugar que calcula esto — mismo
+     * criterio que reviewStatus().
+     */
+    public function videoValidated(): bool
+    {
+        return $this->relationLoaded('videoAccesses')
+            ? $this->videoAccesses->isNotEmpty()
+            : $this->videoAccesses()->exists();
+    }
+
+    /**
+     * Filtro reutilizable para Filament (ExercisesTable) — nunca duplica
+     * la regla de reviewStatus(), la traduce a una consulta SQL
+     * equivalente. Único lugar que lo hace.
+     */
+    public function scopeWithReviewStatus(Builder $query, string $status): Builder
+    {
+        return match ($status) {
+            'active' => $query->where('is_active', true),
+            'pending_review' => $query->where('is_active', false)->whereNull('contraindications'),
+            'inactive' => $query->where('is_active', false)->whereNotNull('contraindications'),
+            default => $query,
+        };
     }
 
     /**

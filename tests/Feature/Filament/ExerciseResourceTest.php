@@ -6,8 +6,10 @@ use App\ExerciseCatalog\Providers\YMove\YMoveExerciseNormalizer;
 use App\Filament\Resources\Exercises\Pages\EditExercise;
 use App\Filament\Resources\Exercises\Pages\ListExercises;
 use App\Models\Exercise;
+use App\Models\ExerciseVideoAccess;
 use App\Models\Tenant;
 use App\Models\User;
+use App\Training\Enums\MuscleFocus;
 use Illuminate\Support\Facades\Http;
 use Livewire\Livewire;
 
@@ -240,4 +242,85 @@ it('Spanish content fields are editable directly from the edit form, independent
         ->call('save');
 
     expect($exercise->fresh()->instructions_es)->toBe(['Dobla las rodillas con cuidado.']);
+});
+
+// ── Hito 9.3 (post-deploy): nuevos filtros — review_status, video_validated, equipment ──
+
+it('the video_validated column reflects our own registry, not provider_has_video', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $validated = Exercise::factory()->fromProvider('ymove')->create(['provider_has_video' => true]);
+    ExerciseVideoAccess::create([
+        'exercise_id' => $validated->id,
+        'provider' => 'ymove',
+        'provider_exercise_id' => $validated->provider_exercise_id,
+        'variant' => 'default',
+        'resolved_at' => now(),
+    ]);
+    // Dice tener video pero NUNCA se resolvió con éxito desde este sistema.
+    $unvalidated = Exercise::factory()->fromProvider('ymove')->create(['provider_has_video' => true]);
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableColumnStateSet('video_validated', true, $validated)
+        ->assertTableColumnStateSet('video_validated', false, $unvalidated);
+});
+
+it('filters by review_status using the exact same rule as reviewStatus(), never a duplicated one', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $pending = Exercise::factory()->fromProvider('ymove')->create();
+    $active = Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create();
+    $inactive = Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create();
+    $inactive->update(['is_active' => false]);
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->filterTable('review_status', 'pending_review')
+        ->assertCanSeeTableRecords([$pending])
+        ->assertCanNotSeeTableRecords([$active, $inactive]);
+});
+
+it('filters by video_validated true/false using our own registry', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $validated = Exercise::factory()->fromProvider('ymove')->create();
+    ExerciseVideoAccess::create([
+        'exercise_id' => $validated->id,
+        'provider' => 'ymove',
+        'provider_exercise_id' => $validated->provider_exercise_id,
+        'variant' => 'default',
+        'resolved_at' => now(),
+    ]);
+    $unvalidated = Exercise::factory()->fromProvider('ymove')->create();
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->filterTable('video_validated', true)
+        ->assertCanSeeTableRecords([$validated])
+        ->assertCanNotSeeTableRecords([$unvalidated]);
+});
+
+it('the active_coverage column counts how many exercises are ALREADY active for the same primary_muscle, to prioritize curation candidates', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create(['primary_muscle' => MuscleFocus::Glutes]);
+    Exercise::factory()->fromProvider('ymove')->reviewedAndActive()->create(['primary_muscle' => MuscleFocus::Glutes]);
+    // Candidato pendiente del mismo foco — la cobertura ya activa es 2.
+    $candidate = Exercise::factory()->fromProvider('ymove')->create(['primary_muscle' => MuscleFocus::Glutes]);
+    // Otro candidato de un foco sin NINGÚN activo — cobertura 0, mayor prioridad.
+    $underserved = Exercise::factory()->fromProvider('ymove')->create(['primary_muscle' => MuscleFocus::Back]);
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableColumnStateSet('active_coverage', 2, $candidate)
+        ->assertTableColumnStateSet('active_coverage', 0, $underserved);
+});
+
+it('filters by equipment against the normalized closed vocabulary, using whereJsonContains', function () {
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $withMachine = Exercise::factory()->fromProvider('ymove')->create(['equipment_needed' => ['machine']]);
+    $withBarbell = Exercise::factory()->fromProvider('ymove')->create(['equipment_needed' => ['barbell']]);
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->filterTable('equipment_needed', 'machine')
+        ->assertCanSeeTableRecords([$withMachine])
+        ->assertCanNotSeeTableRecords([$withBarbell]);
 });
