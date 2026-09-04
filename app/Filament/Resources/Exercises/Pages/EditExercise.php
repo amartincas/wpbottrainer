@@ -136,12 +136,19 @@ class EditExercise extends EditRecord
             // restricciones que la acción homónima de ExercisesTable
             // (nunca activa, nunca sobreescribe el original); ver
             // App\ExerciseCatalog\Curation\ExerciseSpanishContentGenerator.
+            //
+            // Hito 9.3 (curación de seguridad) — mismo fix que en
+            // ExercisesTable: ANTES exigía reviewStatus()==='pending_review'
+            // (is_active===false Y contraindications===null), lo que
+            // bloqueaba la traducción para siempre en cuanto se guardaba una
+            // revisión de seguridad (aunque fuera []) — hallazgo real con el
+            // ID 55. La única condición correcta es no estar activo.
             Action::make('generateSpanishContent')
                 ->label('Generar contenido en español')
                 ->color('info')
                 ->icon('heroicon-o-language')
                 ->visible(fn (): bool => (bool) Auth::user()?->is_super_admin
-                    && $this->record->reviewStatus() === 'pending_review')
+                    && ! $this->record->is_active)
                 ->schema([
                     Select::make('tenant_id')
                         ->label('Credenciales de IA a usar (por tenant)')

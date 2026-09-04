@@ -348,12 +348,25 @@ class ExercisesTable
                 // ya activo sin que un admin lo desactive primero a
                 // propósito. NUNCA activa el ejercicio ni toca is_active —
                 // ver App\ExerciseCatalog\Curation\ExerciseSpanishContentGenerator.
+                //
+                // Hito 9.3 (curación de seguridad) — hallazgo real durante
+                // la curación manual (ID 55): la condición ANTES exigía
+                // reviewStatus()==='pending_review', que además de
+                // is_active===false también requiere contraindications===
+                // null. En cuanto se guardaba una revisión de seguridad
+                // (aunque fuera []), reviewStatus() pasaba a 'inactive' —
+                // NUNCA 'pending_review' de nuevo, ni desactivando el
+                // ejercicio — dejando la traducción bloqueada para siempre.
+                // Seguridad y traducción son procesos independientes (ver
+                // docs/DECISIONS.md): la única condición real, coherente con
+                // el comentario de arriba y con reviewSafety, es no estar
+                // activo — sin importar el estado de contraindications.
                 Action::make('generateSpanishContent')
                     ->label('Generar contenido en español')
                     ->color('info')
                     ->icon('heroicon-o-language')
                     ->visible(fn (Exercise $record): bool => Auth::user()?->is_super_admin
-                        && $record->reviewStatus() === 'pending_review')
+                        && ! $record->is_active)
                     ->schema([
                         Select::make('tenant_id')
                             ->label('Credenciales de IA a usar (por tenant)')

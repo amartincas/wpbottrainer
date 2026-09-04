@@ -386,6 +386,28 @@ it('the generateSpanishContent action is not available once the exercise is alre
         ->assertTableActionHidden('generateSpanishContent', $exercise);
 });
 
+it('the generateSpanishContent action stays available for an inactive exercise even after contraindications were already reviewed, so a broken translation can be regenerated', function () {
+    // Hallazgo real (ID 55): la condición anterior exigía
+    // reviewStatus()==='pending_review' (is_active=false Y
+    // contraindications=null); en cuanto se guardaba una revisión de
+    // seguridad (aunque fuera []), la traducción quedaba bloqueada para
+    // siempre, incluso desactivando el ejercicio — reviewStatus() pasaba a
+    // 'inactive', nunca de vuelta a 'pending_review'. Seguridad y
+    // traducción son procesos independientes; la única condición real debe
+    // ser no estar activo.
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $exercise = Exercise::factory()->fromProvider('ymove')->create(['contraindications' => []]);
+    expect($exercise->reviewStatus())->toBe('inactive');
+
+    Livewire::actingAs($admin)
+        ->test(ListExercises::class)
+        ->assertTableActionVisible('generateSpanishContent', $exercise);
+
+    Livewire::actingAs($admin)
+        ->test(EditExercise::class, ['record' => $exercise->getRouteKey()])
+        ->assertActionVisible('generateSpanishContent');
+});
+
 it('the generateSpanishContent action is hidden from non-super-admin users', function () {
     $user = User::factory()->create(['is_super_admin' => false]);
     $exercise = Exercise::factory()->fromProvider('ymove')->create();
