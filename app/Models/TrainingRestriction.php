@@ -54,4 +54,15 @@ class TrainingRestriction extends Model
     {
         return $this->belongsTo(User::class, 'reviewed_by');
     }
+
+    /**
+     * Hito de seguridad de restricciones (Bloque 2) — de qué declaración
+     * (si alguna) se originó esta restricción. Nullable: una restricción
+     * puede crearse sin pasar por una DeclaredHealthCondition (ej. una
+     * decisión administrativa directa, fuera de este flujo).
+     */
+    public function declaredHealthCondition(): BelongsTo
+    {
+        return $this->belongsTo(DeclaredHealthCondition::class, 'declared_health_condition_id');
+    }
 }
