@@ -14,6 +14,23 @@ it('S: TrainingEngine never references anything from the Onboarding namespace', 
     }
 });
 
+it('R: TrainingEngine never imports HealthScreeningRequirement, DeclaredHealthCondition, or FunctionalLimitationCanonicalMapper — Bloque 5 no lo toca', function () {
+    // Se busca un `use` real, no la mención en prosa dentro de un docblock
+    // explicando la garantía de aislamiento (mismo patrón de falso positivo
+    // ya visto en otros tests de esta suite).
+    $source = file_get_contents(app_path('Training/Engine/TrainingEngine.php'));
+
+    foreach (['HealthScreeningRequirement', 'DeclaredHealthCondition', 'FunctionalLimitationCanonicalMapper'] as $forbidden) {
+        expect($source)->not->toMatch("/use [A-Za-z\\\\]*{$forbidden};/");
+    }
+});
+
+it('R: HealthScreeningRequirement never imports TrainingEngine — el bloqueo vive en TrainingAccessGate, nunca en el motor', function () {
+    $source = file_get_contents(app_path('Training/Onboarding/Requirements/HealthScreeningRequirement.php'));
+
+    expect($source)->not->toContain('TrainingEngine');
+});
+
 it('C (arquitectura): OnboardingConversationService never imports/instantiates any concrete OnboardingRequirement class', function () {
     // Se busca uso real (import/instanciación/type-hint), no menciones en
     // comentarios explicativos — el propio docblock del archivo describe la
@@ -34,10 +51,10 @@ it('J: RestrictionsRequirement never imports TrainingRestriction or DeclaredHeal
     expect($source)->not->toMatch('/use App\\\\Models\\\\DeclaredHealthCondition;/');
 });
 
-it('none of the 9 OnboardingRequirement implementations reference AiServiceInterface or a concrete AI provider', function () {
+it('none of the 10 OnboardingRequirement implementations reference AiServiceInterface or a concrete AI provider', function () {
     $files = glob(app_path('Training/Onboarding/Requirements/*.php'));
 
-    expect($files)->toHaveCount(9);
+    expect($files)->toHaveCount(10); // 9 del Bloque 4 + HealthScreeningRequirement (Bloque 5)
 
     foreach ($files as $file) {
         $source = file_get_contents($file);

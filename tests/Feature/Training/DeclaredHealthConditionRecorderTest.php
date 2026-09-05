@@ -12,10 +12,11 @@ use App\Training\Enums\RestrictionSource;
 use App\Training\Enums\RestrictionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DeclaredHealthConditionRecorder;
+use App\Training\Support\FunctionalLimitationCanonicalMapper;
 
 function recorder(): DeclaredHealthConditionRecorder
 {
-    return new DeclaredHealthConditionRecorder(new BodyRegionCanonicalMapper);
+    return new DeclaredHealthConditionRecorder(new BodyRegionCanonicalMapper, new FunctionalLimitationCanonicalMapper);
 }
 
 // ── A: registro básico + invariante de que declare() nunca crea restricciones ──

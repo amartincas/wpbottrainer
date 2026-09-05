@@ -61,7 +61,9 @@ function readyTrainingContact(): Contact
 {
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id]);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    // health_screening_asked: true — Bloque 5 (D048): sin esto, el perfil ya
+    // no se consideraría "listo para entrenar" bajo el nuevo Registry.
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
     return $contact->fresh();
@@ -436,7 +438,7 @@ it('falls back to generating a new session when there is no active session to re
 it('blocks a report attempt when access is not granted, without touching ExerciseLog', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id]);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id, 'status' => TrainingAccessStatus::Expired, 'expires_at' => now()->subDay()]);
     [, $workoutExercises] = makeSessionWithExercises($contact->fresh(), [['name' => 'Sentadilla']]);
 

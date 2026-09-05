@@ -39,7 +39,7 @@ it('A: the registry returns requirements in registration order', function () {
 
     expect($keys)->toBe([
         'name', 'goal', 'experience_level', 'training_location',
-        'available_equipment', 'restrictions', 'sessions_per_week',
+        'available_equipment', 'health_screening', 'sessions_per_week',
         'primary_focus', 'physical_stats',
     ]);
 });
@@ -155,7 +155,7 @@ it('I/R: PrimaryFocus (and sessions_per_week/physical_stats) never block — a p
         'experience_level' => ExperienceLevel::Beginner,
         'training_location' => TrainingLocation::Home,
         'available_equipment' => [],
-        'restrictions' => [],
+        'health_screening_asked' => true, // Bloque 5: reemplaza a restrictions como último bloqueante
         'primary_focus' => null,
         'sessions_per_week' => null,
         'physical_stats_asked' => false,

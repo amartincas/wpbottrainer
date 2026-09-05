@@ -39,7 +39,7 @@ it('continues into Training after a payment is confirmed and the user replies af
         'nequi_number' => '300-000-0001',
     ]);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'restrictions' => [], 'available_equipment' => []]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true]);
     User::factory()->create(['is_super_admin' => true, 'phone' => '573009990000']);
     // Ventana de WhatsApp abierta (CustomerNotifier) — en producción la
     // actualiza WhatsAppController::handle() en cada mensaje entrante; estas

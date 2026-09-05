@@ -42,6 +42,8 @@ function emptyExtraction(array $overrides = []): array
         'restrictions' => null, 'available_equipment' => null, 'equipment_fully_equipped' => null,
         'sessions_per_week' => null, 'age' => null, 'sex' => null, 'weight_kg' => null,
         'height_cm' => null, 'safety_signal_text' => null,
+        // Bloque 5 (D048)
+        'health_declaration_category' => null, 'health_condition_text' => null, 'functional_limitation_text' => null,
     ], $overrides);
 }
 
@@ -83,9 +85,11 @@ it('routes a training-intent message to TrainingHandler and starts onboarding fo
 
 it('persists progressively answered onboarding fields turn by turn, without re-asking what is already known', function () {
     // Bloque 4 (D047): primary_focus/sessions_per_week/physical_stats ya NO
-    // bloquean la primera rutina — solo se exige name/goal/experience_level/
-    // training_location/available_equipment/restrictions. El onboarding
-    // ahora se completa en 2 turnos en este escenario, no en 3.
+    // bloquean la primera rutina. Bloque 5 (D048): HealthScreeningRequirement
+    // reemplazó a RestrictionsRequirement como último bloqueante — se exige
+    // name/goal/experience_level/training_location/available_equipment/
+    // health_screening. El onboarding se completa en 2 turnos en este
+    // escenario, no en 3.
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
     // Nombre ya conocido de antemano — este test se enfoca en la
     // acumulación progresiva del resto de campos, no en la captura del
@@ -100,7 +104,7 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
                 '¿Cuál es tu nivel de experiencia?'
             ))
             ->push(fakeOnboardingTurn(
-                emptyExtraction(['experience_level' => 'beginner', 'restrictions' => [], 'available_equipment' => []]),
+                emptyExtraction(['experience_level' => 'beginner', 'available_equipment' => [], 'health_condition_text' => '']),
                 'complete_onboarding',
                 '¡Perfecto, ya tengo todo!'
             )),
@@ -144,14 +148,15 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
     expect($aiCalls)->toBe(2); // exactamente 1 por turno, 2 turnos — no un tercero
 });
 
-// 11 y 12 (Hito 5.1, ajustado en Bloque 4/D047): flujo completo de
-// onboarding turno a turno + exactamente UNA llamada HTTP a IA por cada
-// turno mientras el onboarding BLOQUEANTE sigue incompleto (no 2). Desde el
-// Bloque 4, `restrictions` es el último requirement bloqueante en el orden
-// de registro — el onboarding se completa en 6 turnos, no en 8:
-// `sessions_per_week`/`primary_focus`/`physical_stats` ya nunca bloquean, así
-// que los turnos 7 y 8 de este guion no disparan ninguna llamada de IA — el
-// onboarding ya terminó y el flujo cae directo al chequeo de acceso.
+// 11 y 12 (Hito 5.1, ajustado en Bloque 4/D047, luego en Bloque 5/D048):
+// flujo completo de onboarding turno a turno + exactamente UNA llamada HTTP
+// a IA por cada turno mientras el onboarding BLOQUEANTE sigue incompleto
+// (no 2). Desde el Bloque 5, `health_screening` es el último requirement
+// bloqueante en el orden de registro (reemplazó a `restrictions`) — el
+// onboarding se completa en 6 turnos, no en 8: `sessions_per_week`/
+// `primary_focus`/`physical_stats` ya nunca bloquean, así que los turnos 7
+// y 8 de este guion no disparan ninguna llamada de IA — el onboarding ya
+// terminó y el flujo cae directo al chequeo de acceso.
 it('completes the full onboarding conversation turn by turn with exactly ONE AI call per incomplete (blocking) turn', function () {
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
     // Nombre ya conocido de antemano — el turno de captura de nombre tiene
@@ -167,12 +172,18 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
             // que eso cambie qué falta bloqueante.
             ->push(fakeOnboardingTurn(emptyExtraction(['primary_focus' => []]), 'ask_training_location', 'Anotado. ¿Dónde vas a entrenar?'))
             ->push(fakeOnboardingTurn(emptyExtraction(['training_location' => 'gym']), 'ask_equipment', '¿Qué equipo tienes?'))
-            ->push(fakeOnboardingTurn(emptyExtraction(['available_equipment' => []]), 'ask_restrictions', 'Anotado. ¿Alguna lesión o dolor que deba saber?'))
-            ->push(fakeOnboardingTurn(emptyExtraction(['restrictions' => ['dolor en las rodillas']]), 'complete_onboarding', '¡Listo, ya tengo tu perfil completo!')),
+            ->push(fakeOnboardingTurn(emptyExtraction(['available_equipment' => []]), 'ask_health_screening', 'Anotado. ¿Alguna lesión o dolor que deba saber?'))
+            // Turno 6: la condición viene con detalle funcional explícito en
+            // el MISMO mensaje (caso C) — cierra el screening en 1 turno, sin
+            // necesitar una pregunta de seguimiento aparte.
+            ->push(fakeOnboardingTurn(emptyExtraction([
+                'health_condition_text' => 'dolor en las rodillas',
+                'functional_limitation_text' => 'no puedo hacer sentadillas profundas',
+            ]), 'complete_onboarding', '¡Listo, ya tengo tu perfil completo!')),
         'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
     ]);
 
-    $turns = ['Quiero perder peso', 'Intermedio', 'Todo por igual', 'Gimnasio', 'Ninguno', 'Dolor en las rodillas', '3 veces', 'Prefiero no decir'];
+    $turns = ['Quiero perder peso', 'Intermedio', 'Todo por igual', 'Gimnasio', 'Ninguno', 'Dolor en las rodillas, no puedo hacer sentadillas profundas', '3 veces', 'Prefiero no decir'];
 
     foreach ($turns as $turn) {
         sendTrainingMessage($tenant, '573001112233', $turn);
@@ -182,10 +193,10 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
     $profile = TrainingProfile::where('contact_id', $contact->id)->first();
 
     expect(app(OnboardingRequirementRegistry::class)->isOnboardingComplete($profile, $contact))->toBeTrue();
+    expect($profile->health_screening_asked)->toBeTrue();
     expect($profile->goal->value)->toBe('lose_weight');
     expect($profile->experience_level->value)->toBe('intermediate');
     expect($profile->training_location->value)->toBe('gym');
-    expect($profile->restrictions)->toBe(['dolor en las rodillas']);
     expect($profile->primary_focus)->toBe([]); // capturado oportunísticamente en el turno 3
     // Los turnos 7 y 8 ("3 veces", "Prefiero no decir") nunca llegaron a
     // preguntarse — el onboarding bloqueante ya había terminado en el turno
@@ -211,7 +222,10 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
 it('informs the user they need to activate the service when access is denied, with an explicit instruction (Hito 8.1)', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]); // complete, no TrainingAccess row
+    // health_screening_asked: true — Bloque 5 (D048): sin esto, la factory
+    // dejaría el screening sin responder y el perfil ya NO se consideraría
+    // completo bajo el nuevo Registry.
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]); // complete, no TrainingAccess row
 
     Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200)]);
 
@@ -229,7 +243,7 @@ it('informs the user they need to activate the service when access is denied, wi
 it('generates and delivers a WorkoutSession with videos when access is granted, without asking onboarding questions again', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'restrictions' => [], 'available_equipment' => []]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
     $chest = Exercise::factory()->create([
@@ -342,7 +356,7 @@ it('TrainingHandler never sends the opportunistic invitation during the first tw
             ->push(fakeOnboardingTurn(emptyExtraction(['goal' => 'lose_weight']), 'ask_experience_level', '¿Ya has entrenado antes?'))
             ->push(fakeOnboardingTurn(emptyExtraction(['experience_level' => 'intermediate']), 'ask_training_location', '¿Dónde vas a entrenar?'))
             ->push(fakeOnboardingTurn(emptyExtraction(['training_location' => 'gym']), 'ask_equipment', '¿Qué equipo tienes?'))
-            ->push(fakeOnboardingTurn(emptyExtraction(['available_equipment' => [], 'restrictions' => []]), 'complete_onboarding', '¡Listo!')),
+            ->push(fakeOnboardingTurn(emptyExtraction(['available_equipment' => [], 'health_condition_text' => '']), 'complete_onboarding', '¡Listo!')),
         'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
     ]);
 
@@ -376,7 +390,7 @@ it('Y: onboarding_turns increments exactly once per turn while incomplete, and n
         'api.openai.com/v1/chat/completions' => Http::sequence()
             ->push(fakeOnboardingTurn(emptyExtraction(['goal' => 'build_muscle']), 'ask_experience_level', 'Genial. ¿Ya has entrenado antes?'))
             ->push(fakeOnboardingTurn(
-                emptyExtraction(['experience_level' => 'beginner', 'training_location' => 'home', 'available_equipment' => [], 'restrictions' => []]),
+                emptyExtraction(['experience_level' => 'beginner', 'training_location' => 'home', 'available_equipment' => [], 'health_condition_text' => '']),
                 'complete_onboarding',
                 '¡Perfecto, ya tengo todo!'
             )),
@@ -420,7 +434,7 @@ it('E2E: a single compound message providing everything blocking completes onboa
                     'experience_level' => 'beginner',
                     'training_location' => 'home',
                     'available_equipment' => [],
-                    'restrictions' => [],
+                    'health_condition_text' => '',
                 ]),
                 'complete_onboarding',
                 '¡Perfecto Carlos! Ya tengo todo, aquí va tu entrenamiento.'

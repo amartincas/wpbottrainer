@@ -10,15 +10,18 @@ use App\Training\Support\OnboardingConversationService;
 
 /**
  * Bloque 4 — Capa 1 (bloqueante), mecanismo LEGACY TEMPORAL, no la solución
- * definitiva de seguridad. Sigue escribiendo `TrainingProfile.restrictions`
- * (texto libre) exactamente igual que hoy — invariante explícito de este
- * bloque: una condición de salud declarada (ver Bloque 2,
- * `DeclaredHealthConditionRecorder`) NUNCA equivale automáticamente a una
- * restricción funcional. El futuro `HealthScreeningRequirement` (bloque
- * posterior, no implementado aquí) usará `DeclaredHealthConditionRecorder` y
- * podrá, cuando corresponda, conducir a una `TrainingRestriction` explícita
- * — este Requirement no se convierte en esa pieza, solo mantiene el
- * comportamiento actual sin regresión mientras esa pieza no exista.
+ * definitiva de seguridad. Escribía `TrainingProfile.restrictions` (texto
+ * libre).
+ *
+ * DESACTIVADA desde el Bloque 5 (ver docs/DECISIONS.md D048):
+ * `HealthScreeningRequirement` la reemplazó en el registro de
+ * `AppServiceProvider` — una sola pregunta de screening, nunca dos
+ * independientes sobre lo mismo. Esta clase se conserva SIN BORRAR, sin
+ * modificar su lógica, únicamente como documentación histórica y por si
+ * algún consumidor externo a este bloque todavía la instancia
+ * directamente — pero ya NO recibe escrituras nuevas: `TrainingProfile.restrictions`
+ * queda como mecanismo de SOLO LECTURA para `SafetyRestrictionResolver`
+ * durante la transición.
  */
 class RestrictionsRequirement implements OnboardingRequirement
 {

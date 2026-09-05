@@ -72,6 +72,7 @@ it('extracts and validates a fully well-formed response', function () {
         'training_location' => null, 'available_equipment' => [], 'equipment_fully_equipped' => null,
         'restrictions' => ['knee'], 'sessions_per_week' => 3,
         'age' => null, 'sex' => null, 'weight_kg' => null, 'height_cm' => null, 'safety_signal_text' => null,
+        'health_declaration_category' => null, 'health_condition_text' => null, 'functional_limitation_text' => null,
     ]);
     expect($result['next_action'])->toBe('complete_onboarding');
     expect($result['response'])->toBe('¡Perfecto, ya tengo todo!');
@@ -187,6 +188,7 @@ it('returns an empty result when the AI provider fails, without throwing', funct
             'restrictions' => null, 'sessions_per_week' => null,
             'age' => null, 'sex' => null, 'weight_kg' => null, 'height_cm' => null,
             'safety_signal_text' => null,
+            'health_declaration_category' => null, 'health_condition_text' => null, 'functional_limitation_text' => null,
         ],
         'next_action' => null,
         'response' => null,

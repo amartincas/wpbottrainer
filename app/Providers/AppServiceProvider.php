@@ -20,10 +20,10 @@ use App\Training\Onboarding\OnboardingRequirementRegistry;
 use App\Training\Onboarding\Requirements\EquipmentRequirement;
 use App\Training\Onboarding\Requirements\ExperienceLevelRequirement;
 use App\Training\Onboarding\Requirements\GoalRequirement;
+use App\Training\Onboarding\Requirements\HealthScreeningRequirement;
 use App\Training\Onboarding\Requirements\NameRequirement;
 use App\Training\Onboarding\Requirements\PhysicalStatsRequirement;
 use App\Training\Onboarding\Requirements\PrimaryFocusRequirement;
-use App\Training\Onboarding\Requirements\RestrictionsRequirement;
 use App\Training\Onboarding\Requirements\SessionsPerWeekRequirement;
 use App\Training\Onboarding\Requirements\TrainingLocationRequirement;
 use App\Training\Support\SafetySignalPreRoutingScreen;
@@ -102,8 +102,14 @@ class AppServiceProvider extends ServiceProvider
         // Container en cada uso). El ORDEN de este array es la prioridad de
         // preguntas — agregar un requirement nuevo es una clase + una línea
         // aquí, sin tocar TrainingHandler/TrainingEngine (ver docs/DECISIONS.md D047).
+        // Bloque 5 (D048): HealthScreeningRequirement REEMPLAZA a
+        // RestrictionsRequirement en esta posición — una sola pregunta de
+        // screening, nunca dos independientes sobre lo mismo.
+        // RestrictionsRequirement.php se conserva sin borrar (documentación
+        // histórica), pero deja de estar registrada — TrainingProfile.restrictions
+        // ya no recibe escrituras nuevas desde este bloque.
         // Capa 1 (bloqueante): Name, Goal, ExperienceLevel, TrainingLocation,
-        // Equipment, Restrictions (legacy temporal, ver RestrictionsRequirement).
+        // Equipment, HealthScreening.
         // Capa 2 (oportunista, nunca bloquea): SessionsPerWeek, PrimaryFocus,
         // PhysicalStats.
         $this->app->singleton(OnboardingRequirementRegistry::class, fn ($app) => new OnboardingRequirementRegistry($app, [
@@ -112,7 +118,7 @@ class AppServiceProvider extends ServiceProvider
             ExperienceLevelRequirement::class,
             TrainingLocationRequirement::class,
             EquipmentRequirement::class,
-            RestrictionsRequirement::class,
+            HealthScreeningRequirement::class,
             SessionsPerWeekRequirement::class,
             PrimaryFocusRequirement::class,
             PhysicalStatsRequirement::class,

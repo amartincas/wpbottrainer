@@ -138,7 +138,7 @@ it('processes a fully realistic Meta audio webhook payload end-to-end, including
 it('does not process a retried Meta webhook delivery twice (idempotency at the Training/report level)', function () {
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'wa_phone_number_id' => '100000000000003']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
     $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
@@ -176,7 +176,7 @@ it('does not process a retried Meta webhook delivery twice (idempotency at the T
 it('persists the outbound message and logs the failure when Meta rejects the send, without breaking the webhook response', function () {
     $tenant = Tenant::factory()->create(['wa_phone_number_id' => '100000000000004']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
     // Sin TrainingAccess -> respuesta determinista de "activa el servicio",
     // sin necesitar IA, para aislar el caso de "Meta responde error".
 

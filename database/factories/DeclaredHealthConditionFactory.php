@@ -20,6 +20,7 @@ class DeclaredHealthConditionFactory extends Factory
         return [
             'contact_id' => Contact::factory(),
             'original_text' => 'tengo una lesión en el hombro',
+            'functional_limitation_text' => null,
             'source_message_id' => null,
             'category' => HealthConditionCategory::PossibleInjury,
             'suggested_body_region' => null,

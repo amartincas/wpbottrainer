@@ -53,26 +53,42 @@ use InvalidArgumentException;
  */
 class DeclaredHealthConditionRecorder
 {
-    public function __construct(private readonly BodyRegionCanonicalMapper $mapper) {}
+    public function __construct(
+        private readonly BodyRegionCanonicalMapper $mapper,
+        private readonly FunctionalLimitationCanonicalMapper $functionalMapper,
+    ) {}
 
     /**
      * Registra una declaración. SIEMPRE queda `pending_review` — nunca
      * crea ni modifica ninguna `TrainingRestriction`, sin importar
-     * `category` ni si el texto es reconocido por el catálogo.
+     * `category` ni si el texto (de condición o funcional) es reconocido
+     * por alguno de los dos catálogos.
+     *
+     * Bloque 5: `$functionalLimitationText`, cuando se provee, se preserva
+     * LITERAL (nunca se resume) y se usa ÚNICAMENTE para calcular una
+     * sugerencia de `BodyRegion` adicional — vía
+     * `FunctionalLimitationCanonicalMapper`, un catálogo cerrado DISTINTO
+     * de `BodyRegionCanonicalMapper` — cuando el texto de la condición por
+     * sí solo no arrojó ninguna. Esa sugerencia sigue siendo solo una
+     * ETIQUETA para acelerar la revisión humana: jamás crea ni confirma
+     * una `TrainingRestriction` — ese camino sigue siendo exclusivamente
+     * `resolveWithRestriction()`, con revisor humano obligatorio.
      */
     public function declare(
         Contact $contact,
         string $originalText,
         HealthConditionCategory $category,
         ?int $sourceMessageId = null,
+        ?string $functionalLimitationText = null,
     ): DeclaredHealthCondition {
         $this->assertSourceMessageBelongsToContact($contact, $sourceMessageId);
 
-        $suggestedRegion = $this->suggestBodyRegion($originalText);
+        $suggestedRegion = $this->suggestBodyRegion($originalText, $functionalLimitationText);
 
         return DeclaredHealthCondition::create([
             'contact_id' => $contact->id,
             'original_text' => $originalText,
+            'functional_limitation_text' => $functionalLimitationText,
             'source_message_id' => $sourceMessageId,
             'category' => $category,
             'suggested_body_region' => $suggestedRegion,
@@ -151,14 +167,26 @@ class DeclaredHealthConditionRecorder
     }
 
     /**
-     * SOLO una etiqueta determinista, nunca una decisión. `null` si el
-     * texto no coincide exactamente con el catálogo — nunca se aproxima.
+     * SOLO una etiqueta determinista, nunca una decisión. `null` si ningún
+     * texto (condición o funcional) coincide exactamente con su catálogo
+     * respectivo — nunca se aproxima. El texto de condición tiene
+     * prioridad; el funcional es un respaldo cuando el de condición no
+     * arroja nada, nunca al revés (evita que un texto funcional "gane" a
+     * una condición ya reconocida).
      */
-    private function suggestBodyRegion(string $originalText): ?BodyRegion
+    private function suggestBodyRegion(string $originalText, ?string $functionalLimitationText): ?BodyRegion
     {
         $matches = $this->mapper->mapMany([$originalText]);
 
-        return $matches[0] ?? null;
+        if ($matches !== []) {
+            return $matches[0];
+        }
+
+        if ($functionalLimitationText !== null) {
+            return $this->functionalMapper->map($functionalLimitationText);
+        }
+
+        return null;
     }
 
     /**

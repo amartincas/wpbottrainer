@@ -61,6 +61,17 @@ class TrainingHandler implements HandlerInterface
     private const ACCESS_REQUIRED_MESSAGE = 'Tu perfil ya está listo. 💪 Para comenzar a entrenar necesitas activar '
         .'tu acceso. Escribe "quiero pagar" para ver las opciones.';
 
+    /**
+     * Bloque 5 — mostrado cuando `TrainingAccessGate` deniega con
+     * 'health_screening_pending': una `DeclaredHealthCondition` sigue
+     * `pending_review` para un contacto sin ninguna WorkoutSession todavía.
+     * Nunca afirma nada médico, nunca promete un plazo — solo informa que
+     * hay una revisión humana en curso.
+     */
+    private const HEALTH_SCREENING_PENDING_MESSAGE = 'Gracias por contarme. Antes de armar tu primera rutina, '
+        .'un miembro de nuestro equipo va a revisar la información que compartiste para asegurarnos de adaptarla '
+        .'bien. Te aviso en cuanto esté lista 💪';
+
     public function __construct(
         private readonly TrainingAccessGate $accessGate,
         private readonly TrainingEngine $engine,
@@ -365,9 +376,15 @@ class TrainingHandler implements HandlerInterface
 
     private function respondToDenial(?string $reason, string $from, Tenant $tenant): void
     {
-        $message = $reason === 'safety_flagged'
-            ? SafetySignalDetector::ESCALATION_MESSAGE
-            : self::ACCESS_REQUIRED_MESSAGE;
+        $message = match ($reason) {
+            'safety_flagged' => SafetySignalDetector::ESCALATION_MESSAGE,
+            // Bloque 5: mensaje propio, distinto del de emergencia y del de
+            // "activa tu acceso" — nunca hace afirmaciones médicas, solo
+            // informa que hay una revisión humana en curso. Ver
+            // TrainingAccessGate::authorize() y docs/DECISIONS.md D048.
+            'health_screening_pending' => self::HEALTH_SCREENING_PENDING_MESSAGE,
+            default => self::ACCESS_REQUIRED_MESSAGE,
+        };
 
         $this->reply($from, $message, $tenant);
     }

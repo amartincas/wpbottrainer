@@ -6,6 +6,7 @@ use App\Factories\AIServiceFactory;
 use App\Models\Tenant;
 use App\Training\Enums\Equipment;
 use App\Training\Enums\ExperienceLevel;
+use App\Training\Enums\HealthConditionCategory;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\Sex;
 use App\Training\Enums\TrainingGoal;
@@ -50,6 +51,14 @@ class OnboardingConversationService
         'available_equipment' => '¿Qué equipo tienes disponible para entrenar? Por ejemplo mancuernas, bandas, barra, o ninguno.',
         'sessions_per_week' => '¿Cuántos días a la semana puedes entrenar?',
         'physical_stats' => 'Para terminar de afinar tu plan, si quieres cuéntame tu edad, sexo, peso y estatura — no es obligatorio.',
+        // Bloque 5: HealthScreeningRequirement tiene un segundo texto de
+        // contingencia (seguimiento) que NO vive aquí — ver
+        // resolveQuestion()'s $fallbackOverride y
+        // HealthScreeningRequirement::questionContext(). Esta entrada es
+        // solo el default genérico (pregunta inicial) para cualquier
+        // llamador que no pase el override explícito.
+        'health_screening' => 'Antes de comenzar, quiero asegurarme de adaptar bien tu entrenamiento. '
+            .'¿Tienes actualmente alguna lesión, dolor, molestia o condición que debamos tener en cuenta?',
     ];
 
     /**
@@ -68,11 +77,13 @@ class OnboardingConversationService
         'available_equipment' => 'ask_equipment',
         'sessions_per_week' => 'ask_sessions_per_week',
         'physical_stats' => 'ask_physical_stats',
+        'health_screening' => 'ask_health_screening',
     ];
 
     private const VALID_NEXT_ACTIONS = [
         'ask_name', 'ask_goal', 'ask_experience_level', 'ask_primary_focus', 'ask_training_location',
         'ask_restrictions', 'ask_equipment', 'ask_sessions_per_week', 'ask_physical_stats',
+        'ask_health_screening',
         'complete_onboarding',
     ];
 
@@ -98,6 +109,8 @@ class OnboardingConversationService
      *         equipment_fully_equipped: ?bool, restrictions: ?array,
      *         sessions_per_week: ?int, age: ?int, sex: ?string,
      *         weight_kg: ?float, height_cm: ?int, safety_signal_text: ?string,
+     *         health_declaration_category: ?string, health_condition_text: ?string,
+     *         functional_limitation_text: ?string,
      *     },
      *     next_action: ?string,
      *     response: ?string,
@@ -158,10 +171,21 @@ class OnboardingConversationService
 
     /**
      * Decide, de forma 100% determinista, qué pregunta enviar al usuario.
-     * $realMissingField viene de TrainingProfile::firstMissingOnboardingField()
-     * (la única autoridad) — nunca de la IA.
+     * $realMissingField viene de la autoridad real (hoy
+     * OnboardingRequirementRegistry::firstPendingBlocking()) — nunca de la IA.
+     *
+     * Bloque 5: `$fallbackOverride` es opcional y retrocompatible — cuando
+     * se omite, se preserva exactamente el comportamiento anterior
+     * (`FALLBACK_QUESTIONS[$realMissingField]`, un texto fijo por campo).
+     * Se necesitó porque `HealthScreeningRequirement` tiene DOS textos de
+     * contingencia distintos (pregunta inicial vs. de seguimiento) según su
+     * propio estado conversacional — un mapa estático de un-texto-por-campo
+     * no alcanza para ese caso. El llamador (`TrainingHandler`) pasa
+     * siempre `$requirement->questionContext($profile, $contact)->fallbackQuestion`,
+     * haciendo de `QuestionContext` la fuente de verdad real para
+     * cualquier requirement, estático o dependiente de estado.
      */
-    public function resolveQuestion(string $realMissingField, ?string $aiNextAction, ?string $aiResponse): string
+    public function resolveQuestion(string $realMissingField, ?string $aiNextAction, ?string $aiResponse, ?string $fallbackOverride = null): string
     {
         $expectedAction = self::NEXT_ACTION_MAP[$realMissingField] ?? null;
 
@@ -169,7 +193,7 @@ class OnboardingConversationService
             return trim($aiResponse);
         }
 
-        return self::FALLBACK_QUESTIONS[$realMissingField] ?? self::FALLBACK_QUESTIONS['goal'];
+        return $fallbackOverride ?? self::FALLBACK_QUESTIONS[$realMissingField] ?? self::FALLBACK_QUESTIONS['goal'];
     }
 
     public function usedAiResponse(string $realMissingField, ?string $aiNextAction, ?string $aiResponse): bool
@@ -227,6 +251,9 @@ class OnboardingConversationService
                 'weight_kg' => null,
                 'height_cm' => null,
                 'safety_signal_text' => null,
+                'health_declaration_category' => null,
+                'health_condition_text' => null,
+                'functional_limitation_text' => null,
             ],
             'next_action' => null,
             'response' => null,
@@ -249,6 +276,7 @@ class OnboardingConversationService
         'restrictions' => 'si tiene alguna lesión, dolor o limitación física',
         'sessions_per_week' => 'cuántos días a la semana puede entrenar',
         'physical_stats' => 'sus datos físicos (edad/sexo/peso/estatura), opcionales',
+        'health_screening' => 'si tiene alguna lesión, dolor, molestia o condición de salud relevante, y si hay algún movimiento específico que deba evitar',
     ];
 
     private function buildCombinedPrompt(array $knownProfile, ?string $pendingField = null, ?string $opportunisticInvitation = null): string
@@ -281,9 +309,12 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin expl
     "sex": "male"|"female"|"prefer_not_to_say"|null,
     "weight_kg": <número>|null,
     "height_cm": <entero>|null,
-    "safety_signal_text": "<frase textual>"|null
+    "safety_signal_text": "<frase textual>"|null,
+    "health_declaration_category": "possible_injury"|"possible_recovery"|"professional_indication"|null,
+    "health_condition_text": "<frase textual>"|""|null,
+    "functional_limitation_text": "<frase textual>"|null
   },
-  "next_action": "ask_name"|"ask_goal"|"ask_experience_level"|"ask_primary_focus"|"ask_training_location"|"ask_restrictions"|"ask_equipment"|"ask_sessions_per_week"|"ask_physical_stats"|"complete_onboarding",
+  "next_action": "ask_name"|"ask_goal"|"ask_experience_level"|"ask_primary_focus"|"ask_training_location"|"ask_restrictions"|"ask_equipment"|"ask_sessions_per_week"|"ask_physical_stats"|"ask_health_screening"|"complete_onboarding",
   "response": "<tu respuesta conversacional en español>"
 }
 
@@ -291,6 +322,10 @@ Reglas de "extracted":
 - Usa null en cualquier campo que el mensaje no mencione. Usa [] únicamente si el usuario dice explícitamente que no tiene restricciones, no tiene equipo, o no tiene ninguna zona que priorizar (quiere trabajar todo por igual).
 - Cualquier lesión, dolor, molestia o limitación física que el usuario mencione (ej. "dolor en la rodilla", "molestia en la espalda") va SIEMPRE en "restrictions", sin importar si también aparece en "safety_signal_text" — son campos independientes, pueden llenarse ambos a la vez o solo uno.
 - "safety_signal_text": SOLO llénalo si el mensaje sugiere una posible urgencia médica real (dolor de pecho, dificultad para respirar, pérdida de conocimiento/desmayo, cirugía muy reciente, entumecimiento/hormigueo severo, lesión grave repentina, o complicación de embarazo). Una molestia o dolor ordinario de entrenamiento (rodilla, espalda, hombro, ciática, etc., sin esos signos) NO es una urgencia — usa null aquí aunque sí llenes "restrictions". Ejemplo: "tengo dolor en las rodillas" → restrictions: ["dolor en las rodillas"], safety_signal_text: null.
+- "health_condition_text"/"health_declaration_category"/"functional_limitation_text" son ESPECÍFICOS de la pregunta de screening de salud (independientes de "restrictions", que sigue existiendo por compatibilidad con perfiles antiguos pero ya no se usa para decidir nada nuevo) — solo tienen sentido cuando la pregunta pendiente indicada arriba es sobre "detectar cualquier lesión, dolor, molestia o condición" o sobre "identificar si existe un movimiento específico que deba evitarse":
+  - "health_condition_text": si el usuario NIEGA explícitamente tener cualquier lesión/dolor/molestia/condición (de cualquier forma natural: "no", "ninguna", "no tengo nada", "estoy bien"), usa "" (cadena vacía) — NUNCA null en ese caso (null significa "el mensaje no abordó el tema todavía"). Si el usuario SÍ menciona algo, usa el texto LITERAL de lo que dijo sobre su condición (ej. "tengo una lesión de hombro", o incluso algo vago como "me duele" o "sí, me molesta") — nunca lo resumas, nunca lo completes con detalles que no dijo, nunca lo dejes vacío si hay contenido real. Una afirmación totalmente vacía de contenido (un "sí" suelto, sin decir qué le pasa, cuando no es claro si entendió la pregunta) déjala en null en vez de inventar un texto — es preferible seguir preguntando a fabricar una declaración.
+  - "health_declaration_category": clasifica el texto de "health_condition_text" (cuando no es "" ni null) en "possible_injury" (lesión/dolor/molestia propia, el caso por defecto), "possible_recovery" (el usuario dice que ya se recuperó, ya está bien, ya sanó de algo que tenía antes), o "professional_indication" (el usuario reporta que un profesional de la salud —médico, fisioterapeuta, etc.— le dio una indicación). Si no es evidente cuál aplica, usa "possible_injury".
+  - "functional_limitation_text": SOLO cuando el usuario describe EXPLÍCITAMENTE qué movimiento, ejercicio o acción física no puede realizar o debe evitar (ej. "no puedo levantar el brazo por encima de la cabeza", "no puedo hacer sentadillas profundas", "debo evitar cargar peso en la espalda") — NUNCA lo infieras ni lo generes a partir de solo mencionar una lesión o dolor sin ese detalle. Si el usuario solo dice "tengo una lesión de hombro" sin especificar qué movimiento evitar, deja este campo en null aunque sí llenes "health_condition_text". Preserva el texto LITERAL — nunca resumas ni traduzcas esto a una zona del cuerpo; esa traducción la hace el código, nunca tú.
 - "equipment_fully_equipped": true SOLO si el usuario indica acceso amplio o completo a equipo SIN enumerar (ej. "tengo de todo", "tengo todo", "lo normal de un gimnasio", "está bien equipado") — en ese caso "available_equipment" puede quedar null o vacío, NUNCA inventes una lista de aparatos. Si el usuario menciona equipo específico (ej. "solo pesas", "tengo mancuernas y bandas", o incluso solo dice "gimnasio" sin más detalle sobre qué tiene), usa "available_equipment" con lo mencionado (o null si solo dijo el lugar, sin hablar de equipo) y deja "equipment_fully_equipped" en null — decir dónde entrena no es lo mismo que declarar que tiene todo el equipo.
 - "available_equipment": traduce cada aparato mencionado a este vocabulario cerrado (igual criterio que "primary_focus" — nunca dejes el término en español libre, nunca inventes un valor fuera de esta lista), usando esta tabla:
   - "mancuernas"/"pesas" (sin más detalle)/"pesas de mano" → "dumbbells"
@@ -336,7 +371,7 @@ Reglas de "extracted":
 - Si la pregunta pendiente indicada arriba es sobre el OBJETIVO GENERAL ("goal") y el usuario responde mencionando una o más zonas del cuerpo a priorizar (una respuesta de tipo "foco", ej. "piernas", "quiero trabajar glúteos") SIN mencionar ninguno de los 4 objetivos generales de la lista cerrada, extrae esas zonas en "primary_focus"/"secondary_focus" según corresponda (usando la tabla de traducción de más abajo) y deja "goal" en null — el objetivo general sigue sin responderse, nunca lo inventes ni lo fuerces a partir de una respuesta de foco. Esto aplica de forma general a cualquier zona del cuerpo, no solo a los ejemplos mencionados aquí.
 - Si la pregunta pendiente indicada arriba es sobre RESTRICCIONES/lesiones ("restrictions") y el usuario responde con cualquier negación natural (de cualquier forma: "no", "no tengo", "ninguna", "ninguno", "nada", "no la verdad", o equivalente), SIN mencionar ninguna lesión o limitación real, interpreta esto como una respuesta explícita de "sin restricciones" y usa restrictions: [] — nunca lo dejes en null en este caso (null significa "todavía no respondió", no "respondió que no tiene ninguna"). Esta regla es sobre el PATRÓN semántico de una negación directa a esa pregunta, no una lista fija de frases — reconoce cualquier forma natural equivalente en español.
 
-Reglas de "next_action": indica cuál de estos campos pendientes sigue sin responderse, en este orden de prioridad: name, goal, experience_level, primary_focus, training_location, available_equipment, restrictions, sessions_per_week, y por último (opcional) datos físicos. Usa "complete_onboarding" solo si ya no falta nada de lo anterior. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
+Reglas de "next_action": indica cuál de estos campos pendientes sigue sin responderse, en este orden de prioridad: name, goal, experience_level, training_location, available_equipment, health_screening, y luego (opcionales, no bloqueantes) sessions_per_week, primary_focus, datos físicos. Usa "complete_onboarding" solo si ya no falta nada de lo anterior. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
 
 Reglas de "response": redacta en tono natural y cercano, como un entrenador personal real — NUNCA como un formulario. Si ya conoces el nombre del usuario, puedes usarlo con naturalidad. Si el onboarding sigue incompleto, reconoce brevemente lo que el usuario acaba de decir y luego haz la siguiente pregunta de forma conversacional. Máximo 2-3 frases. Nunca uses los términos técnicos "primary_focus"/"secondary_focus" — habla de "zona a priorizar" o similar, en lenguaje natural.
 PROMPT;
@@ -382,6 +417,9 @@ PROMPT;
                 'safety_signal_text' => is_string($extractedRaw['safety_signal_text'] ?? null) && $extractedRaw['safety_signal_text'] !== ''
                     ? $extractedRaw['safety_signal_text']
                     : null,
+                'health_declaration_category' => $this->validateEnumValue($extractedRaw['health_declaration_category'] ?? null, HealthConditionCategory::class),
+                'health_condition_text' => $this->validateHealthConditionText($extractedRaw['health_condition_text'] ?? null),
+                'functional_limitation_text' => $this->validateNonEmptyString($extractedRaw['functional_limitation_text'] ?? null),
             ],
             'next_action' => is_string($nextAction) && in_array($nextAction, self::VALID_NEXT_ACTIONS, true) ? $nextAction : null,
             'response' => is_string($decoded['response'] ?? null) ? $decoded['response'] : null,
@@ -402,6 +440,44 @@ PROMPT;
     private function validateBool(mixed $value): ?bool
     {
         return is_bool($value) ? $value : null;
+    }
+
+    /**
+     * Bloque 5 — a diferencia de validateNonEmptyString(), preserva la
+     * distinción "" (negación explícita: preguntado, ninguna condición) vs.
+     * null (todavía sin responder) — mismo criterio ya usado para
+     * restrictions/available_equipment/primary_focus con arrays vacíos.
+     */
+    private function validateHealthConditionText(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        if ($value === '') {
+            return '';
+        }
+
+        $trimmed = trim($value);
+
+        return ($trimmed !== '' && mb_strlen($trimmed) <= self::MAX_RESPONSE_LENGTH) ? $trimmed : null;
+    }
+
+    /**
+     * Bloque 5 — para functional_limitation_text: SOLO texto literal no
+     * vacío, o null. A diferencia de health_condition_text, aquí "" no
+     * tiene significado propio (no existe una "negación explícita de
+     * limitación funcional" distinta de simplemente no mencionarla).
+     */
+    private function validateNonEmptyString(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        $trimmed = trim($value);
+
+        return ($trimmed !== '' && mb_strlen($trimmed) <= self::MAX_RESPONSE_LENGTH) ? $trimmed : null;
     }
 
     private function validateEnumValue(mixed $value, string $enumClass): ?string

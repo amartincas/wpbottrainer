@@ -44,7 +44,7 @@ it('F: the AI cannot substitute the requirement the system decided to ask — ev
 });
 
 it('fallbackQuestionFor() is the single source of truth reused by both resolveQuestion() and QuestionContext', function () {
-    foreach (['name', 'goal', 'experience_level', 'training_location', 'available_equipment', 'restrictions', 'sessions_per_week', 'primary_focus', 'physical_stats'] as $key) {
+    foreach (['name', 'goal', 'experience_level', 'training_location', 'available_equipment', 'restrictions', 'sessions_per_week', 'primary_focus', 'physical_stats', 'health_screening'] as $key) {
         expect(OnboardingConversationService::fallbackQuestionFor($key))->not->toBe('');
     }
 });

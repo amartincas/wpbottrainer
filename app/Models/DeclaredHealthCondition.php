@@ -31,6 +31,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 #[Fillable([
     'contact_id',
     'original_text',
+    'functional_limitation_text',
     'source_message_id',
     'category',
     'suggested_body_region',
@@ -59,6 +60,21 @@ class DeclaredHealthCondition extends Model
     public function contact(): BelongsTo
     {
         return $this->belongsTo(Contact::class);
+    }
+
+    /**
+     * Bloque 5 — única fuente de verdad para "¿hay algo esperando revisión
+     * humana para este contacto?". La usan tanto `TrainingAccessGate`
+     * (bloquea la primera rutina) como `HealthScreeningRequirement`
+     * (decide si la próxima pregunta es la inicial o la de seguimiento) —
+     * evita duplicar esta consulta en dos lugares.
+     */
+    public static function hasPendingReviewFor(int $contactId): bool
+    {
+        return static::query()
+            ->where('contact_id', $contactId)
+            ->where('status', HealthConditionStatus::PendingReview)
+            ->exists();
     }
 
     /**
