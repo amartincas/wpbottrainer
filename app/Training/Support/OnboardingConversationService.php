@@ -20,9 +20,15 @@ use Illuminate\Support\Facades\Log;
  *
  * Extract → Decide → Narrate (docs/DECISIONS.md, D007, D026, D033):
  * - extractAndRespond() hace Extract Y Narrate en UNA sola llamada.
- * - Decidir qué campo falta de verdad sigue sin pasar por aquí — sigue
- *   siendo TrainingProfile::firstMissingOnboardingField() (determinista).
- * - resolveQuestion() es el punto de Decide para la redacción.
+ * - Decidir qué campo falta de verdad sigue sin pasar por aquí — desde el
+ *   Bloque 4 es `App\Training\Onboarding\OnboardingRequirementRegistry`
+ *   (determinista) quien decide, TrainingHandler solo pasa la clave.
+ * - resolveQuestion() es el punto de Decide para la redacción, sin cambios.
+ *
+ * Bloque 4 (D047): el JSON/prompt/validadores permanecen intactos — la
+ * única adición es `$opportunisticInvitation` en extractAndRespond(), un
+ * fragmento ya compuesto por `OnboardingConversationComposer` según la
+ * política de turnos progresivos (Opción A: sin segunda llamada de IA).
  *
  * Hito 8.3: se agregan `name` (persistido en Contact.customer_name, no en
  * TrainingProfile — TrainingHandler lo aplica al modelo correcto),
@@ -110,7 +116,16 @@ class OnboardingConversationService
      *                                     (TrainingProfile::firstMissingOnboardingField()), exactamente
      *                                     igual que antes de este fix.
      */
-    public function extractAndRespond(string $messageBody, ?array $knownProfile, Tenant $tenant, ?string $pendingField = null): array
+    /**
+     * @param  string|null  $opportunisticInvitation  Bloque 4 — fragmento ya
+     *         compuesto por `App\Training\Onboarding\OnboardingConversationComposer`
+     *         (política de turnos progresivos), a inyectar en el MISMO
+     *         prompt combinado — NUNCA dispara una segunda llamada de IA.
+     *         `null` cuando la política de turnos no invita a ningún
+     *         requirement oportunista este turno (ver
+     *         OnboardingRequirementRegistry::secondaryOpportunisticFor()).
+     */
+    public function extractAndRespond(string $messageBody, ?array $knownProfile, Tenant $tenant, ?string $pendingField = null, ?string $opportunisticInvitation = null): array
     {
         $empty = $this->emptyResult();
 
@@ -120,7 +135,7 @@ class OnboardingConversationService
 
         try {
             $ai = AIServiceFactory::make($tenant);
-            $raw = $ai->getResponse($messageBody, $this->buildCombinedPrompt($knownProfile ?? [], $pendingField), []);
+            $raw = $ai->getResponse($messageBody, $this->buildCombinedPrompt($knownProfile ?? [], $pendingField, $opportunisticInvitation), []);
 
             return $this->parseCombinedJson($raw);
         } catch (\Throwable $e) {
@@ -128,6 +143,17 @@ class OnboardingConversationService
 
             return $empty;
         }
+    }
+
+    /**
+     * Bloque 4 — único punto de verdad para el texto de contingencia de un
+     * campo: usado tanto por `resolveQuestion()` (sin cambios) como por
+     * cada `OnboardingRequirement::questionContext()->fallbackQuestion`
+     * (nuevo), para no duplicar los textos en dos lugares.
+     */
+    public static function fallbackQuestionFor(string $key): string
+    {
+        return self::FALLBACK_QUESTIONS[$key] ?? self::FALLBACK_QUESTIONS['goal'];
     }
 
     /**
@@ -225,16 +251,17 @@ class OnboardingConversationService
         'physical_stats' => 'sus datos físicos (edad/sexo/peso/estatura), opcionales',
     ];
 
-    private function buildCombinedPrompt(array $knownProfile, ?string $pendingField = null): string
+    private function buildCombinedPrompt(array $knownProfile, ?string $pendingField = null, ?string $opportunisticInvitation = null): string
     {
         $known = json_encode($knownProfile);
         $pendingContext = $this->buildPendingFieldContext($pendingField);
+        $opportunisticContext = $opportunisticInvitation ?? '';
 
         return <<<PROMPT
 Eres un entrenador personal cercano, escribiendo por WhatsApp en español, ayudando a un usuario a configurar su perfil de entrenamiento.
 
 Perfil ya conocido (no lo repitas ni lo cambies si ya está aquí, salvo que el usuario lo corrija explícitamente): {$known}
-{$pendingContext}
+{$pendingContext}{$opportunisticContext}
 Del mensaje del usuario, extrae ÚNICAMENTE lo que menciona explícitamente. NUNCA inventes ni asumas un valor que no fue mencionado.
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin explicación) con esta forma exacta:

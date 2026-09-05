@@ -20,6 +20,8 @@ use App\Services\WhatsAppStatusTracker;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SplitType;
+use App\Training\Onboarding\OnboardingConversationComposer;
+use App\Training\Onboarding\OnboardingRequirementRegistry;
 use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
@@ -64,6 +66,8 @@ class TrainingHandler implements HandlerInterface
         private readonly TrainingEngine $engine,
         private readonly SafetySignalDetector $safetyDetector,
         private readonly OnboardingConversationService $onboarding,
+        private readonly OnboardingRequirementRegistry $requirementRegistry,
+        private readonly OnboardingConversationComposer $composer,
         private readonly ExecutionReportService $reportExtractor,
         private readonly ExecutionReportRecorder $reportRecorder,
         private readonly ContextBuilder $contextBuilder,
@@ -117,18 +121,35 @@ class TrainingHandler implements HandlerInterface
             return;
         }
 
-        // 2. Onboarding conversacional, mientras falte algún dato obligatorio.
-        // Hito 5.1: Extract+Narrate fusionados en UNA llamada de IA. Hito 8.3:
-        // se agregan nombre/training_location (bloqueantes) y datos físicos
-        // (nunca bloqueantes, se preguntan una sola vez) — ver
-        // App\Training\Support\OnboardingConversationService y D026/D033 en
-        // docs/DECISIONS.md.
-        if (! $profile->isOnboardingComplete($contact)) {
+        // 2. Onboarding conversacional, mientras falte algún requirement
+        // bloqueante. Bloque 4 (ver docs/DECISIONS.md D047):
+        // OnboardingRequirementRegistry reemplaza a
+        // TrainingProfile::firstMissingOnboardingField()/isOnboardingComplete()
+        // como autoridad real — ya NO trata primary_focus/sessions_per_week
+        // como bloqueantes (cambio de producto deliberado). Extract+Narrate
+        // siguen fusionados en UNA sola llamada de IA (D026, Opción A
+        // aprobada) — OnboardingConversationComposer solo aporta un
+        // fragmento de prompt adicional, nunca dispara una segunda llamada.
+        // Ver App\Training\Onboarding\*.
+        if (! $this->requirementRegistry->isOnboardingComplete($profile, $contact)) {
+            // "onboarding_turns": una interacción procesada mientras el
+            // onboarding está incompleto — nunca una pregunta individual, ni
+            // una llamada de IA. Se incrementa una sola vez por turno, antes
+            // de decidir qué preguntar, para que la política de turnos
+            // progresivos (secondaryOpportunisticFor()) ya conozca el número
+            // de turno correcto de ESTE turno.
+            $profile->increment('onboarding_turns');
+
             $fragment = $this->buildContext($context, 'training_profile');
-            $pendingFieldBeforeTurn = $profile->firstMissingOnboardingField($contact);
+            $pending = $this->requirementRegistry->firstPendingBlocking($profile, $contact);
+            $secondary = $this->requirementRegistry->secondaryOpportunisticFor($profile->onboarding_turns, $profile, $contact);
+
+            $opportunisticInvitation = $secondary !== null
+                ? $this->composer->describeOpportunisticInvitation($secondary->questionContext($profile, $contact))
+                : null;
 
             $aiCallStartedAt = microtime(true);
-            $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant, $pendingFieldBeforeTurn);
+            $result = $this->onboarding->extractAndRespond($body, $fragment->data, $tenant, $pending->key(), $opportunisticInvitation);
             $aiCallElapsedMs = (int) round((microtime(true) - $aiCallStartedAt) * 1000);
             $extracted = $result['extracted'];
 
@@ -144,32 +165,33 @@ class TrainingHandler implements HandlerInterface
                 }
             }
 
-            $this->applyExtractedFields($contact, $profile, $extracted);
+            $this->requirementRegistry->applyExtracted($contact, $profile, $extracted);
 
-            // Los datos físicos se preguntan una sola vez (Hito 8.3, aprobado
-            // explícitamente): si el campo pendiente ANTES de este turno ya
-            // era 'physical_stats', este turno fue la oportunidad de
-            // responder — se acepta lo que haya llegado (parcial o nada) y
-            // no se vuelve a insistir, sin importar si la IA extrajo algo.
-            if ($pendingFieldBeforeTurn === 'physical_stats') {
-                $profile->update(['physical_stats_asked' => true]);
-            }
+            // onAsked() se invoca para lo que realmente se ofreció este
+            // turno (principal + secundario/oportunista, si hubo), sin
+            // importar si el usuario respondió — necesario para que
+            // PhysicalStatsRequirement reproduzca "se pregunta una sola
+            // vez, sin importar la respuesta" (ver OnboardingRequirement::onAsked()).
+            // No-op para el resto de requirements.
+            $pending->onAsked($contact, $profile);
+            $secondary?->onAsked($contact, $profile);
 
             $profile = $profile->fresh();
             $contact = $contact->fresh();
 
-            if (! $profile->isOnboardingComplete($contact)) {
-                $realMissingField = $profile->firstMissingOnboardingField($contact);
-                $question = $this->onboarding->resolveQuestion($realMissingField, $result['next_action'], $result['response']);
+            if (! $this->requirementRegistry->isOnboardingComplete($profile, $contact)) {
+                $realMissing = $this->requirementRegistry->firstPendingBlocking($profile, $contact);
+                $question = $this->onboarding->resolveQuestion($realMissing->key(), $result['next_action'], $result['response']);
 
                 // Métricas Hito 5.1: comparar contra la línea base de 2
                 // llamadas/30-45s — ver docs/DECISIONS.md (D026).
                 Log::info('ONBOARDING_TURN_METRICS', [
                     'tenant_id' => $tenant->id,
                     'contact_id' => $contact->id,
+                    'onboarding_turn' => $profile->onboarding_turns,
                     'ai_call_elapsed_ms' => $aiCallElapsedMs,
                     'ai_calls_count' => 1,
-                    'used_ai_response' => $this->onboarding->usedAiResponse($realMissingField, $result['next_action'], $result['response']),
+                    'used_ai_response' => $this->onboarding->usedAiResponse($realMissing->key(), $result['next_action'], $result['response']),
                 ]);
 
                 $this->reply($from, $question, $tenant);
@@ -339,43 +361,6 @@ class TrainingHandler implements HandlerInterface
         }
 
         return $lines !== [] ? implode("\n", $lines) : 'Listo.';
-    }
-
-    /**
-     * Hito 8.3: `name` se persiste en Contact.customer_name (identidad, no
-     * vive en TrainingProfile) — nunca se sobrescribe si el usuario ya tenía
-     * un nombre guardado, salvo corrección explícita (fuera de alcance de
-     * este hito: hoy simplemente no se vuelve a preguntar una vez existe).
-     */
-    private function applyExtractedFields(Contact $contact, TrainingProfile $profile, array $extracted): void
-    {
-        if ($extracted['name'] !== null && $contact->customer_name === null) {
-            $contact->update(['customer_name' => $extracted['name']]);
-        }
-
-        $updates = [];
-
-        foreach ([
-            'goal', 'experience_level', 'primary_focus', 'secondary_focus',
-            'restrictions', 'available_equipment',
-            'equipment_fully_equipped', 'training_location', 'sessions_per_week',
-            'age', 'sex', 'weight_kg', 'height_cm',
-        ] as $field) {
-            if ($extracted[$field] !== null) {
-                $updates[$field] = $extracted[$field];
-            }
-        }
-
-        // Hito 9.0: sessions_per_week por sí solo no cambiaba nada en
-        // TrainingEngine — su único efecto real es derivar split_type,
-        // determinísticamente, cada vez que se captura o se actualiza.
-        if ($extracted['sessions_per_week'] !== null) {
-            $updates['split_type'] = TrainingProfile::deriveSplitTypeFromSessionsPerWeek($extracted['sessions_per_week']);
-        }
-
-        if ($updates !== []) {
-            $profile->update($updates);
-        }
     }
 
     private function respondToDenial(?string $reason, string $from, Tenant $tenant): void

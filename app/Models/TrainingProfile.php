@@ -29,6 +29,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'weight_kg',
     'height_cm',
     'physical_stats_asked',
+    'onboarding_turns',
     'training_location',
     'split_type',
     'next_focus',
@@ -59,6 +60,7 @@ class TrainingProfile extends Model
             'weight_kg' => 'decimal:2',
             'height_cm' => 'integer',
             'physical_stats_asked' => 'boolean',
+            'onboarding_turns' => 'integer',
             'training_location' => TrainingLocation::class,
             'split_type' => SplitType::class,
             'safety_status' => SafetyStatus::class,
@@ -224,6 +226,15 @@ class TrainingProfile extends Model
      * capturan desde MVP (docs/DECISIONS.md) pero nunca bloquean el
      * onboarding; se preguntan una sola vez (`physical_stats_asked`) y se
      * acepta cualquier respuesta, incluida ninguna.
+     *
+     * @deprecated Bloque 4 (ver docs/DECISIONS.md D047): `TrainingHandler`
+     * ya no usa este método — la autoridad real es
+     * `App\Training\Onboarding\OnboardingRequirementRegistry::isOnboardingComplete()`,
+     * que además ya NO trata `primary_focus`/`sessions_per_week` como
+     * bloqueantes (cambio de producto deliberado). Se conserva sin
+     * modificar por compatibilidad con otros consumidores/tests que no
+     * forman parte del alcance del Bloque 4 — su remoción es limpieza
+     * futura, no de este bloque.
      */
     public function isOnboardingComplete(Contact $contact): bool
     {
@@ -241,6 +252,11 @@ class TrainingProfile extends Model
      * oportunista) — ver docs/DECISIONS.md D034. `secondary_focus` nunca
      * bloquea el onboarding: es una representación interna derivada, el
      * usuario nunca la ve ni la responde directamente.
+     *
+     * @deprecated Bloque 4 (ver docs/DECISIONS.md D047): superseded por
+     * `OnboardingRequirementRegistry::firstPendingBlocking()`, que también
+     * reclasifica `primary_focus` y `sessions_per_week` como oportunistas
+     * (no bloqueantes) — ver la nota de `isOnboardingComplete()` arriba.
      */
     public function firstMissingOnboardingField(Contact $contact): ?string
     {

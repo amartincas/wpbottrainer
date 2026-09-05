@@ -16,6 +16,16 @@ use App\Payments\Support\PaymentIntentClassifier;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
+use App\Training\Onboarding\OnboardingRequirementRegistry;
+use App\Training\Onboarding\Requirements\EquipmentRequirement;
+use App\Training\Onboarding\Requirements\ExperienceLevelRequirement;
+use App\Training\Onboarding\Requirements\GoalRequirement;
+use App\Training\Onboarding\Requirements\NameRequirement;
+use App\Training\Onboarding\Requirements\PhysicalStatsRequirement;
+use App\Training\Onboarding\Requirements\PrimaryFocusRequirement;
+use App\Training\Onboarding\Requirements\RestrictionsRequirement;
+use App\Training\Onboarding\Requirements\SessionsPerWeekRequirement;
+use App\Training\Onboarding\Requirements\TrainingLocationRequirement;
 use App\Training\Support\SafetySignalPreRoutingScreen;
 use App\Training\Support\TrainingIntentClassifier;
 use Carbon\CarbonImmutable;
@@ -85,6 +95,27 @@ class AppServiceProvider extends ServiceProvider
         $this->app->singleton(ContextBuilder::class, fn ($app) => new ContextBuilder($app, [
             'training_profile' => TrainingProfileContextProvider::class,
             'active_workout_session' => ActiveWorkoutSessionContextProvider::class,
+        ]));
+
+        // Bloque 4 — OnboardingRequirementRegistry: mismo patrón de
+        // Router/Dispatcher (mapa de CLASES, no instancias, resuelto por el
+        // Container en cada uso). El ORDEN de este array es la prioridad de
+        // preguntas — agregar un requirement nuevo es una clase + una línea
+        // aquí, sin tocar TrainingHandler/TrainingEngine (ver docs/DECISIONS.md D047).
+        // Capa 1 (bloqueante): Name, Goal, ExperienceLevel, TrainingLocation,
+        // Equipment, Restrictions (legacy temporal, ver RestrictionsRequirement).
+        // Capa 2 (oportunista, nunca bloquea): SessionsPerWeek, PrimaryFocus,
+        // PhysicalStats.
+        $this->app->singleton(OnboardingRequirementRegistry::class, fn ($app) => new OnboardingRequirementRegistry($app, [
+            NameRequirement::class,
+            GoalRequirement::class,
+            ExperienceLevelRequirement::class,
+            TrainingLocationRequirement::class,
+            EquipmentRequirement::class,
+            RestrictionsRequirement::class,
+            SessionsPerWeekRequirement::class,
+            PrimaryFocusRequirement::class,
+            PhysicalStatsRequirement::class,
         ]));
     }
 
