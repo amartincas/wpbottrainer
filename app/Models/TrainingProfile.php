@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'contact_id',
@@ -69,6 +70,17 @@ class TrainingProfile extends Model
     public function contact(): BelongsTo
     {
         return $this->belongsTo(Contact::class);
+    }
+
+    /**
+     * Hito de seguridad de restricciones — fuente NUEVA y estructurada de
+     * restricciones (contrato canónico), vía `contact_id`. Convive con
+     * `restrictions` (legacy, texto libre) — SOLO `SafetyRestrictionResolver`
+     * conoce ambas a la vez; este modelo no las mezcla ni decide nada.
+     */
+    public function trainingRestrictions(): HasMany
+    {
+        return $this->hasMany(TrainingRestriction::class, 'contact_id', 'contact_id');
     }
 
     /**

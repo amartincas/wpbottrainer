@@ -16,6 +16,8 @@ use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Facades\Log;
@@ -36,7 +38,7 @@ function makeReadyContact(array $profileOverrides = []): Contact
 
 function trainingEngine(): TrainingEngine
 {
-    return new TrainingEngine(new TrainingAccessGate);
+    return new TrainingEngine(new TrainingAccessGate, new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
 }
 
 it('blocks generation with no_access when there is no TrainingAccess', function () {

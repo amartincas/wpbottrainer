@@ -11,6 +11,7 @@ use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Collection;
@@ -104,7 +105,10 @@ class TrainingEngine
         'push_pull_legs' => ['arms,chest,shoulders', 'arms,back', 'core,legs'],
     ];
 
-    public function __construct(private readonly TrainingAccessGate $accessGate) {}
+    public function __construct(
+        private readonly TrainingAccessGate $accessGate,
+        private readonly SafetyRestrictionResolver $safetyResolver,
+    ) {}
 
     /**
      * Decide la próxima WorkoutSession para un Contact. Si ya existe una
@@ -426,13 +430,23 @@ class TrainingEngine
      * equipamiento. `equipment_fully_equipped` (Hito 8.3) hace que CUALQUIER
      * ejercicio sea elegible en cuanto a equipo — declarar acceso amplio
      * significa que no vale la pena enumerar qué tiene exactamente.
+     *
+     * Hito de seguridad de restricciones: la comparación de seguridad ya
+     * no lee los campos crudos de restricciones/contraindicaciones de
+     * forma directa — ambos se resuelven a un contrato canónico vía
+     * `SafetyRestrictionResolver`, la única pieza que conoce el mecanismo
+     * legacy (texto libre) y el nuevo (`TrainingRestriction` estructurado).
+     * Este motor sigue haciendo exactamente la misma intersección de
+     * siempre, solo que sobre datos ya nivelados — no conoce
+     * `TrainingRestriction`, `DeclaredHealthCondition`, `source`, `status`,
+     * ni revisión humana.
      */
     private function isEligible(Exercise $exercise, TrainingProfile $profile): bool
     {
-        $restrictions = $profile->restrictions ?? [];
-        $contraindications = $exercise->contraindications ?? [];
+        $activeRestrictions = $this->safetyResolver->activeSafetyBodyRegions($profile);
+        $exerciseSafetyTags = $this->safetyResolver->exerciseBodyRegions($exercise);
 
-        if (array_intersect($restrictions, $contraindications) !== []) {
+        if (array_intersect($activeRestrictions, $exerciseSafetyTags) !== []) {
             return false;
         }
 
