@@ -954,6 +954,36 @@ Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar
 
 ---
 
+### D046 — `prescription_context_snapshot` (Bloque 3) y Fundación Temporal
+
+**CONTEXTO**: no existía forma de reconstruir, para una `WorkoutSession` ya generada, qué contexto real (objetivo, nivel, foco, ubicación, equipamiento, restricciones activas) usó `TrainingEngine` para prescribirla — si el `TrainingProfile` cambiaba después, se perdía esa evidencia histórica. En paralelo, se identificó que el TIEMPO no tenía todavía un tratamiento explícito como concepto de primera clase en la arquitectura de Training, necesario como base para historial/Coach/programación/recordatorios futuros.
+
+**DECISIÓN TOMADA — snapshot**:
+
+1. **Columna nueva `prescription_context_snapshot`** (`json`, nullable) en `workout_sessions`, cast `array`, poblada UNA sola vez dentro de `TrainingEngine::decideNextSession()` en el momento de creación de la fila — mismo patrón ya existente de `WorkoutExercise.exercise_snapshot` (congelado, inmutable por convención, nunca reescrito).
+2. **`TrainingProfile::toPrescriptionContextSnapshot(string $decidedFocus, array $activeSafetyTags, DateTimeInterface $generatedAt): array`** — vive en el modelo fuente (mismo lugar que `Exercise::toSnapshot()`), y NO conoce `SafetyRestrictionResolver` ni `TrainingEngine`: recibe como parámetros lo que no puede calcular por sí mismo. Congela ÚNICAMENTE los campos verificados por lectura de código como realmente usados por el motor: `goal`, `experience_level`, `primary_focus`, `secondary_focus`, `decided_focus` (el foco de rotación real de esta sesión, distinto de `primary_focus`/`secondary_focus`), `split_type`, `training_location`, `available_equipment`, `equipment_fully_equipped`, `active_safety_tags`. Deliberadamente FUERA: `age`/`sex`/`weight_kg`/`height_cm`/`physical_stats_asked`/`sessions_per_week` (sin consumidor real en la prescripción — `sessions_per_week` ya está reflejado en `split_type`), `restrictions` crudo (ya nivelado en `active_safety_tags`), todo el bloque `safety_status/*` (pertenece a control de ACCESO, resuelto aguas arriba por `TrainingAccessGate`, no a la prescripción).
+3. **`active_safety_tags`**: reutiliza literalmente `SafetyRestrictionResolver::activeSafetyBodyRegions($profile)` — el mismo array plano que `isEligible()` ya usa. Cero lógica de seguridad duplicada; `TrainingEngine` no gana ningún conocimiento nuevo de `TrainingRestriction`/`DeclaredHealthCondition`.
+4. **`schema_version: 1`**: marca de esquema para poder interpretar snapshots históricos si la forma cambia en el futuro — no es un sistema de versionado genérico, solo un entero.
+5. **Sesiones históricas sin snapshot quedan en `null` para siempre** — cero backfill, cero inferencia desde el `TrainingProfile` actual (fabricaría una respuesta falsa a "qué se usó entonces").
+
+**DECISIÓN TOMADA — Fundación Temporal**:
+
+6. **`prescribed_at` vs `scheduled_at` son conceptos distintos, aunque hoy coincidan**: `prescribed_at` (conceptual, representado por `prescription_context_snapshot.generated_at`) es el instante en que `TrainingEngine` decidió la prescripción; `scheduled_at` (campo real de `WorkoutSession`, sin cambios) es el instante para el que la sesión está prevista. Coinciden hoy únicamente porque `TrainingEngine` no soporta programación anticipada — no por definición.
+7. **Se eligió NO agregar una columna `prescribed_at` separada** (opción B sobre A): `prescription_context_snapshot.generated_at` ya cumple ese rol histórico sin duplicar dato ni requerir migración; una columna dedicada solo se justificará cuando exista programación real que haga divergir ambos instantes.
+8. **`generated_at` documentado sin ambigüedad**: representa el instante de prescripción, nunca el momento de entrega por WhatsApp (campo `delivered_at`, todavía inexistente) ni un compromiso de programación futura.
+9. **Zona horaria (decisión diferida, no implementada)**: cualquier interpretación futura de fecha/hora/día relativo/recordatorio/programación deberá resolverse con la zona horaria del contacto/usuario — nunca asumiendo UTC, nunca calculada libremente por la IA. Hoy no existe campo de timezone en `Contact`/`TrainingProfile`; se documenta como necesidad futura, no se crea ahora.
+10. **Patrón para la futura capa temporal (diferida, no implementada)**: mismo Extract → Decide → Narrate ya usado en `TrainingEngine`/`SafetySignalDetector`/`ExecutionReportService` — la IA puede extraer/parafrasear señales de lenguaje natural ("el jueves que viene", "a las 2pm"), pero la resolución final a fecha/hora concreta la hará una capa determinista separada y todavía sin nombre ni implementación (explícitamente NO `TemporalContextManager`/`Scheduler`/DSL de fechas), nunca el LLM ni un futuro `TrainingCoachService` decidiendo por sí solos.
+11. **Impacto futuro en historial (diferido)**: los futuros `ContextProvider` de historial deberán considerar no solo "qué sesión" sino "cuándo" — fecha de prescripción, programada, de entrega, de inicio, de finalización — cuando esos timestamps existan. No se agregan campos sin consumidor hoy.
+12. **Impacto futuro en el Coach (diferido)**: un futuro `TrainingCoachService` podrá usar contexto temporal real (`scheduled_at`, `generated_at`) para respuestas de continuidad ("el jueves toca espalda", "la última sesión de espalda fue hace 7 días"), pero nunca será la autoridad que calcula fechas o decide calendarios.
+
+**Explícitamente NO implementado en este bloque**: columna `prescribed_at`, parser de fechas naturales, cálculo de "mañana"/"el próximo jueves", `ReminderService`, `Scheduler`, reprogramación, notificaciones de recordatorio, infraestructura de timezone, `TemporalContextManager`, abstracción de Calendar/Scheduler, DSL de fechas, framework de versionado genérico.
+
+**IMPACTO**: `database/migrations/2026_09_05_000004_add_prescription_context_snapshot_to_workout_sessions_table.php` (nuevo), `app/Models/WorkoutSession.php` (fillable + cast + docblock), `app/Models/TrainingProfile.php` (+`toPrescriptionContextSnapshot()`), `app/Training/Engine/TrainingEngine.php` (`decideNextSession()`: captura única de `$generatedAt`, nueva clave en `WorkoutSession::create()`).
+
+**Tests**: `PrescriptionContextSnapshotTest` (10 — A: snapshot generado; B: valores reales congelados, incluyendo que `generated_at` coincide con `scheduled_at` al segundo por la implementación actual; C: `active_safety_tags` vía `SafetyRestrictionResolver`; D/E: inmutable frente a cambios posteriores del perfil/restricciones; F: una nueva sesión produce un snapshot distinto; G: lectura estable, sin recomputar; H: factory directa deja `null`; I: sin regresión en la creación de sesiones; J: `decided_focus` distinto del `next_focus` escrito después).
+
+---
+
 ## Deuda técnica y hallazgos documentados (Hitos 1-7, no corregidos, fuera de alcance)
 
 - Con el Router ya extraído, `FallbackChatHandler` sigue conteniendo toda la lógica de negocio previa (catálogo de productos, extracción de lead) sin descomponer más — es la única forma de intent hoy, y descomponerla más no era el objetivo del Hito 2 ("extraer, no reescribir").

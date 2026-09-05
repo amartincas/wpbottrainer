@@ -152,11 +152,33 @@ class TrainingEngine
 
         $exercises = $this->selectExercises($profile, $focus, $recentSessions, $contact);
 
+        // Bloque 3 — Fundación Temporal (ver docs/DECISIONS.md D046):
+        // capturado UNA sola vez. Conceptualmente es `prescribed_at` — el
+        // instante en que TrainingEngine tomó la decisión de prescribir —
+        // que NO es el mismo concepto que `scheduled_at` (el instante para
+        // el que la sesión está prevista), aunque hoy coincidan por
+        // construcción: este motor no soporta programación anticipada, así
+        // que "decidido ahora" y "previsto para ahora" son, hoy, el mismo
+        // número. Por eso se reutiliza la misma variable para ambos sin
+        // cambiar el significado de `scheduled_at`. Si en el futuro se
+        // introduce programación real (una capacidad temporal separada y
+        // determinista, explícitamente fuera de este bloque), `prescribed_at`
+        // deberá capturarse independientemente de `scheduled_at` — hoy no
+        // se crea esa columna porque no existe ningún consumidor real que
+        // la necesite fuera de `prescription_context_snapshot.generated_at`,
+        // que ya cumple ese rol histórico.
+        $generatedAt = now();
+
         $session = WorkoutSession::create([
             'contact_id' => $contact->id,
             'status' => WorkoutSessionStatus::Scheduled,
-            'scheduled_at' => now(),
+            'scheduled_at' => $generatedAt,
             'generated_by' => 'training_engine',
+            'prescription_context_snapshot' => $profile->toPrescriptionContextSnapshot(
+                $focus,
+                $this->safetyResolver->activeSafetyBodyRegions($profile),
+                $generatedAt,
+            ),
         ]);
 
         foreach ($exercises as $index => $exercise) {

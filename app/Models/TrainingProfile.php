@@ -140,6 +140,54 @@ class TrainingProfile extends Model
     }
 
     /**
+     * Bloque 3 — congela ÚNICAMENTE los campos de este perfil que realmente
+     * participan en la decisión de `TrainingEngine` (verificado leyendo su
+     * código, no supuesto): `age`/`sex`/`weight_kg`/`height_cm`/
+     * `physical_stats_asked`/`sessions_per_week`/`restrictions` crudo/todo
+     * el bloque `safety_*` quedan deliberadamente FUERA — sin consumidor
+     * real en la prescripción (o, en el caso de `restrictions`, ya nivelado
+     * en `$activeSafetyTags`).
+     *
+     * Este modelo NO conoce `SafetyRestrictionResolver` ni `TrainingEngine`
+     * — por eso el foco decidido y los tags de seguridad ya nivelados se
+     * reciben como parámetros, calculados por quien sí los conoce
+     * (`TrainingEngine`), exactamente igual que `Exercise::toSnapshot()` no
+     * depende de nada externo a `Exercise` mismo.
+     *
+     * @param  array<int, string>  $activeSafetyTags  Resultado de
+     *         SafetyRestrictionResolver::activeSafetyBodyRegions($this) en
+     *         el mismo instante — nunca recalculado aquí, para no duplicar
+     *         lógica de seguridad.
+     * @param  \DateTimeInterface  $generatedAt  Fundación Temporal (Bloque 3,
+     *         ver docs/DECISIONS.md D046): representa `prescribed_at` —el
+     *         instante exacto en que `TrainingEngine` tomó ESTA decisión de
+     *         prescripción—, NUNCA el momento en que el mensaje se entregó
+     *         por WhatsApp (ese timestamp no existe todavía como campo) ni
+     *         un compromiso de programación futura. Es un concepto distinto
+     *         de `WorkoutSession.scheduled_at` (el instante para el que la
+     *         sesión está prevista), aunque hoy ambos coincidan porque
+     *         `TrainingEngine` no soporta programación anticipada.
+     */
+    public function toPrescriptionContextSnapshot(string $decidedFocus, array $activeSafetyTags, \DateTimeInterface $generatedAt): array
+    {
+        return [
+            'schema_version' => 1,
+            'goal' => $this->goal?->value,
+            'experience_level' => $this->experience_level?->value,
+            'primary_focus' => $this->primary_focus ?? [],
+            'secondary_focus' => $this->secondary_focus ?? [],
+            'decided_focus' => $decidedFocus,
+            'split_type' => $this->split_type->value,
+            'training_location' => $this->training_location?->value,
+            'available_equipment' => $this->available_equipment ?? [],
+            'equipment_fully_equipped' => $this->equipment_fully_equipped,
+            'active_safety_tags' => array_values($activeSafetyTags),
+            // prescribed_at conceptual — ver docblock del parámetro $generatedAt.
+            'generated_at' => $generatedAt->toISOString(),
+        ];
+    }
+
+    /**
      * Hito 9.0: `sessions_per_week` no tenía ningún consumidor real en
      * `TrainingEngine` — se capturaba y persistía, pero no cambiaba nada
      * (hallazgo explícito, ver docs/DECISIONS.md). Esta es su única
