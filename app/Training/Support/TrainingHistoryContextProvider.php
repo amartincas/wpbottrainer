@@ -134,6 +134,11 @@ class TrainingHistoryContextProvider
             note: $log?->note,
             skipReason: $log?->skip_reason,
             loggedAt: $log?->logged_at,
+            // Bloque 7 (extensión aditiva de D049): prescripción histórica de
+            // ESTA misma ejecución, nunca del perfil actual ni del catálogo vivo.
+            prescribedReps: $workoutExercise->prescribed_reps,
+            prescribedLoad: $workoutExercise->prescribed_load !== null ? (float) $workoutExercise->prescribed_load : null,
+            prescribedSets: $workoutExercise->prescribed_sets,
         );
     }
 

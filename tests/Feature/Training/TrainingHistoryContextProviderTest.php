@@ -607,6 +607,94 @@ it('39: TrainingHistoryContextProvider never references any AI service', functio
 
 // ── 40: sin N+1 evidente ──
 
+// ── Bloque 7: extensión aditiva — prescribedReps/prescribedLoad/prescribedSets ──
+
+it('41: prescribedReps/prescribedLoad/prescribedSets come from that same historical WorkoutExercise', function () {
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    $session = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
+    $exercise = Exercise::factory()->create();
+
+    $we = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_reps' => 12,
+        'prescribed_load' => 35.5,
+        'prescribed_sets' => 4,
+    ]);
+    ExerciseLog::factory()->create(['workout_exercise_id' => $we->id]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $we->fresh()->exerciseLog->id, 'actual_reps' => 12, 'actual_load' => 35.5]);
+
+    $context = historyProvider()->build($contact->fresh());
+    $entry = $context->sessions[0]->exercises[0];
+
+    expect($entry->prescribedReps)->toBe(12);
+    expect($entry->prescribedLoad)->toBe(35.5);
+    expect($entry->prescribedSets)->toBe(4);
+});
+
+it('42: prescribedReps/prescribedLoad/prescribedSets are null when the historical prescription did not set them', function () {
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    $session = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
+    $exercise = Exercise::factory()->create();
+
+    $we = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_reps' => null,
+        'prescribed_load' => null,
+        'prescribed_sets' => null,
+    ]);
+    ExerciseLog::factory()->create(['workout_exercise_id' => $we->id]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $we->fresh()->exerciseLog->id]);
+
+    $context = historyProvider()->build($contact->fresh());
+    $entry = $context->sessions[0]->exercises[0];
+
+    expect($entry->prescribedReps)->toBeNull();
+    expect($entry->prescribedLoad)->toBeNull();
+    expect($entry->prescribedSets)->toBeNull();
+});
+
+it('43: prescribedReps/prescribedLoad/prescribedSets are independent per execution, never taken from the current profile or catalog', function () {
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    $exercise = Exercise::factory()->create();
+
+    $older = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDays(2)]);
+    $weOlder = WorkoutExercise::factory()->create([
+        'workout_session_id' => $older->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_reps' => 8,
+        'prescribed_sets' => 3,
+    ]);
+    ExerciseLog::factory()->create(['workout_exercise_id' => $weOlder->id]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $weOlder->fresh()->exerciseLog->id]);
+
+    $newer = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDay()]);
+    $weNewer = WorkoutExercise::factory()->create([
+        'workout_session_id' => $newer->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_reps' => 12,
+        'prescribed_sets' => 5,
+    ]);
+    ExerciseLog::factory()->create(['workout_exercise_id' => $weNewer->id]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $weNewer->fresh()->exerciseLog->id]);
+
+    $context = historyProvider()->build($contact->fresh());
+
+    // sessions[0] es la más reciente (scheduled_at DESC).
+    expect($context->sessions[0]->exercises[0]->prescribedReps)->toBe(12);
+    expect($context->sessions[0]->exercises[0]->prescribedSets)->toBe(5);
+    expect($context->sessions[1]->exercises[0]->prescribedReps)->toBe(8);
+    expect($context->sessions[1]->exercises[0]->prescribedSets)->toBe(3);
+});
+
 it('40: query count does not grow with the number of exercises/sets (no obvious N+1)', function () {
     $contact = Contact::factory()->create();
     TrainingProfile::factory()->create(['contact_id' => $contact->id]);

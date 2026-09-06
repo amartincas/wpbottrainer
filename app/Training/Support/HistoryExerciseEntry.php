@@ -12,6 +12,14 @@ use Carbon\CarbonInterface;
  * aunque `exerciseId` sea `null` (Exercise borrado) o el ejercicio actual
  * esté `is_active=false`: el snapshot histórico manda, el catálogo actual
  * no participa en absoluto en su reconstrucción.
+ *
+ * Bloque 7 (D049, extensión aditiva — ver docs/DECISIONS.md): `prescribedReps`
+ * / `prescribedLoad` / `prescribedSets` son la prescripción histórica de ESTA
+ * MISMA ejecución (columnas ya existentes de `WorkoutExercise`, inmutables
+ * desde su creación) — nunca del perfil actual ni del catálogo vivo, y nunca
+ * una decisión del proveedor: son un dato de prescripción pasada, expuesto
+ * para que `ProgressionEvaluator` pueda comparar lo ejecutado contra lo
+ * prescrito en esa ejecución concreta.
  */
 final readonly class HistoryExerciseEntry
 {
@@ -27,5 +35,8 @@ final readonly class HistoryExerciseEntry
         public ?string $note,
         public ?SkipReason $skipReason,
         public ?CarbonInterface $loggedAt,
+        public ?int $prescribedReps,
+        public ?float $prescribedLoad,
+        public ?int $prescribedSets,
     ) {}
 }
