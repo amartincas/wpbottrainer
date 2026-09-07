@@ -148,7 +148,20 @@ class TrainingHandler implements HandlerInterface
 
     private const REMINDER_MODIFIED_MESSAGE = 'Listo, actualicé tu recordatorio para %s a las %s. 🔔';
 
-    private const PROACTIVE_SESSION_COMPLETED_TIME = '19:00';
+    /**
+     * // DECISIÓN DE NEGOCIO PENDIENTE — valor técnico provisional,
+     * compartido por los 3 triggers MVP de proactividad (D053).
+     */
+    private const PROACTIVE_OFFER_TIME = '19:00';
+
+    /**
+     * Hito 10 (D053, corrección post-revisión) — `trigger_reason` de
+     * Trigger 2 ("terminó una sesión"): no proviene de un `DetectedIntentType`
+     * (se decide por `ExecutionReportOutcome::sessionCompleted`, no por la
+     * IA), así que no comparte enum con los Triggers 1/3 — se declara aquí
+     * como su propia constante, con el mismo criterio de nomenclatura.
+     */
+    private const PROACTIVE_TRIGGER_SESSION_COMPLETED = 'session_completed';
 
     public function __construct(
         private readonly TrainingAccessGate $accessGate,
@@ -499,6 +512,12 @@ class TrainingHandler implements HandlerInterface
                 continue;
             }
 
+            if ($action->type === ConversationActionType::OfferProactiveReminder) {
+                $this->offerProactiveReminder($action->reminderData['trigger_reason'], $contact, $tenant, $from);
+
+                continue;
+            }
+
             if ($action->type === ConversationActionType::DeliverSession) {
                 if ($activeSessionData !== null) {
                     // Ya existe una sesión pendiente — nunca se genera ni se
@@ -542,7 +561,7 @@ class TrainingHandler implements HandlerInterface
         // decisión de ofrecer (o no) la toma ReminderProactivityGate, nunca
         // este método por su cuenta.
         if ($outcome->sessionCompleted) {
-            $this->maybeOfferProactiveReminder($contact, $tenant, $from);
+            $this->offerProactiveReminder(self::PROACTIVE_TRIGGER_SESSION_COMPLETED, $contact, $tenant, $from);
         }
     }
 
@@ -772,13 +791,21 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
-     * Hito 10, Trigger 2 de proactividad ("usuario acaba de terminar una
-     * sesión"). La decisión de ofrecer la toma `ReminderProactivityGate`
-     * — código, nunca la IA. Texto y parámetros deterministas: la hora
-     * (`PROACTIVE_SESSION_COMPLETED_TIME`) es un valor técnico provisional,
-     * marcado explícitamente como decisión de negocio pendiente.
+     * Hito 10 (D053, corrección post-revisión) — los 3 triggers MVP de
+     * proactividad ("terminó una sesión" / "menciona que se le olvida
+     * entrenar" / "pregunta cuándo debería entrenar") convergen aquí: la
+     * ÚNICA decisión de si corresponde ofrecer la toma `ReminderProactivityGate`
+     * — código, nunca la IA — con los MISMOS controles anti-spam
+     * (cooldown proactivo, cooldown post-rechazo) sin importar cuál de los
+     * 3 disparó la llamada. `$triggerReason` solo se persiste para
+     * auditoría/análisis posterior — nunca cambia la política de oferta.
+     * Texto y parámetros deterministas: la hora (`PROACTIVE_OFFER_TIME`) es
+     * un valor técnico provisional, marcado explícitamente como decisión
+     * de negocio pendiente. Nunca crea un `Reminder` — solo una
+     * `ReminderSuggestion` pendiente, que sigue exigiendo confirmación
+     * explícita como cualquier otra.
      */
-    private function maybeOfferProactiveReminder(Contact $contact, Tenant $tenant, string $from): void
+    private function offerProactiveReminder(string $triggerReason, Contact $contact, Tenant $tenant, string $from): void
     {
         if (! $this->proactivityGate->canOffer($contact)) {
             return;
@@ -787,7 +814,7 @@ class TrainingHandler implements HandlerInterface
         $timezone = $this->timezoneResolver->resolve($contact);
         $day = self::WEEKDAY_INT_TO_STRING[\Carbon\CarbonImmutable::now($timezone)->dayOfWeek];
 
-        $resolution = $this->reminderTimeResolver->resolve($day, self::PROACTIVE_SESSION_COMPLETED_TIME, true, $timezone, now());
+        $resolution = $this->reminderTimeResolver->resolve($day, self::PROACTIVE_OFFER_TIME, true, $timezone, now());
 
         if ($resolution === null) {
             return;
@@ -797,16 +824,16 @@ class TrainingHandler implements HandlerInterface
             'tenant_id' => $tenant->id,
             'contact_id' => $contact->id,
             'origin' => ReminderSuggestionOrigin::Proactive,
-            'trigger_reason' => 'session_completed',
+            'trigger_reason' => $triggerReason,
             'proposed_type' => 'training_weekly',
-            'proposed_params' => ['day' => $day, 'time' => self::PROACTIVE_SESSION_COMPLETED_TIME, 'recurring' => true],
+            'proposed_params' => ['day' => $day, 'time' => self::PROACTIVE_OFFER_TIME, 'recurring' => true],
             'status' => ReminderSuggestionStatus::Pending,
             'expires_at' => now()->addHours(24),
         ]);
 
         $this->reply(
             $from,
-            sprintf('¿Quieres que te recuerde entrenar %s a las %s? Responde "sí" para confirmar. 💪', $this->describeDay($day, true), self::PROACTIVE_SESSION_COMPLETED_TIME),
+            sprintf('¿Quieres que te recuerde entrenar %s a las %s? Responde "sí" para confirmar. 💪', $this->describeDay($day, true), self::PROACTIVE_OFFER_TIME),
             $tenant,
         );
     }

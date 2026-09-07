@@ -4,6 +4,7 @@ namespace App\Training\Support;
 
 use App\Training\Context\CoachContext;
 use App\Training\Context\CoachExerciseSnapshot;
+use App\Training\Context\PendingReminderSuggestion;
 use App\Training\Enums\HistoryExerciseOutcome;
 
 /**
@@ -61,6 +62,18 @@ class CoachFactsFormatter
         'unreported' => 'sin reportar',
     ];
 
+    /**
+     * Hito 10 (D053) — mismo vocabulario cerrado que `ReminderExtractionFields`
+     * (`monday`..`sunday`, `today`, `tomorrow`); "today"/"tomorrow" se dejan
+     * tal cual porque son relativos al momento de la propuesta, no un día
+     * fijo que tenga sentido traducir aquí sin la fecha real.
+     */
+    private const WEEKDAY_SPANISH = [
+        'monday' => 'el lunes', 'tuesday' => 'el martes', 'wednesday' => 'el miércoles',
+        'thursday' => 'el jueves', 'friday' => 'el viernes', 'saturday' => 'el sábado', 'sunday' => 'el domingo',
+        'today' => 'hoy', 'tomorrow' => 'mañana',
+    ];
+
     public function format(CoachContext $context): string
     {
         $lines = [];
@@ -69,6 +82,7 @@ class CoachFactsFormatter
         $lines[] = $this->formatCurrentSession($context);
         $lines[] = $this->formatProgressions($context);
         $lines[] = $this->formatHistoryAggregates($context);
+        $lines[] = $this->formatPendingReminderSuggestion($context->pendingReminderSuggestion);
 
         $safetyRegions = $context->historyContext->activeSafetyBodyRegions;
         if ($safetyRegions !== []) {
@@ -190,5 +204,27 @@ class CoachFactsFormatter
     private function translateReasonCode(string $code): string
     {
         return self::REASON_CODE_PHRASES[$code] ?? 'motivo adicional sin traducción disponible — no lo inventes, resume solo lo que ya sabes';
+    }
+
+    /**
+     * Hito 10 (D053, corrección post-revisión) — HECHO estructurado para
+     * que `reminder_confirmation` se resuelva sin depender de que el
+     * mensaje original de la oferta siga en `recentMessages` (ver
+     * `CoachContext`/`CoachContextProvider`). Ausente por completo (no una
+     * línea vacía) cuando no hay ninguna `ReminderSuggestion` pendiente —
+     * la ausencia de esta línea es, en sí misma, la señal de "nada
+     * pendiente" que el prompt le pide a la IA.
+     */
+    private function formatPendingReminderSuggestion(?PendingReminderSuggestion $pending): string
+    {
+        if ($pending === null) {
+            return '';
+        }
+
+        $day = $pending->day !== null ? (self::WEEKDAY_SPANISH[$pending->day] ?? $pending->day) : 'un día sin especificar';
+        $time = $pending->time ?? 'una hora sin especificar';
+        $recurrence = $pending->recurring ? 'recurrente, todas las semanas' : 'una sola vez';
+
+        return "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN: {$day} a las {$time} ({$recurrence}). Todavía NO fue aceptado — el sistema espera que el usuario lo confirme o lo rechace en su próximo mensaje. Usa \"reminder_confirmation\" true/false SOLO si el mensaje ACTUAL del usuario confirma o rechaza ESTA propuesta (aunque el mensaje donde se ofreció ya no aparezca en el HISTORIAL DE CONVERSACIÓN reciente — esta línea es la fuente de verdad, no el historial).";
     }
 }

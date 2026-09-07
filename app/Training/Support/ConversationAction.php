@@ -69,4 +69,18 @@ final readonly class ConversationAction
     {
         return new self(ConversationActionType::ApplyReminderDecision, reminderData: $data);
     }
+
+    /**
+     * Hito 10 (D053, corrección post-revisión) — Triggers 1/3 de
+     * proactividad: transporta CUÁL señal se detectó (`trigger_reason`),
+     * nunca decide si corresponde ofrecer algo — `TrainingHandler` consulta
+     * `ReminderProactivityGate` (código) antes de crear cualquier
+     * `ReminderSuggestion`. Nunca crea un `Reminder` directamente.
+     *
+     * @param  array{trigger_reason: string}  $data
+     */
+    public static function offerProactiveReminder(array $data): self
+    {
+        return new self(ConversationActionType::OfferProactiveReminder, reminderData: $data);
+    }
 }

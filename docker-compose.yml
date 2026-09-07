@@ -118,10 +118,44 @@ services:
       retries: 3
       start_period: 10s
 
-  # No hay contenedor "scheduler": routes/console.php no define ningún
-  # Schedule::command(); el único comando registrado es "inspire" (el de
-  # ejemplo de Laravel). Un `schedule:work` hoy no tendría nada que
-  # ejecutar. Se añade en el momento en que exista una tarea programada real.
+  # Hito 10 (D053) — invoca "php artisan schedule:run" cada minuto, que a su
+  # vez decide (según la definición real de routes/console.php) si toca
+  # ejecutar "reminders:dispatch-due" (cada minuto) y/o
+  # "reminders:recover-stuck" (cada 5 minutos). Misma imagen ya construida
+  # que "app"/"queue" — sin build propio, sin paquete de cron/supervisor
+  # nuevo en el Dockerfile. NUNCA procesa jobs directamente: "dispatch-due"
+  # solo hace SendReminderJob::dispatch() — el contenedor "queue", ya
+  # existente y sin cambios, sigue siendo el único que ejecuta el envío
+  # real. Aislado de "app"/"queue": si este contenedor muere o se reinicia,
+  # ni sirve HTTP ni deja de procesar jobs ya encolados — el peor caso es
+  # que el próximo minuto de reminders se retrase hasta que Docker lo
+  # reinicie (restart: unless-stopped).
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: wpbottrainer-app:latest
+    restart: unless-stopped
+    env_file: .env
+    command: ["sh", "-c", "while true; do php artisan schedule:run; sleep 60; done"]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Empareja el proceso "sh" que sostiene el bucle mismo (siempre vivo
+      # durante toda la vida del contenedor), no "schedule:run"/"sleep 60"
+      # (hijos transitorios que podrían no existir en el instante exacto del
+      # chequeo) — evita un healthcheck intermitente por una carrera de
+      # temporización, sin alternación de regex que dependa del motor de
+      # BusyBox de esta imagen.
+      test: ["CMD-SHELL", "pgrep -f 'while true' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   mariadb_data:

@@ -52,6 +52,12 @@ class ConversationTurnResolver
     private const TRAINING_REPLY_INTENTS = [
         DetectedIntentType::ExerciseQuestion->value,
         DetectedIntentType::GeneralConversation->value,
+        // Hito 10 (D053) — "asked_when_to_train" puede llevar una respuesta
+        // conversacional propia (ej. "según tu plan, entrenas martes y
+        // viernes") ADEMÁS de la oferta proactiva de OfferProactiveReminder
+        // — son dos acciones/mensajes independientes, nunca uno sustituye
+        // al otro.
+        DetectedIntentType::AskedWhenToTrain->value,
     ];
 
     public function __construct(private readonly SafetySignalDetector $safetyDetector) {}
@@ -135,6 +141,20 @@ class ConversationTurnResolver
                 'day' => $result['reminder_day'] ?? null,
                 'time' => $result['reminder_time'] ?? null,
             ]);
+        }
+
+        // Hito 10 (D053, corrección post-revisión) — Triggers 1/3 de
+        // proactividad: SEÑALES, nunca peticiones explícitas — el trigger
+        // reason es literalmente el valor del intent detectado (sin tabla
+        // de mapeo separada que pudiera desincronizarse). El código
+        // (ReminderProactivityGate, en TrainingHandler) decide si
+        // corresponde ofrecer algo; este resolver solo transporta CUÁL
+        // señal apareció. Si ambas coinciden en el mismo mensaje (raro), se
+        // prioriza la más específica de las dos (mentioned_forgetting).
+        if (in_array(DetectedIntentType::MentionedForgettingToTrain->value, $intents, true)) {
+            $actions[] = ConversationAction::offerProactiveReminder(['trigger_reason' => DetectedIntentType::MentionedForgettingToTrain->value]);
+        } elseif (in_array(DetectedIntentType::AskedWhenToTrain->value, $intents, true)) {
+            $actions[] = ConversationAction::offerProactiveReminder(['trigger_reason' => DetectedIntentType::AskedWhenToTrain->value]);
         }
 
         if (in_array(DetectedIntentType::MembershipStatus->value, $intents, true)) {

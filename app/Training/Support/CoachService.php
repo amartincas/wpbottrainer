@@ -79,9 +79,11 @@ Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber
 - "general_conversation": conversación general de entrenamiento no cubierta arriba.
 - "membership_status": preguntas sobre membresía, pago, acceso o facturación.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
-- "reminder_request": el usuario pide explícitamente un recordatorio ("recuérdame mañana a las 7", "todos los martes recuérdame entrenar") O menciona que se le olvida entrenar ("siempre se me olvida entrenar los martes") — en ambos casos extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial.
+- "reminder_request": el usuario pide explícitamente un recordatorio ("recuérdame mañana a las 7", "todos los martes recuérdame entrenar", "ponme una alarma para entrenar") — extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial.
 - "reminder_cancel": el usuario quiere cancelar un recordatorio ya configurado ("ya no quiero ese recordatorio").
 - "reminder_modify": el usuario quiere cambiar un recordatorio ya configurado ("cámbialo para las 8").
+- "mentioned_forgetting": el usuario menciona una dificultad genérica para entrenar por su cuenta, SIN pedir un recordatorio ni dar día/hora ("siempre se me olvida entrenar", "no tengo constancia", "se me pasa por alto entrenar"). Es una señal, no una petición — NUNCA extraigas "reminder_day"/"reminder_time"/"reminder_recurrence" para este caso; el sistema decide si ofrece algo.
+- "asked_when_to_train": el usuario pregunta genéricamente cuándo debería entrenar, sin pedir un recordatorio explícitamente ("¿cuándo debería entrenar?", "¿qué días me conviene entrenar?"). Puede combinarse con "general_conversation" si además esperas que respondas la pregunta en "training_reply".
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 {
@@ -91,7 +93,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" (SOLO si el usuario mencionó un día, para crear/modificar/confirmar-con-cambio un recordatorio) | null,
   "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
   "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
-  "reminder_confirmation": true (el mensaje confirma afirmativamente una propuesta de recordatorio que TÚ MISMO ofreciste en un mensaje anterior de este historial — revisa el HISTORIAL DE CONVERSACIÓN) | false (la rechaza) | null (no hay ninguna propuesta pendiente que confirmar/rechazar en este mensaje)
+  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.
 }
 
 Para "membership_status"/"faq_question" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta. El código, nunca tú, calcula la fecha/hora real y crea/modifica cualquier recordatorio — solo extraes lo que el usuario dijo, en el vocabulario cerrado de arriba.

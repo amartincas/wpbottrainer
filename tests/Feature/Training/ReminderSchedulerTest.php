@@ -27,6 +27,22 @@ function fakeReminderAi(): void
     ]);
 }
 
+// ── Registro en el scheduler (D053, corrección post-revisión) ────────────
+
+it('reminders:dispatch-due and reminders:recover-stuck are registered on the scheduler with the correct frequency', function () {
+    $schedule = app(\Illuminate\Console\Scheduling\Schedule::class);
+    $events = collect($schedule->events());
+
+    $dispatchDue = $events->first(fn ($e) => str_contains($e->command, 'reminders:dispatch-due'));
+    $recoverStuck = $events->first(fn ($e) => str_contains($e->command, 'reminders:recover-stuck'));
+
+    expect($dispatchDue)->not->toBeNull();
+    expect($dispatchDue->expression)->toBe('* * * * *');
+
+    expect($recoverStuck)->not->toBeNull();
+    expect($recoverStuck->expression)->toBe('*/5 * * * *');
+});
+
 // ── reminders:dispatch-due ───────────────────────────────────────────────
 
 it('dispatch-due queues one SendReminderJob per due, pending Reminder — never for future or non-pending ones', function () {
@@ -134,6 +150,30 @@ it('marks a Reminder failed and alerts once recovery_attempts reaches the limit,
     $this->artisan('reminders:recover-stuck')->assertSuccessful();
 
     expect($reminder->fresh()->status)->toBe(ReminderStatus::Failed);
+});
+
+// ── Verificación E2E real (D053, corrección post-revisión) ──────────────
+
+it('end-to-end: reminders:dispatch-due ALONE — sin invocar SendReminderJob directamente, sin Queue::fake() — produce un envío confirmado y la transición correcta de estado, exactamente la cadena que schedule:run dispararía en producción', function () {
+    $contact = schedulerReadyContact();
+    $reminder = Reminder::factory()->oneOff()->create(['contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id, 'fire_at' => now()->subMinute()]);
+    fakeReminderAi();
+
+    // QUEUE_CONNECTION=sync en testing (phpunit.xml) => SendReminderJob se
+    // ejecuta de forma síncrona dentro de esta misma llamada a artisan,
+    // igual que en producción lo ejecutaría el contenedor "queue" al
+    // recibirlo del contenedor "scheduler" — la única diferencia real con
+    // producción es QUIÉN invoca "reminders:dispatch-due" (aquí el test,
+    // allá schedule:run), nunca CÓMO se procesa una vez despachado.
+    $this->artisan('reminders:dispatch-due')->assertSuccessful();
+
+    $fresh = $reminder->fresh();
+    expect($fresh->status)->toBe(ReminderStatus::Sent);
+    expect($fresh->last_fired_at)->not->toBeNull();
+
+    $message = WhatsAppMessage::where('idempotency_key', $reminder->currentOccurrenceIdempotencyKey())->first();
+    expect($message)->not->toBeNull();
+    expect($message->dispatch_confirmed_at)->not->toBeNull();
 });
 
 it('finalizes directly (no re-send, no new AI call) when the WhatsAppMessage for this occurrence was already confirmed', function () {

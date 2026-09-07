@@ -27,7 +27,15 @@ return new class extends Migration
             $table->string('origin');            // ReminderSuggestionOrigin: user_request | proactive
             $table->string('trigger_reason')->nullable(); // solo si origin=proactive; libre, mismo criterio que Alert::category
             $table->string('proposed_type');      // 'training_weekly' | 'training_one_off'
-            $table->json('proposed_params');      // ya resuelto por ReminderTimeResolver — nunca texto crudo
+            // Vocabulario CERRADO ya validado por ReminderExtractionFields
+            // (day/time/recurring) — nunca texto libre del usuario. NO es el
+            // resultado YA RESUELTO de ReminderTimeResolver (fire_at/
+            // recurrence en UTC): la resolución real se recalcula desde
+            // estos valores en el momento de la confirmación (ver
+            // TrainingHandler::applyReminderConfirmation()), a propósito,
+            // para que "el próximo martes" siga siendo el próximo martes
+            // real aunque la confirmación llegue días después de la oferta.
+            $table->json('proposed_params');
             $table->string('status')->default('pending'); // ReminderSuggestionStatus
             $table->timestamp('expires_at');
             $table->timestamps();

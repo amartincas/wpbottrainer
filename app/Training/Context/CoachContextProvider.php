@@ -7,6 +7,7 @@ use App\Core\Memory\ContextProviderInterface;
 use App\Core\Messaging\ExecutionContext;
 use App\Models\Contact;
 use App\Models\ExerciseSet;
+use App\Models\ReminderSuggestion;
 use App\Models\WhatsAppMessage;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
@@ -64,6 +65,7 @@ class CoachContextProvider implements ContextProviderInterface
         $currentSession = $this->resolveCurrentSession($contact);
         $progressionEvaluations = $this->evaluateProgressionsFor($currentSession, $historyContext);
         $recentMessages = $this->recentMessagesFor($context);
+        $pendingReminderSuggestion = $this->pendingReminderSuggestionFor($contact);
 
         $coachContext = new CoachContext(
             profileSnapshot: $historyContext->currentProfileSnapshot,
@@ -71,6 +73,7 @@ class CoachContextProvider implements ContextProviderInterface
             historyContext: $historyContext,
             progressionEvaluations: $progressionEvaluations,
             recentMessages: $recentMessages,
+            pendingReminderSuggestion: $pendingReminderSuggestion,
         );
 
         return new ContextFragment(
@@ -214,5 +217,31 @@ class CoachContextProvider implements ContextProviderInterface
             ->map(fn (WhatsAppMessage $message) => ['role' => $message->role, 'content' => $message->content])
             ->values()
             ->all();
+    }
+
+    /**
+     * Hito 10 (D053, corrección post-revisión) — reutiliza literalmente
+     * `ReminderSuggestion::activePendingFor()` (mismo criterio de
+     * identificación: `contact_id` + `status=pending`, único por base de
+     * datos) — nunca reimplementa esa lógica aquí. Se expone como HECHO
+     * estructurado (ver `CoachFactsFormatter`) precisamente para que la IA
+     * no necesite encontrar el mensaje original de la oferta dentro de los
+     * últimos 10 `recentMessages`.
+     */
+    private function pendingReminderSuggestionFor(Contact $contact): ?PendingReminderSuggestion
+    {
+        $suggestion = ReminderSuggestion::activePendingFor($contact);
+
+        if ($suggestion === null) {
+            return null;
+        }
+
+        $params = $suggestion->proposed_params;
+
+        return new PendingReminderSuggestion(
+            day: $params['day'] ?? null,
+            time: $params['time'] ?? null,
+            recurring: (bool) ($params['recurring'] ?? false),
+        );
     }
 }

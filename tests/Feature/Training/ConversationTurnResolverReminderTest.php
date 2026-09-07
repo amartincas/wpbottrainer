@@ -82,3 +82,57 @@ it('proposing a reminder never produces a DeliverSession/RecordExecutionReport a
     expect($types)->not->toContain(ConversationActionType::DeliverSession);
     expect($types)->not->toContain(ConversationActionType::RecordExecutionReport);
 });
+
+// ── Triggers 1/3 de proactividad (D053, corrección post-revisión) ────────
+
+it('mentioned_forgetting produces an OfferProactiveReminder action, never ProposeReminder/ApplyReminderDecision', function () {
+    $resolved = reminderTurnResolver()->resolve(reminderResultBase(['intents' => ['mentioned_forgetting']]));
+
+    expect($resolved->actions)->toHaveCount(1);
+    expect($resolved->actions[0]->type)->toBe(ConversationActionType::OfferProactiveReminder);
+    expect($resolved->actions[0]->reminderData)->toBe(['trigger_reason' => 'mentioned_forgetting']);
+});
+
+it('asked_when_to_train produces an OfferProactiveReminder action', function () {
+    $resolved = reminderTurnResolver()->resolve(reminderResultBase(['intents' => ['asked_when_to_train']]));
+
+    expect($resolved->actions)->toHaveCount(1);
+    expect($resolved->actions[0]->type)->toBe(ConversationActionType::OfferProactiveReminder);
+    expect($resolved->actions[0]->reminderData)->toBe(['trigger_reason' => 'asked_when_to_train']);
+});
+
+it('when both proactive-trigger intents appear together (rare), only the more specific one (mentioned_forgetting) produces an action — never both', function () {
+    $resolved = reminderTurnResolver()->resolve(reminderResultBase(['intents' => ['mentioned_forgetting', 'asked_when_to_train']]));
+
+    $types = array_map(fn ($a) => $a->type, $resolved->actions);
+    expect($types)->toBe([ConversationActionType::OfferProactiveReminder]);
+    expect($resolved->actions[0]->reminderData['trigger_reason'])->toBe('mentioned_forgetting');
+});
+
+it('asked_when_to_train combined with a training_reply produces both SendText and OfferProactiveReminder — one never replaces the other', function () {
+    $resolved = reminderTurnResolver()->resolve(reminderResultBase([
+        'intents' => ['asked_when_to_train'], 'training_reply' => 'Deberías entrenar martes y viernes.',
+    ]));
+
+    $types = array_map(fn ($a) => $a->type, $resolved->actions);
+    expect($types)->toBe([ConversationActionType::SendText, ConversationActionType::OfferProactiveReminder]);
+});
+
+it('Safety still cuts everything even when a proactive-trigger intent is present', function () {
+    $resolved = reminderTurnResolver()->resolve(reminderResultBase([
+        'safety_signal_text' => 'tengo un fuerte dolor de pecho', 'intents' => ['mentioned_forgetting'],
+    ]));
+
+    expect($resolved->actions)->toHaveCount(1);
+    expect($resolved->actions[0]->type)->toBe(ConversationActionType::EscalateSafety);
+});
+
+it('a proactive-trigger intent never produces ProposeReminder/ApplyReminderDecision, and vice versa — the two mechanisms stay separate', function () {
+    $proactive = reminderTurnResolver()->resolve(reminderResultBase(['intents' => ['asked_when_to_train']]));
+    $explicit = reminderTurnResolver()->resolve(reminderResultBase([
+        'intents' => ['reminder_request'], 'reminder_day' => 'monday', 'reminder_time' => '07:00',
+    ]));
+
+    expect(array_map(fn ($a) => $a->type, $proactive->actions))->not->toContain(ConversationActionType::ProposeReminder);
+    expect(array_map(fn ($a) => $a->type, $explicit->actions))->not->toContain(ConversationActionType::OfferProactiveReminder);
+});

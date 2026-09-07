@@ -12,9 +12,12 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 /**
  * Hito 10 — propuesta efímera de recordatorio, previa a la confirmación
  * explícita del usuario. NUNCA crea un `Reminder` por sí sola — ver
- * `ConversationTurnResolver`/`ApplyReminderDecision`. `proposed_params` ya
- * viene resuelto por `ReminderTimeResolver` (nunca el texto crudo del
- * usuario) — ver docs/DECISIONS.md (D053).
+ * `ConversationTurnResolver`/`ApplyReminderDecision`. `proposed_params`
+ * contiene el vocabulario CERRADO ya validado por `ReminderExtractionFields`
+ * (day/time/recurring) — nunca texto libre del usuario, pero tampoco el
+ * resultado YA RESUELTO de `ReminderTimeResolver` (eso se recalcula recién
+ * en la confirmación, para que "el próximo martes" siga siendo correcto
+ * aunque la confirmación llegue días después) — ver docs/DECISIONS.md (D053).
  */
 #[Fillable([
     'tenant_id',

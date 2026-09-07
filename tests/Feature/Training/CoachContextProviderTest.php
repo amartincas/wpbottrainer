@@ -6,6 +6,7 @@ use App\Models\Contact;
 use App\Models\Exercise;
 use App\Models\ExerciseLog;
 use App\Models\ExerciseSet;
+use App\Models\ReminderSuggestion;
 use App\Models\Tenant;
 use App\Models\TrainingProfile;
 use App\Models\WhatsAppMessage;
@@ -13,9 +14,12 @@ use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Training\Context\CoachContextProvider;
 use App\Training\Enums\HistoryExerciseOutcome;
+use App\Training\Enums\ReminderSuggestionOrigin;
+use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\CoachFactsFormatter;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingHistoryContextProvider;
@@ -219,4 +223,83 @@ it('never modifies any source-of-truth table', function () {
     expect(WorkoutSession::count())->toBe($before[0]);
     expect(WorkoutExercise::count())->toBe($before[1]);
     expect(TrainingProfile::count())->toBe($before[2]);
+});
+
+// ── pendingReminderSuggestion (D053, corrección post-revisión) ───────────
+
+it('pendingReminderSuggestion reflects the pending ReminderSuggestion via activePendingFor(), reusing it verbatim', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000009']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    ReminderSuggestion::create([
+        'tenant_id' => $tenant->id, 'contact_id' => $contact->id, 'origin' => ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_weekly', 'proposed_params' => ['day' => 'tuesday', 'time' => '19:00', 'recurring' => true],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000009'))->data;
+
+    expect($context->pendingReminderSuggestion)->not->toBeNull();
+    expect($context->pendingReminderSuggestion->day)->toBe('tuesday');
+    expect($context->pendingReminderSuggestion->time)->toBe('19:00');
+    expect($context->pendingReminderSuggestion->recurring)->toBeTrue();
+});
+
+it('pendingReminderSuggestion is null when there is no pending suggestion', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000010']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000010'))->data;
+
+    expect($context->pendingReminderSuggestion)->toBeNull();
+});
+
+it('pendingReminderSuggestion stays populated even when 15 unrelated WhatsAppMessage rows push the original offer far outside the 10-message recentMessages window', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000011']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    // El "mensaje de oferta" en sí nunca se persiste literalmente aquí — lo
+    // que se demuestra es que, sin importar cuántos mensajes NO relacionados
+    // hayan pasado desde entonces (mucho más que el límite de 10 de
+    // recentMessages), el HECHO estructurado sigue disponible porque viene
+    // de la fila de ReminderSuggestion (BD), nunca de buscar en el chat.
+    for ($i = 1; $i <= 15; $i++) {
+        WhatsAppMessage::create([
+            'tenant_id' => $tenant->id, 'customer_phone' => '5730000011',
+            'role' => $i % 2 === 0 ? 'assistant' : 'user', 'content' => "charla sin relación {$i}",
+        ]);
+    }
+
+    ReminderSuggestion::create([
+        'tenant_id' => $tenant->id, 'contact_id' => $contact->id, 'origin' => ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_weekly', 'proposed_params' => ['day' => 'tuesday', 'time' => '19:00', 'recurring' => true],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000011'))->data;
+
+    // El historial ya no contiene ningún rastro de la oferta (10 de 15
+    // mensajes, todos ajenos al recordatorio) — y aun así el HECHO está.
+    $historyMentionsReminder = collect($context->recentMessages)
+        ->contains(fn (array $message) => str_contains($message['content'], 'recordarte'));
+    expect($historyMentionsReminder)->toBeFalse();
+    expect($context->pendingReminderSuggestion)->not->toBeNull();
+    expect($context->pendingReminderSuggestion->day)->toBe('tuesday');
+
+    $facts = (new CoachFactsFormatter)->format($context);
+    expect($facts)->toContain('RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN');
+    expect($facts)->toContain('el martes a las 19:00');
+});
+
+it('CoachFactsFormatter never mentions a pending reminder when there is none', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000012']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000012'))->data;
+    $facts = (new CoachFactsFormatter)->format($context);
+
+    expect($facts)->not->toContain('RECORDATORIO PROPUESTO PENDIENTE');
 });

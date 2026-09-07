@@ -42,6 +42,30 @@ enum DetectedIntentType: string
     case ReminderModify = 'reminder_modify';
 
     /**
+     * Hito 10 (D053, corrección post-revisión) — Trigger 1 de proactividad:
+     * el usuario menciona una dificultad genérica para entrenar por su
+     * cuenta ("siempre se me olvida entrenar", "no tengo constancia"), SIN
+     * pedir un recordatorio ni dar día/hora. Es una SEÑAL, nunca una
+     * petición explícita — `ReminderProactivityGate` (código, nunca la IA)
+     * decide si corresponde ofrecer una `ReminderSuggestion` proactiva.
+     * Distinto de `ReminderRequest`: si el usuario da día/hora o pide
+     * explícitamente ("recuérdame el martes a las 7"), eso sigue siendo
+     * `ReminderRequest`, nunca este intent.
+     */
+    case MentionedForgettingToTrain = 'mentioned_forgetting';
+
+    /**
+     * Hito 10 (D053, corrección post-revisión) — Trigger 3 de proactividad:
+     * el usuario pregunta genéricamente cuándo debería entrenar
+     * ("¿cuándo debería entrenar?", "¿qué días me conviene?"), sin pedir
+     * un recordatorio explícitamente. Misma naturaleza que
+     * `MentionedForgettingToTrain`: una señal para `ReminderProactivityGate`,
+     * nunca una petición directa — puede coexistir con `general_conversation`
+     * si además se espera que el Coach responda la pregunta en texto.
+     */
+    case AskedWhenToTrain = 'asked_when_to_train';
+
+    /**
      * Valida una lista cruda (ej. del JSON de la IA) contra este vocabulario
      * cerrado — cualquier valor que no sea uno de estos casos se descarta
      * silenciosamente (nunca un error, nunca una segunda autoridad de

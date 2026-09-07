@@ -224,6 +224,193 @@ it('a reply shortly after a fired Reminder routes to Training, not FallbackChatH
     expect(WorkoutSession::where('contact_id', $contact->id)->exists())->toBeTrue();
 });
 
+it('Trigger 1: mentioning forgetting to train (no day/time given) offers a proactive reminder tagged proactive/mentioned_forgetting — never creates a Reminder directly', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['mentioned_forgetting'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Siempre se me olvida entrenar');
+
+    $suggestion = ReminderSuggestion::where('contact_id', $contact->id)->first();
+    expect($suggestion)->not->toBeNull();
+    expect($suggestion->origin)->toBe(\App\Training\Enums\ReminderSuggestionOrigin::Proactive);
+    expect($suggestion->trigger_reason)->toBe('mentioned_forgetting');
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'recuerde entrenar'));
+});
+
+it('Trigger 1 respects the SAME anti-spam cooldown as the other proactive triggers — never a keyword-only shortcut that bypasses the Gate', function () {
+    $contact = reminderIntegrationContact();
+    ReminderSuggestion::factory()->proactive('session_completed')->create([
+        'contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id,
+        'status' => ReminderSuggestionStatus::Accepted, 'created_at' => now()->subHours(10),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['mentioned_forgetting'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Siempre se me olvida entrenar');
+
+    // Sigue existiendo únicamente la sugerencia original (Trigger 2, hace
+    // 10h) — el cooldown proactivo de 72h bloquea una segunda oferta sin
+    // importar cuál de los 3 triggers la dispare.
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->first()->trigger_reason)->toBe('session_completed');
+});
+
+it('Trigger 3: asking when to train offers a proactive reminder tagged proactive/asked_when_to_train — never creates a Reminder directly', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['asked_when_to_train'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, '¿Cuándo debería entrenar?');
+
+    $suggestion = ReminderSuggestion::where('contact_id', $contact->id)->first();
+    expect($suggestion)->not->toBeNull();
+    expect($suggestion->origin)->toBe(\App\Training\Enums\ReminderSuggestionOrigin::Proactive);
+    expect($suggestion->trigger_reason)->toBe('asked_when_to_train');
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+});
+
+it('Trigger 3 also respects the (longer) post-decline cooldown, same as the other proactive triggers', function () {
+    $contact = reminderIntegrationContact();
+    $suggestion = ReminderSuggestion::factory()->declined()->create(['contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id]);
+    $suggestion->forceFill(['updated_at' => now()->subHours(100)])->saveQuietly();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['asked_when_to_train'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, '¿Qué días me conviene entrenar?');
+
+    // Ninguna sugerencia nueva — solo sigue existiendo la declinada original.
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+});
+
+it('Trigger 3 coexists with a normal conversational reply in the same turn — the training_reply and the proactive offer are both sent, neither replaces the other', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['general_conversation', 'asked_when_to_train'],
+            'training_reply' => 'Según tu plan actual, lo ideal es entrenar martes y viernes.',
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, '¿Cuándo debería entrenar?');
+
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'martes y viernes'));
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'recuerde entrenar'));
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->where('trigger_reason', 'asked_when_to_train')->exists())->toBeTrue();
+});
+
+it('coexistence of the 3 triggers: once Trigger 1 already created a pending proactive suggestion, Trigger 3 in a later message does not create a second one', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['mentioned_forgetting'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+    sendReminderIntegrationMessage($contact, 'Siempre se me olvida entrenar');
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['asked_when_to_train'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+    sendReminderIntegrationMessage($contact, '¿Cuándo debería entrenar?');
+
+    // Misma protección DB-level (uq_reminder_suggestions_pending_contact) y
+    // de aplicación (activePendingFor()) que ya cubre ProposeReminder — los
+    // 3 triggers comparten el mismo mecanismo anti-duplicado, nunca uno
+    // separado por trigger.
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->first()->trigger_reason)->toBe('mentioned_forgetting');
+});
+
+it('confirming a suggestion originated by Trigger 1/3 (origin=proactive) still creates the Reminder exactly like a user-requested one', function () {
+    $contact = reminderIntegrationContact();
+    ReminderSuggestion::factory()->proactive('mentioned_forgetting')->create([
+        'contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id,
+        'proposed_params' => ['day' => 'tuesday', 'time' => '19:00', 'recurring' => true],
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => true,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Sí');
+
+    expect(Reminder::where('contact_id', $contact->id)->where('status', ReminderStatus::Pending)->count())->toBe(1);
+});
+
+it('a pending suggestion still gets confirmed correctly even after 12 unrelated prior messages pushed the original offer out of the 10-message history window', function () {
+    $contact = reminderIntegrationContact();
+
+    for ($i = 1; $i <= 12; $i++) {
+        \App\Models\WhatsAppMessage::create([
+            'tenant_id' => $contact->tenant_id, 'customer_phone' => $contact->customer_phone,
+            'role' => $i % 2 === 0 ? 'assistant' : 'user', 'content' => "charla sin relación {$i}",
+        ]);
+    }
+
+    ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_weekly', 'proposed_params' => ['day' => 'tuesday', 'time' => '19:00', 'recurring' => true],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    // La IA (mock) confirma usando el HECHO estructurado pendingReminderSuggestion
+    // — nunca el historial, que en este test ya no contiene ningún rastro
+    // de la oferta original (D053, corrección post-revisión).
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => true,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Sí');
+
+    expect(Reminder::where('contact_id', $contact->id)->where('status', ReminderStatus::Pending)->count())->toBe(1);
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->first()->status)->toBe(ReminderSuggestionStatus::Accepted);
+});
+
 it('Trigger 2: completing a session offers a proactive reminder when the gate allows it', function () {
     $contact = reminderIntegrationContact();
     [$session, $we] = reminderIntegrationSession($contact);
