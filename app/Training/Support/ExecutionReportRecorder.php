@@ -161,12 +161,28 @@ class ExecutionReportRecorder
                 return "{$set['duration_seconds']}s";
             }
 
-            $load = $set['load'] !== null ? '@'.rtrim(rtrim((string) $set['load'], '0'), '.').'kg' : '';
+            $load = $set['load'] !== null ? '@'.$this->formatLoad($set['load']).'kg' : '';
 
             return trim("{$set['reps']}rep{$load}");
         })->implode(', ');
 
         return "{$name}: {$setsText}";
+    }
+
+    /**
+     * Hardening pre-producción (hallazgo E2E de Bloque 9): formatea una
+     * carga para el texto de confirmación al usuario — nunca toca el valor
+     * persistido (`ExerciseSet.actual_load` guarda el float tal cual, ver
+     * persist() arriba). La implementación anterior usaba
+     * `rtrim((string) $load, '0')`, que le quitaba el último cero también a
+     * enteros como 40 (→ "4") o 20 (→ "2"), no solo a ceros decimales de
+     * sobra — number_format() a precisión fija primero, y solo entonces
+     * recortar ceros/punto decimal de sobra, evita ese error: 40 → "40",
+     * 40.50 → "40.5", 10 → "10".
+     */
+    private function formatLoad(float $load): string
+    {
+        return rtrim(rtrim(number_format($load, 2, '.', ''), '0'), '.');
     }
 
     /**

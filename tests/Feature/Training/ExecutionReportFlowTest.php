@@ -533,6 +533,45 @@ it('distinguishes "no pude" from "no quiero" via skip_reason, without inventing 
     expect($log->skip_reason->value)->toBe('dont_want');
 });
 
+// ── Hardening pre-producción (hallazgo E2E de Bloque 9) ─────────────────
+
+// 24. Formateo de carga en el texto de confirmación: enteros terminados en
+// cero no deben perder ese cero (bug real reproducido en el E2E de staging:
+// 40 se mostraba como "4kg"), y los decimales deben conservarse tal cual.
+// El valor persistido (ExerciseSet.actual_load) nunca cambia — se verifica
+// aparte, en el mismo test, contra los floats originales.
+it('formats whole-number loads ending in zero correctly in the confirmation text, without altering the persisted value', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Sentadilla', 'not_performed' => false,
+                'sets' => [
+                    ['reps' => 10, 'load' => 10, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 20, 'duration_seconds' => null],
+                    ['reps' => 8, 'load' => 40, 'duration_seconds' => null],
+                    ['reps' => 6, 'load' => 40.5, 'duration_seconds' => null],
+                ],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Sentadilla: 10x10, 10x20, 8x40 y 6x40.5');
+
+    Http::assertSent(fn ($request) => str_contains(
+        data_get($request->data(), 'text.body', ''),
+        '10rep@10kg, 10rep@20kg, 8rep@40kg, 6rep@40.5kg'
+    ));
+
+    $sets = ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->first()->exerciseSets;
+    expect($sets->pluck('actual_load')->map(fn ($load) => (float) $load)->all())->toBe([10.0, 20.0, 40.0, 40.5]);
+});
+
 it('records skip_reason as null when not_performed is true but no reason was given or implied', function () {
     $contact = readyTrainingContact();
     [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);

@@ -1171,3 +1171,44 @@ Ningún proveedor nuevo fue necesario — confirma la instrucción de no agregar
 - Posible bug preexistente en `dashboard.blade.php`: el enlace "Go to Tenant Settings" apunta a la misma ruta del propio dashboard.
 - `resources/views/livewire/auth/register.blade.php` postea a `route('register.store')`, y existen `app/Actions/Fortify/CreateNewUser.php`/`ResetUserPassword.php`, pero **Laravel Fortify no está instalado** en `composer.json`. Es casi con certeza código muerto de un starter-kit no instalado, pero no se verificó al 100% ni se tocó — código de autenticación, fuera del pedido explícito.
 - Ambigüedad de prefijo de URL de los recursos Filament: el panel tiene `path('')`, por lo que las rutas reales son `/contacts`, `/tenants`, etc. (sin prefijo `/admin`), pero el widget `UnprocessedContactsStats` (heredado de `UnprocessedLeadsStats`) usa una URL hardcodeada `/admin/contacts?...` — posible bug preexistente, no verificado en runtime, no corregido en este hito.
+
+### Hardening pre-producción de Bloque 9 (D052) — dos hallazgos del E2E real en staging, documentados y diferidos
+
+Durante el E2E controlado de Bloque 9 en staging (datos sintéticos, sin tocar Tenants/Contacts reales) surgieron dos hallazgos ajenos al alcance de Bloque 9 (ninguno de los dos toca `TrainingEngine`/`ProgressionEvaluator`/`TrainingAccessGate`/`ConversationTurnResolver`/la arquitectura multi-intent aprobada). Se documentan aquí como deuda técnica aceptada — **sin implementación todavía** — para que un bloque posterior los recoja con su propio diseño y tests de regresión.
+
+**1 — Nota técnica: continuidad conversacional de `TrainingIntentClassifier` tras completar una sesión.**
+
+*Causa exacta*: `TrainingIntentClassifier::classify()` (Hito 5/6) solo clasifica un mensaje como `Intent::Training` por 4 vías deterministas: (a) keyword de entrenamiento, (b) onboarding incompleto, (c) `WorkoutSession.status = Scheduled` existente, (d) acceso activo + cero `WorkoutSession` históricas (caso "primera rutina", Hito 8.1). En cuanto una sesión pasa a `Completed`/`Skipped`, (c) deja de cumplirse, y como ya existe ≥1 `WorkoutSession` histórica, (d) tampoco — si el siguiente mensaje del contacto no trae ninguna keyword, el clasificador devuelve `null` y el Router cae a `Intent::FallbackChat` (chat genérico de e-commerce) en vez de a Training/Coach.
+
+*Por qué no es una regresión de seguridad*: la Seguridad no depende de este clasificador — `PreRoutingScreener`/`SafetySignalPreRoutingScreen` (Hito 7, `App\Core\Messaging\PreRoutingScreener`) corren `SafetySignalDetector::detect()` sobre **todo** mensaje entrante, antes del Router, sin importar sesión/onboarding, y delegan directo a `TrainingHandler::handle()` si detectan una señal real. Este hallazgo afecta únicamente la continuidad de conversaciones **no urgentes** con el Coach (p. ej. una pregunta de seguimiento sin keyword justo después de terminar la sesión), no la garantía de escalamiento de Safety.
+
+*Propuesta de diseño (no implementada)*: una 5ª condición determinista en `TrainingIntentClassifier`, simétrica a las 3 existentes y acotada a una ventana de tiempo corta (nunca "cualquier ex-alumno para siempre" — eso capturaría permanentemente los mensajes de cualquier contacto que alguna vez entrenó, quitándole a Core la capacidad de enrutarlo a otro vertical):
+```php
+private function hasRecentlyCompletedWorkoutSession(Contact $contact): bool
+{
+    return $contact->workoutSessions()
+        ->whereIn('status', [WorkoutSessionStatus::Completed, WorkoutSessionStatus::Skipped])
+        ->where('completed_at', '>=', now()->subHours(N)) // N: decisión de negocio/producto pendiente, deliberadamente sin fijar aquí
+        ->exists();
+}
+```
+`N` (la ventana en horas) queda **explícitamente sin definir** — es una decisión de negocio/producto, no técnica, y debe fijarse cuando este hallazgo se convierta en un bloque de hardening propio.
+
+*Impacto sobre Core y otros verticales*: ninguno. `Router`, `PreRoutingScreener`, `IntentClassifierInterface`, `Dispatcher` no cambiarían; `App\Payments\Support\PaymentIntentClassifier` no se ve afectado — es una condición más dentro del vocabulario ya propio de `TrainingIntentClassifier` (mismo patrón que las 3 existentes), nunca una reestructuración del Router en un clasificador genérico específico de Training.
+
+*Tests de regresión que ese bloque futuro deberá incluir*: (1) sin keyword + sesión completada hace menos de `N` horas → `Intent::Training`; (2) igual pero hace más de `N` horas → `Intent::FallbackChat` (comportamiento actual, sin regresión); (3) sesión completada reciente pero con una `Scheduled` más nueva ya generada → sigue resolviendo vía la regla (c) existente, sin interferencia; (4) contacto sin ninguna `WorkoutSession` nunca → sin cambio (regresión de las 3 reglas actuales); (5) E2E de extremo a extremo (mismo patrón de `ExecutionReportFlowTest`/`TrainingHandlerInterruptionTest`): tras completar una sesión, el siguiente mensaje sin keyword llega a `TrainingHandler`/Coach, no a `FallbackChatHandler`.
+
+**2 — Deuda de seguridad: robustez de `acute_undiagnosed_injury` en `SafetySignalDetector` (no modificado, sin cambios).**
+
+El E2E reprodujo `SafetySignalDetector::detect('Me duele la rodilla')` → `null` (no escala). Esto **no es un bug**: es exactamente el comportamiento ya cubierto por un test previo y aprobado (`tests/Feature/Training/SafetySignalDetectorTest.php`, *"does not flag ordinary training limitations as safety alarms"* — `'me duele un poco la rodilla al hacer sentadillas'` ya se esperaba `null` antes de Bloque 9). El contrato vigente es deliberadamente conservador: 7 categorías cerradas y curadas, nunca "cualquier declaración de dolor" — escalar cada mención de dolor inundaría la revisión humana con molestias normales de entrenamiento.
+
+La brecha real, más estrecha, es de **robustez de matching**, no de alcance: la categoría `acute_undiagnosed_injury` (lesión aguda real: "no puedo mover", "lesión grave", "fractura") solo compara contra esas 3 frases exactas — no recibió la generalización por co-ocurrencia (trigger + anchor) que Hito 7 ya aplicó a `chest_pain` tras encontrar que "me duele mucho el pecho" no coincidía con la frase literal ("dolor de pecho"). Una lesión aguda de rodilla real, descrita como "me duele muchísimo la rodilla, no puedo apoyarla", hoy no activaría la categoría por esa misma fragilidad.
+
+Esta clase de cambio está marcada en el propio archivo como **"REQUIERE REVISIÓN DE NEGOCIO/PROFESIONAL ANTES DE PRODUCCIÓN"** — no se modifica sin ese sign-off. Queda registrada como deuda de seguridad pendiente, para revisión posterior con negocio/profesional de salud, con una posible extensión (no implementada, sujeta a esa revisión) del mismo patrón ya usado para `chest_pain`:
+```php
+'acute_undiagnosed_injury' => [
+    'triggers' => ['no puedo', 'no logro', 'me duele muchísimo', 'me duele demasiado'],
+    'anchors' => ['apoyar', 'mover', 'caminar', 'enderezar', 'pisar'],
+],
+```
+deliberadamente agnóstica de parte del cuerpo (nunca una lista de "rodilla, hombro, tobillo...", que sería un parche puntual en vez de cerrar la clase de fragilidad ya identificada).
