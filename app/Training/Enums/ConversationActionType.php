@@ -14,4 +14,8 @@ enum ConversationActionType: string
     case RecordExecutionReport = 'record_execution_report';
     case SendText = 'send_text';
     case DeliverSession = 'deliver_session';
+
+    /** Hito 10 — ver App\Training\Support\ConversationAction. */
+    case ProposeReminder = 'propose_reminder';
+    case ApplyReminderDecision = 'apply_reminder_decision';
 }

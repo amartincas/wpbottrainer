@@ -101,6 +101,42 @@ class ConversationTurnResolver
             $actions[] = ConversationAction::deliverSession();
         }
 
+        // Hito 10 — datos CRUDOS únicamente: ni resueltos ni validados aquí
+        // (ConversationTurnResolver sigue sin conocer Contact/base de datos/
+        // timezone). `TrainingHandler` decide, al ejecutar, si hay algo real
+        // a lo que aplicar esto (una ReminderSuggestion pendiente / un
+        // Reminder activo) — mismo patrón que RecordExecutionReport.
+        if (in_array(DetectedIntentType::ReminderRequest->value, $intents, true)) {
+            $actions[] = ConversationAction::proposeReminder([
+                'day' => $result['reminder_day'] ?? null,
+                'time' => $result['reminder_time'] ?? null,
+                'recurring' => ($result['reminder_recurrence'] ?? false) === true,
+            ]);
+        }
+
+        $reminderConfirmation = $result['reminder_confirmation'] ?? null;
+
+        if ($reminderConfirmation !== null) {
+            $actions[] = ConversationAction::applyReminderDecision([
+                'decision' => 'confirmation',
+                'confirmed' => $reminderConfirmation === true,
+                'day' => $result['reminder_day'] ?? null,
+                'time' => $result['reminder_time'] ?? null,
+            ]);
+        }
+
+        if (in_array(DetectedIntentType::ReminderCancel->value, $intents, true)) {
+            $actions[] = ConversationAction::applyReminderDecision(['decision' => 'cancel', 'confirmed' => null, 'day' => null, 'time' => null]);
+        }
+
+        if (in_array(DetectedIntentType::ReminderModify->value, $intents, true)) {
+            $actions[] = ConversationAction::applyReminderDecision([
+                'decision' => 'modify', 'confirmed' => null,
+                'day' => $result['reminder_day'] ?? null,
+                'time' => $result['reminder_time'] ?? null,
+            ]);
+        }
+
         if (in_array(DetectedIntentType::MembershipStatus->value, $intents, true)) {
             $actions[] = ConversationAction::sendText(self::COMMERCIAL_STUB);
         }

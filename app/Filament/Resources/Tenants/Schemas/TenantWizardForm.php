@@ -68,6 +68,22 @@ class TenantWizardForm
                     ->placeholder('eaa...')
                     ->columnSpanFull(),
 
+                // === REGIONAL (Hito 10) ===
+                // Estructural, no opcional: WpbotTrainer debe poder operar en
+                // múltiples países. Obligatorio en el wizard para que ningún
+                // tenant nuevo quede sin configurar — ver
+                // App\Training\Support\TimezoneResolver (nunca usa un
+                // fallback silencioso en tiempo de ejecución).
+                Select::make('timezone')
+                    ->label('Timezone (IANA)')
+                    ->searchable()
+                    ->options(array_combine(\DateTimeZone::listIdentifiers(), \DateTimeZone::listIdentifiers()))
+                    ->required()
+                    ->default('America/Bogota')
+                    ->rule('timezone:all')
+                    ->helperText('Zona horaria del negocio — determina cuándo se disparan sus recordatorios. Ej: America/Bogota, America/Mexico_City, America/Lima, Europe/Madrid.')
+                    ->columnSpanFull(),
+
                 // === AI PERSONA ===
                 Select::make('personality_type')
                     ->label('Persona Type')

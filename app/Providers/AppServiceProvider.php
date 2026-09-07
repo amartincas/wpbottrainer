@@ -10,6 +10,7 @@ use App\Core\Messaging\Dispatcher;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
+use App\Core\Reminders\ReminderDispatcher;
 use App\Handlers\FallbackChatHandler;
 use App\Payments\Handlers\PaymentHandler;
 use App\Payments\Support\PaymentIntentClassifier;
@@ -29,6 +30,7 @@ use App\Training\Onboarding\Requirements\SessionsPerWeekRequirement;
 use App\Training\Onboarding\Requirements\TrainingLocationRequirement;
 use App\Training\Support\SafetySignalPreRoutingScreen;
 use App\Training\Support\TrainingIntentClassifier;
+use App\Training\Support\TrainingReminderExecutor;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
@@ -119,6 +121,16 @@ class AppServiceProvider extends ServiceProvider
         // Equipment, HealthScreening.
         // Capa 2 (oportunista, nunca bloquea): SessionsPerWeek, PrimaryFocus,
         // PhysicalStats.
+        // Hito 10 — ReminderDispatcher: mismo patrón Container-resuelto que
+        // Dispatcher/Router/PreRoutingScreener (mapa de CLASES, no
+        // instancias). `training_weekly`/`training_one_off` comparten hoy
+        // el mismo ejecutor de dominio — un segundo tipo de Reminder no
+        // relacionado con Training solo necesitaría una línea más aquí.
+        $this->app->singleton(ReminderDispatcher::class, fn ($app) => new ReminderDispatcher($app, [
+            'training_weekly' => TrainingReminderExecutor::class,
+            'training_one_off' => TrainingReminderExecutor::class,
+        ]));
+
         $this->app->singleton(OnboardingRequirementRegistry::class, fn ($app) => new OnboardingRequirementRegistry($app, [
             NameRequirement::class,
             GoalRequirement::class,

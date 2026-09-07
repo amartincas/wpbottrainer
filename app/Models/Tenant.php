@@ -21,6 +21,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'wa_verify_token',
     'currency',
     'country',
+    'timezone',
     'monthly_price',
     'payment_instructions',
     'nequi_number',
@@ -47,6 +48,23 @@ class Tenant extends Model
             // aunque hoy (sin pasarela integrada) normalmente esté vacío.
             'gateway_config' => 'encrypted',
         ];
+    }
+
+    /**
+     * Hito 10 — defensa en profundidad: `timezone` se valida en el
+     * formulario de Filament (`Select::make('timezone')->rule('timezone:all')`),
+     * pero cualquier otra vía de escritura (seeders, comandos, una futura
+     * API) debe encontrar la misma barrera. Nunca corrige el valor por su
+     * cuenta ni lo sustituye por un default — un valor inválido bloquea el
+     * guardado, punto.
+     */
+    protected static function booted(): void
+    {
+        static::saving(function (self $tenant) {
+            if ($tenant->timezone !== null && ! in_array($tenant->timezone, \DateTimeZone::listIdentifiers(), true)) {
+                throw new \InvalidArgumentException("Invalid IANA timezone for Tenant: {$tenant->timezone}");
+            }
+        });
     }
 
     public function products(): HasMany

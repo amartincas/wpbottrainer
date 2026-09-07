@@ -60,6 +60,21 @@ class Contact extends Model
     }
 
     /**
+     * Hito 10 — dominio Reminder. Mismo criterio que el resto: Contact sigue
+     * siendo la única identidad, estas relaciones exponen datos que
+     * pertenecen a Reminder, no a Core ni a Training en sí.
+     */
+    public function reminders(): HasMany
+    {
+        return $this->hasMany(Reminder::class);
+    }
+
+    public function reminderSuggestions(): HasMany
+    {
+        return $this->hasMany(ReminderSuggestion::class);
+    }
+
+    /**
      * Hito 8 — dominio Payments. Igual que Training: Contact sigue siendo la
      * única identidad, esta relación expone datos que pertenecen a
      * Payments, no a Core.

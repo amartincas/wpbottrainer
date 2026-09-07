@@ -28,10 +28,13 @@ use Illuminate\Support\Facades\Log;
  */
 class CoachService
 {
-    private const EMPTY_RESULT = ['safety_signal_text' => null, 'intents' => [], 'training_reply' => null];
+    private const EMPTY_RESULT = [
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+        'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+    ];
 
     /**
-     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string}
+     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool}
      */
     public function respond(string $messageBody, CoachContext $coachContext, Tenant $tenant): array
     {
@@ -76,15 +79,22 @@ Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber
 - "general_conversation": conversación general de entrenamiento no cubierta arriba.
 - "membership_status": preguntas sobre membresía, pago, acceso o facturación.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
+- "reminder_request": el usuario pide explícitamente un recordatorio ("recuérdame mañana a las 7", "todos los martes recuérdame entrenar") O menciona que se le olvida entrenar ("siempre se me olvida entrenar los martes") — en ambos casos extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial.
+- "reminder_cancel": el usuario quiere cancelar un recordatorio ya configurado ("ya no quiero ese recordatorio").
+- "reminder_modify": el usuario quiere cambiar un recordatorio ya configurado ("cámbialo para las 8").
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 {
   "safety_signal_text": "<frase textual del usuario si menciona dolor de pecho, dificultad para respirar, desmayo, cirugía reciente, entumecimiento severo, lesión grave repentina o embarazo de riesgo>" | null,
   "intents": ["<uno o más de la lista cerrada>"],
-  "training_reply": "<tu explicación, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation); usa ÚNICAMENTE los HECHOS de arriba>" | null
+  "training_reply": "<tu explicación, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation); usa ÚNICAMENTE los HECHOS de arriba>" | null,
+  "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" (SOLO si el usuario mencionó un día, para crear/modificar/confirmar-con-cambio un recordatorio) | null,
+  "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
+  "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
+  "reminder_confirmation": true (el mensaje confirma afirmativamente una propuesta de recordatorio que TÚ MISMO ofreciste en un mensaje anterior de este historial — revisa el HISTORIAL DE CONVERSACIÓN) | false (la rechaza) | null (no hay ninguna propuesta pendiente que confirmar/rechazar en este mensaje)
 }
 
-Para "membership_status"/"faq_question" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta.
+Para "membership_status"/"faq_question" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta. El código, nunca tú, calcula la fecha/hora real y crea/modifica cualquier recordatorio — solo extraes lo que el usuario dijo, en el vocabulario cerrado de arriba.
 PROMPT;
     }
 
@@ -108,6 +118,7 @@ PROMPT;
             'training_reply' => is_string($decoded['training_reply'] ?? null) && trim($decoded['training_reply']) !== ''
                 ? $decoded['training_reply']
                 : null,
+            ...ReminderExtractionFields::validate($decoded),
         ];
     }
 }

@@ -31,6 +31,17 @@ enum DetectedIntentType: string
     case FaqQuestion = 'faq_question';
 
     /**
+     * Hito 10 — cubre tanto una petición explícita ("recuérdame mañana a
+     * las 7", "todos los martes recuérdame entrenar") como una mención que
+     * dispara una OFERTA proactiva ("siempre se me olvida entrenar los
+     * martes") — en ambos casos el código decide qué hacer con `reminder_day`/
+     * `reminder_time`/`reminder_recurrence`, nunca la IA.
+     */
+    case ReminderRequest = 'reminder_request';
+    case ReminderCancel = 'reminder_cancel';
+    case ReminderModify = 'reminder_modify';
+
+    /**
      * Valida una lista cruda (ej. del JSON de la IA) contra este vocabulario
      * cerrado — cualquier valor que no sea uno de estos casos se descarta
      * silenciosamente (nunca un error, nunca una segunda autoridad de

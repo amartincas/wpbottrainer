@@ -60,6 +60,10 @@ class ExecutionReportService
         'safety_signal_text' => null,
         'intents' => [],
         'training_reply' => null,
+        'reminder_day' => null,
+        'reminder_time' => null,
+        'reminder_recurrence' => null,
+        'reminder_confirmation' => null,
     ];
 
     /**
@@ -122,8 +126,12 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
     }
   ],
   "session_finished": true (si el usuario indica que terminó/cerró toda la sesión, ej. "eso fue todo", "ya terminé") | false,
-  "intents": ["<uno o más de: exercise_question, continue_training, general_conversation, membership_status, faq_question>"],
-  "training_reply": "<texto conversacional, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation) Y el mensaje no es (solo) un reporte>" | null
+  "intents": ["<uno o más de: exercise_question, continue_training, general_conversation, membership_status, faq_question, reminder_request, reminder_cancel, reminder_modify>"],
+  "training_reply": "<texto conversacional, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation) Y el mensaje no es (solo) un reporte>" | null,
+  "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" | null,
+  "reminder_time": "<hora en formato 24h HH:MM>" | null,
+  "reminder_recurrence": true|false|null,
+  "reminder_confirmation": true|false|null
 }
 
 Reglas del reporte:
@@ -142,6 +150,8 @@ Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
 - Si el mensaje es ÚNICAMENTE un reporte, sin ninguna otra pregunta, "intents" debe ser [] y "training_reply" null.
 - Para "membership_status"/"faq_question" NUNCA generes contenido factual en "training_reply" — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta.
+- "reminder_request": el usuario pide un recordatorio O menciona que se le olvida entrenar — extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial. "reminder_cancel"/"reminder_modify": quiere cancelar/cambiar uno ya configurado.
+- "reminder_confirmation": true/false SOLO si el mensaje confirma o rechaza una propuesta de recordatorio que TÚ ofreciste en un mensaje anterior de este historial (revisa el HISTORIAL DE CONVERSACIÓN) — null si no aplica. El código, nunca tú, calcula la fecha/hora real y crea o modifica cualquier recordatorio.
 PROMPT;
 
         if ($coachContext !== null) {
@@ -200,6 +210,7 @@ PROMPT;
             'training_reply' => is_string($decoded['training_reply'] ?? null) && trim($decoded['training_reply']) !== ''
                 ? $decoded['training_reply']
                 : null,
+            ...ReminderExtractionFields::validate($decoded),
         ];
     }
 

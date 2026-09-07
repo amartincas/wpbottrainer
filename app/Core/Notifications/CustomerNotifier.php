@@ -20,24 +20,37 @@ use Illuminate\Support\Facades\Log;
  * Decide ÚNICAMENTE el mecanismo de entrega — mensaje libre si la ventana de
  * 24h de WhatsApp sigue abierta, WhatsApp Template si no — nunca CUÁNDO ni
  * POR QUÉ contactar al cliente; esa decisión es y seguirá siendo exclusiva
- * del dominio que llama (Payments hoy; Proactivity en el futuro reutiliza
- * este mismo método sin que este componente contenga ninguna de sus reglas).
+ * del dominio que llama (Payments; Reminders desde Hito 10 — este
+ * componente sigue sin contener ninguna de sus reglas).
  *
- * Un dominio (Payments/Safety/futuros) solo describe el evento — nunca
+ * Un dominio (Payments/Safety/Reminders) solo describe el evento — nunca
  * conoce Graph API, nombre técnico de plantilla, versión de Meta, ni la
  * regla de ventana. Ver docs/DECISIONS.md.
  *
  * `eventKey` es un string libre a propósito (mismo criterio que
  * `Alert::category` en App\Core\Alerts) — un enum cerrado aquí obligaría a
  * tocar este componente cada vez que un dominio nuevo necesite notificar.
- * Los valores válidos hoy (payment_confirmed, payment_rejected) solo existen
- * como guía en el Select de WhatsAppTemplateForm, no como restricción de
- * este componente ni de la base de datos.
  *
  * Ninguna excepción se propaga fuera de `notify()`: un fallo de entrega
  * (plantilla no configurada, Meta la rechaza, error de red) nunca debe
  * afectar al proceso que originó la notificación — mismo contrato que
- * AlertService::send().
+ * AlertService::send(). Si no hay plantilla configurada, NO se persiste
+ * ningún WhatsAppMessage — nunca se intentó nada real (comportamiento
+ * original, sin cambios).
+ *
+ * Hito 10 — idempotencia (`$idempotencyKey` opcional): garantiza "como
+ * máximo una entrega CONFIRMADA" por clave lógica, nunca "exactly once"
+ * (ver docs/DECISIONS.md). `WhatsAppMessage.idempotency_key` (índice único)
+ * es la identidad; `WhatsAppMessage.dispatch_confirmed_at` es la única
+ * fuente DURABLE (no caché) de "esto sí se confirmó con Meta" — se fija
+ * únicamente cuando la llamada real responde con éxito. Si ya existe un
+ * `WhatsAppMessage` con esa clave y `dispatch_confirmed_at` ya tiene valor,
+ * NUNCA se reintenta el envío. Si existe pero sin confirmar (resultado de
+ * un intento anterior desconocido — el proceso pudo morir antes de que
+ * Meta respondiera), se reintenta REUSANDO la MISMA fila (`firstOrCreate`),
+ * nunca creando una segunda — el contenido puede regenerarse en el retry
+ * sin que eso afecte la identidad lógica del envío ni permita una segunda
+ * entrega confirmada.
  */
 class CustomerNotifier
 {
@@ -49,22 +62,47 @@ class CustomerNotifier
      */
     private const WINDOW_THRESHOLD_MINUTES = (23 * 60) + 30;
 
-    public function notify(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText): void
-    {
+    public function notify(
+        Tenant $tenant,
+        string $to,
+        string $eventKey,
+        array $variables,
+        string $freeFormText,
+        ?string $idempotencyKey = null,
+    ): CustomerNotifyResult {
         try {
-            if ($this->isWindowOpen($tenant, $to)) {
-                $this->sendFreeForm($tenant, $to, $eventKey, $freeFormText);
+            if ($idempotencyKey !== null) {
+                $existing = WhatsAppMessage::where('idempotency_key', $idempotencyKey)->first();
 
-                return;
+                if ($existing !== null && $existing->dispatch_confirmed_at !== null) {
+                    // Ya hubo una entrega CONFIRMADA para esta MISMA
+                    // ocurrencia (mismo Reminder + mismo fire_at) — nunca se
+                    // reenvía, sin importar cuántas veces se reinvoque con
+                    // la misma clave.
+                    Log::info('CUSTOMER_NOTIFIER_ALREADY_CONFIRMED', [
+                        'tenant_id' => $tenant->id,
+                        'event_key' => $eventKey,
+                        'idempotency_key' => $idempotencyKey,
+                    ]);
+
+                    return CustomerNotifyResult::confirmed();
+                }
             }
 
-            $this->sendViaTemplate($tenant, $to, $eventKey, $variables, $freeFormText);
+            $wamid = $this->isWindowOpen($tenant, $to)
+                ? $this->sendFreeForm($tenant, $to, $eventKey, $freeFormText, $idempotencyKey)
+                : $this->sendViaTemplate($tenant, $to, $eventKey, $variables, $freeFormText, $idempotencyKey);
+
+            return $wamid !== null ? CustomerNotifyResult::confirmed() : CustomerNotifyResult::unconfirmed();
         } catch (\Throwable $e) {
             Log::error('CUSTOMER_NOTIFIER_FAILED', [
                 'tenant_id' => $tenant->id,
                 'event_key' => $eventKey,
+                'idempotency_key' => $idempotencyKey,
                 'error' => $e->getMessage(),
             ]);
+
+            return CustomerNotifyResult::unconfirmed();
         }
     }
 
@@ -87,28 +125,31 @@ class CustomerNotifier
         return $conversation->last_session_at->diffInMinutes(now()) < self::WINDOW_THRESHOLD_MINUTES;
     }
 
-    private function sendFreeForm(Tenant $tenant, string $to, string $eventKey, string $text): void
+    private function sendFreeForm(Tenant $tenant, string $to, string $eventKey, string $text, ?string $idempotencyKey): ?string
     {
-        $message = $this->persistOutbound($tenant, $to, $text);
+        $message = $this->persistOutbound($tenant, $to, $text, $idempotencyKey);
 
         $wamid = WhatsAppService::sendMessage($to, $text, $tenant);
 
-        $this->trackDelivery($message, $wamid, $eventKey, 'free_form');
+        $this->finalizeDelivery($message, $wamid, $eventKey, 'free_form', $idempotencyKey);
+
+        return $wamid;
     }
 
-    private function sendViaTemplate(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText): void
+    private function sendViaTemplate(Tenant $tenant, string $to, string $eventKey, array $variables, string $freeFormText, ?string $idempotencyKey): ?string
     {
         $template = WhatsAppTemplate::where('tenant_id', $tenant->id)
             ->where('event_key', $eventKey)
             ->first();
 
         if ($template === null) {
+            // Nunca se persiste nada aquí — no se intentó ningún envío real.
             Log::warning('CUSTOMER_NOTIFIER_TEMPLATE_NOT_CONFIGURED', [
                 'tenant_id' => $tenant->id,
                 'event_key' => $eventKey,
             ]);
 
-            return;
+            return null;
         }
 
         $orderedVariables = $this->resolveVariables($template, $variables);
@@ -118,22 +159,30 @@ class CustomerNotifier
         // contexto de FallbackChatHandler, igual que si la ventana hubiera
         // estado abierta. El canal técnico realmente usado queda en el log
         // CUSTOMER_NOTIFIER_SENT, no en WhatsAppMessage.
-        $message = $this->persistOutbound($tenant, $to, $freeFormText);
+        $message = $this->persistOutbound($tenant, $to, $freeFormText, $idempotencyKey);
 
         $wamid = WhatsAppService::sendTemplateMessage($to, $template->name, $template->language, $orderedVariables, $tenant);
 
-        $this->trackDelivery($message, $wamid, $eventKey, 'template', $template->name);
+        $this->finalizeDelivery($message, $wamid, $eventKey, 'template', $idempotencyKey, $template->name);
+
+        return $wamid;
     }
 
     /**
-     * Mismo patrón ya usado por PaymentHandler::reply()/TrainingHandler::reply()
-     * — el historial de WhatsAppMessage debe quedar consistente sin importar
-     * qué componente originó el mensaje saliente. Se persiste ANTES de
-     * intentar el envío real (igual que esos dos) para que quede registro de
-     * lo que se intentó comunicar incluso si Meta rechaza el envío.
+     * `firstOrCreate` sobre `idempotency_key` cuando se provee: si ya
+     * existe una fila con esa clave (confirmada o no), se REUTILIZA — nunca
+     * se crea una segunda. Sin clave (llamadores existentes, Payments),
+     * comportamiento idéntico al de siempre.
      */
-    private function persistOutbound(Tenant $tenant, string $to, string $text): WhatsAppMessage
+    private function persistOutbound(Tenant $tenant, string $to, string $text, ?string $idempotencyKey): WhatsAppMessage
     {
+        if ($idempotencyKey !== null) {
+            return WhatsAppMessage::firstOrCreate(
+                ['idempotency_key' => $idempotencyKey],
+                ['tenant_id' => $tenant->id, 'customer_phone' => $to, 'role' => 'assistant', 'content' => $text],
+            );
+        }
+
         return WhatsAppMessage::create([
             'tenant_id' => $tenant->id,
             'customer_phone' => $to,
@@ -142,24 +191,35 @@ class CustomerNotifier
         ]);
     }
 
-    private function trackDelivery(WhatsAppMessage $message, ?string $wamid, string $eventKey, string $channel, ?string $templateName = null): void
+    private function finalizeDelivery(WhatsAppMessage $message, ?string $wamid, string $eventKey, string $channel, ?string $idempotencyKey, ?string $templateName = null): void
     {
-        if ($wamid !== null) {
-            WhatsAppStatusTracker::trackMessage($message->id, $wamid);
-        } else {
+        if ($wamid === null) {
             Log::warning('CUSTOMER_NOTIFIER_META_SEND_FAILED', [
                 'whatsapp_message_id' => $message->id,
                 'event_key' => $eventKey,
                 'channel' => $channel,
             ]);
+
+            Log::info('CUSTOMER_NOTIFIER_SENT', array_filter([
+                'tenant_id' => $message->tenant_id, 'event_key' => $eventKey, 'channel' => $channel,
+                'template_name' => $templateName, 'success' => false,
+            ], fn ($v) => $v !== null));
+
+            return;
         }
 
+        if ($idempotencyKey !== null) {
+            // Se fija SOLO ahora, justo después de que Meta confirmó — es
+            // la única fuente durable de "esto sí salió" (nunca la caché de
+            // WhatsAppStatusTracker, que no es duradera).
+            $message->update(['dispatch_confirmed_at' => now()]);
+        }
+
+        WhatsAppStatusTracker::trackMessage($message->id, $wamid);
+
         Log::info('CUSTOMER_NOTIFIER_SENT', array_filter([
-            'tenant_id' => $message->tenant_id,
-            'event_key' => $eventKey,
-            'channel' => $channel,
-            'template_name' => $templateName,
-            'success' => $wamid !== null,
+            'tenant_id' => $message->tenant_id, 'event_key' => $eventKey, 'channel' => $channel,
+            'template_name' => $templateName, 'success' => true,
         ], fn ($v) => $v !== null));
     }
 

@@ -50,7 +50,7 @@ it('returns an empty result for an empty message, without calling the AI provide
 
     $result = (new CoachService)->respond('', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
     Http::assertNothingSent();
 });
 
@@ -111,7 +111,7 @@ it('degrades to an empty result when the AI provider fails, without throwing', f
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
 });
 
 it('degrades to an empty result when the AI response is not valid JSON', function () {
@@ -119,7 +119,7 @@ it('degrades to an empty result when the AI response is not valid JSON', functio
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
 });
 
 it('treats an empty/blank training_reply as null, never an empty string action', function () {

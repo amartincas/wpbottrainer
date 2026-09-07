@@ -11,6 +11,8 @@ use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\HandlerInterface;
 use App\ExerciseCatalog\MediaResolver;
 use App\Models\Contact;
+use App\Models\Reminder;
+use App\Models\ReminderSuggestion;
 use App\Models\Tenant;
 use App\Models\TrainingProfile;
 use App\Models\WhatsAppMessage;
@@ -19,6 +21,8 @@ use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\ConversationActionType;
+use App\Training\Enums\ReminderSuggestionOrigin;
+use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SplitType;
 use App\Training\Onboarding\OnboardingConversationComposer;
@@ -31,7 +35,10 @@ use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
 use App\Training\Support\ExerciseMessageFormatter;
 use App\Training\Support\OnboardingConversationService;
+use App\Training\Support\ReminderProactivityGate;
+use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\SafetySignalDetector;
+use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Facades\Log;
@@ -114,6 +121,35 @@ class TrainingHandler implements HandlerInterface
         .'un miembro de nuestro equipo va a revisar la información que compartiste para asegurarnos de adaptarla '
         .'bien. Te aviso en cuanto esté lista 💪';
 
+    /**
+     * Hito 10 — atajo determinista (cero IA) para una afirmación corta
+     * dentro de la ventana de continuidad de un Reminder ya disparado (ver
+     * `Reminder.awaiting_response_until`, D053). Vocabulario cerrado y
+     * curado, mismo criterio que `SafetySignalDetector::PATTERNS`.
+     */
+    private const SHORT_AFFIRMATIVE_WORDS = [
+        'si', 'sí', 'dale', 'listo', 'vamos', 'empecemos', 'ok', 'okay', 'va', 'bueno',
+    ];
+
+    private const REMINDER_CLARIFICATION_MESSAGE = '¿Qué día y a qué hora quieres que te recuerde? '
+        .'Por ejemplo: "todos los martes a las 7pm" o "mañana a las 8am".';
+
+    private const REMINDER_PROPOSAL_TEMPLATE = 'Puedo recordarte entrenar %s a las %s. ¿Confirmas? 💪';
+
+    private const REMINDER_CONFIRMED_MESSAGE = '¡Listo! Te recordaré entrenar %s a las %s. 🔔';
+
+    private const REMINDER_DECLINED_MESSAGE = 'Sin problema, no configuro ningún recordatorio.';
+
+    private const REMINDER_NONE_ACTIVE_MESSAGE = 'No tienes ningún recordatorio activo en este momento.';
+
+    private const REMINDER_ALREADY_ACTIVE_MESSAGE = 'Ya tienes un recordatorio activo — cancélalo primero si quieres configurar uno nuevo.';
+
+    private const REMINDER_CANCELLED_MESSAGE = 'Listo, cancelé tu recordatorio. 🔕';
+
+    private const REMINDER_MODIFIED_MESSAGE = 'Listo, actualicé tu recordatorio para %s a las %s. 🔔';
+
+    private const PROACTIVE_SESSION_COMPLETED_TIME = '19:00';
+
     public function __construct(
         private readonly TrainingAccessGate $accessGate,
         private readonly TrainingEngine $engine,
@@ -129,6 +165,9 @@ class TrainingHandler implements HandlerInterface
         private readonly ExerciseMessageFormatter $messageFormatter,
         private readonly CoachService $coach,
         private readonly ConversationTurnResolver $turnResolver,
+        private readonly ReminderTimeResolver $reminderTimeResolver,
+        private readonly TimezoneResolver $timezoneResolver,
+        private readonly ReminderProactivityGate $proactivityGate,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -307,6 +346,12 @@ class TrainingHandler implements HandlerInterface
         // exacto), sin invocar a Coach.
         if ($onboardingJustCompletedThisTurn) {
             // continúa directo al paso 6, sin segunda llamada de IA.
+        } elseif ($this->isShortAffirmativeAfterReminder($body, $freshContact)) {
+            // Hito 10 (D053) — "sí"/"dale"/... dentro de la ventana de
+            // continuidad de un Reminder disparado recientemente se traduce
+            // directo a continue_training, cero llamadas de IA. Consume la
+            // ventana para no volver a disparar en un mensaje posterior no
+            // relacionado.
         } elseif ($body !== '') {
             $coachContext = $this->buildContext($context, 'coach_context')->data;
             $result = $this->coach->respond($body, $coachContext, $tenant);
@@ -431,13 +476,25 @@ class TrainingHandler implements HandlerInterface
             }
 
             if ($action->type === ConversationActionType::RecordExecutionReport && $activeSessionData !== null) {
-                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $startedAt);
+                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $contact, $startedAt);
 
                 continue;
             }
 
             if ($action->type === ConversationActionType::SendText) {
                 $this->reply($from, $action->text, $tenant);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::ProposeReminder) {
+                $this->proposeReminder($action->reminderData, $contact, $tenant, $from);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::ApplyReminderDecision) {
+                $this->applyReminderDecision($action->reminderData, $contact, $tenant, $from);
 
                 continue;
             }
@@ -463,7 +520,7 @@ class TrainingHandler implements HandlerInterface
      * @param  array{reports: array, session_finished: bool}  $report
      * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
      */
-    private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, float $startedAt): void
+    private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, Contact $contact, float $startedAt): void
     {
         Log::info('TRAINING_REPORT_ATTEMPT', ['workout_session_id' => $activeSessionData['workout_session_id']]);
 
@@ -480,6 +537,13 @@ class TrainingHandler implements HandlerInterface
         ]);
 
         $this->reply($from, $this->buildReportResponseMessage($outcome), $tenant);
+
+        // Hito 10, Trigger 2 de proactividad — determinista, sin IA: la
+        // decisión de ofrecer (o no) la toma ReminderProactivityGate, nunca
+        // este método por su cuenta.
+        if ($outcome->sessionCompleted) {
+            $this->maybeOfferProactiveReminder($contact, $tenant, $from);
+        }
     }
 
     private function buildReportResponseMessage(ExecutionReportOutcome $outcome): string
@@ -504,6 +568,262 @@ class TrainingHandler implements HandlerInterface
         }
 
         return $lines !== [] ? implode("\n", $lines) : 'Listo.';
+    }
+
+    // ── Hito 10 — Reminders ──────────────────────────────────────────────
+
+    private const WEEKDAY_INT_TO_STRING = [
+        0 => 'sunday', 1 => 'monday', 2 => 'tuesday', 3 => 'wednesday', 4 => 'thursday', 5 => 'friday', 6 => 'saturday',
+    ];
+
+    private const WEEKDAY_SINGULAR = [
+        'monday' => 'el lunes', 'tuesday' => 'el martes', 'wednesday' => 'el miércoles', 'thursday' => 'el jueves',
+        'friday' => 'el viernes', 'saturday' => 'el sábado', 'sunday' => 'el domingo',
+    ];
+
+    private const WEEKDAY_PLURAL = [
+        'monday' => 'todos los lunes', 'tuesday' => 'todos los martes', 'wednesday' => 'todos los miércoles',
+        'thursday' => 'todos los jueves', 'friday' => 'todos los viernes', 'saturday' => 'todos los sábados',
+        'sunday' => 'todos los domingos',
+    ];
+
+    /**
+     * Hito 10 (D053) — atajo determinista, cero llamadas de IA: una
+     * afirmación corta dentro de la ventana de continuidad de un `Reminder`
+     * ya disparado se traduce directo a `continue_training`. Consume la
+     * ventana al usarla, para que un mensaje posterior no relacionado
+     * dentro de las mismas horas no vuelva a dispararla.
+     */
+    private function isShortAffirmativeAfterReminder(string $body, Contact $contact): bool
+    {
+        $normalized = mb_strtolower(trim(preg_replace('/[.!¡¿?]/u', '', $body) ?? $body));
+
+        if (! in_array($normalized, self::SHORT_AFFIRMATIVE_WORDS, true)) {
+            return false;
+        }
+
+        $reminder = Reminder::where('contact_id', $contact->id)
+            ->whereNotNull('awaiting_response_until')
+            ->where('awaiting_response_until', '>', now())
+            ->first();
+
+        if ($reminder === null) {
+            return false;
+        }
+
+        $reminder->update(['awaiting_response_until' => null]);
+
+        return true;
+    }
+
+    /**
+     * @param  array{day: ?string, time: ?string, recurring: bool}  $data
+     */
+    private function proposeReminder(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        if (ReminderSuggestion::activePendingFor($contact) !== null || Reminder::activeFor($contact) !== null) {
+            // Ya hay una propuesta pendiente o un recordatorio activo — no
+            // se ofrece un segundo en silencio (mismo criterio que el
+            // índice único de base de datos).
+            return;
+        }
+
+        $timezone = $this->timezoneResolver->resolve($contact);
+        $resolution = $this->reminderTimeResolver->resolve($data['day'], $data['time'], $data['recurring'], $timezone, now());
+
+        if ($resolution === null) {
+            $this->reply($from, self::REMINDER_CLARIFICATION_MESSAGE, $tenant);
+
+            return;
+        }
+
+        ReminderSuggestion::create([
+            'tenant_id' => $tenant->id,
+            'contact_id' => $contact->id,
+            'origin' => ReminderSuggestionOrigin::UserRequest,
+            'trigger_reason' => null,
+            'proposed_type' => $resolution->recurrence !== null ? 'training_weekly' : 'training_one_off',
+            'proposed_params' => $data,
+            'status' => ReminderSuggestionStatus::Pending,
+            'expires_at' => now()->addHours(24),
+        ]);
+
+        $this->reply($from, sprintf(self::REMINDER_PROPOSAL_TEMPLATE, $this->describeDay($data['day'], $data['recurring']), $data['time']), $tenant);
+    }
+
+    /**
+     * @param  array{decision: string, confirmed: ?bool, day: ?string, time: ?string}  $data
+     */
+    private function applyReminderDecision(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        match ($data['decision']) {
+            'confirmation' => $this->applyReminderConfirmation($data, $contact, $tenant, $from),
+            'cancel' => $this->cancelActiveReminder($contact, $tenant, $from),
+            'modify' => $this->modifyActiveReminder($data, $contact, $tenant, $from),
+            default => null,
+        };
+    }
+
+    private function applyReminderConfirmation(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        $suggestion = ReminderSuggestion::activePendingFor($contact);
+
+        if ($suggestion === null) {
+            // Nada pendiente que confirmar — no-op silencioso, mismo
+            // criterio que RecordExecutionReport sin sesión activa.
+            return;
+        }
+
+        if ($data['confirmed'] === false) {
+            $suggestion->update(['status' => ReminderSuggestionStatus::Declined]);
+            $this->reply($from, self::REMINDER_DECLINED_MESSAGE, $tenant);
+
+            return;
+        }
+
+        if (Reminder::activeFor($contact) !== null) {
+            $this->reply($from, self::REMINDER_ALREADY_ACTIVE_MESSAGE, $tenant);
+
+            return;
+        }
+
+        // Override ("Sí, pero a las 8"): CÓDIGO revalida con el mismo
+        // resolver — nunca se acepta el valor de la IA a ciegas, ni
+        // siquiera en una confirmación.
+        $params = $suggestion->proposed_params;
+        $day = $data['day'] ?? $params['day'];
+        $time = $data['time'] ?? $params['time'];
+        $recurring = $params['recurring'];
+
+        $timezone = $this->timezoneResolver->resolve($contact);
+        $resolution = $this->reminderTimeResolver->resolve($day, $time, $recurring, $timezone, now());
+
+        if ($resolution === null) {
+            // La suggestion sigue pending — no se pierde la aceptación
+            // implícita, se pide precisar el dato que falta.
+            $this->reply($from, self::REMINDER_CLARIFICATION_MESSAGE, $tenant);
+
+            return;
+        }
+
+        Reminder::create([
+            'tenant_id' => $tenant->id,
+            'contact_id' => $contact->id,
+            'type' => $suggestion->proposed_type,
+            'status' => \App\Training\Enums\ReminderStatus::Pending,
+            'fire_at' => $resolution->fireAt,
+            'recurrence' => $resolution->recurrence,
+            'created_from_suggestion_id' => $suggestion->id,
+        ]);
+
+        $suggestion->update(['status' => ReminderSuggestionStatus::Accepted]);
+
+        $this->reply($from, sprintf(self::REMINDER_CONFIRMED_MESSAGE, $this->describeDay($day, $recurring), $time), $tenant);
+    }
+
+    private function cancelActiveReminder(Contact $contact, Tenant $tenant, string $from): void
+    {
+        $reminder = Reminder::activeFor($contact);
+
+        if ($reminder === null) {
+            $this->reply($from, self::REMINDER_NONE_ACTIVE_MESSAGE, $tenant);
+
+            return;
+        }
+
+        $reminder->update(['status' => \App\Training\Enums\ReminderStatus::Cancelled, 'cancelled_at' => now()]);
+        $this->reply($from, self::REMINDER_CANCELLED_MESSAGE, $tenant);
+    }
+
+    /**
+     * @param  array{day: ?string, time: ?string}  $data
+     */
+    private function modifyActiveReminder(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        $reminder = Reminder::activeFor($contact);
+
+        if ($reminder === null) {
+            $this->reply($from, self::REMINDER_NONE_ACTIVE_MESSAGE, $tenant);
+
+            return;
+        }
+
+        $timezone = $this->timezoneResolver->resolve($contact);
+        $currentLocal = \Carbon\CarbonImmutable::instance($reminder->fire_at)->setTimezone($timezone);
+        $recurring = $reminder->recurrence !== null;
+
+        // Sin día nuevo explícito ("cámbialo para las 8"): se conserva el
+        // día que ya tenía la ocurrencia actual — nunca se adivina uno
+        // distinto.
+        $day = $data['day'] ?? self::WEEKDAY_INT_TO_STRING[$currentLocal->dayOfWeek];
+        $time = $data['time'] ?? $currentLocal->format('H:i');
+
+        $resolution = $this->reminderTimeResolver->resolve($day, $time, $recurring, $timezone, now());
+
+        if ($resolution === null) {
+            $this->reply($from, self::REMINDER_CLARIFICATION_MESSAGE, $tenant);
+
+            return;
+        }
+
+        $reminder->update(['fire_at' => $resolution->fireAt, 'recurrence' => $resolution->recurrence]);
+
+        $this->reply($from, sprintf(self::REMINDER_MODIFIED_MESSAGE, $this->describeDay($day, $recurring), $time), $tenant);
+    }
+
+    /**
+     * Hito 10, Trigger 2 de proactividad ("usuario acaba de terminar una
+     * sesión"). La decisión de ofrecer la toma `ReminderProactivityGate`
+     * — código, nunca la IA. Texto y parámetros deterministas: la hora
+     * (`PROACTIVE_SESSION_COMPLETED_TIME`) es un valor técnico provisional,
+     * marcado explícitamente como decisión de negocio pendiente.
+     */
+    private function maybeOfferProactiveReminder(Contact $contact, Tenant $tenant, string $from): void
+    {
+        if (! $this->proactivityGate->canOffer($contact)) {
+            return;
+        }
+
+        $timezone = $this->timezoneResolver->resolve($contact);
+        $day = self::WEEKDAY_INT_TO_STRING[\Carbon\CarbonImmutable::now($timezone)->dayOfWeek];
+
+        $resolution = $this->reminderTimeResolver->resolve($day, self::PROACTIVE_SESSION_COMPLETED_TIME, true, $timezone, now());
+
+        if ($resolution === null) {
+            return;
+        }
+
+        ReminderSuggestion::create([
+            'tenant_id' => $tenant->id,
+            'contact_id' => $contact->id,
+            'origin' => ReminderSuggestionOrigin::Proactive,
+            'trigger_reason' => 'session_completed',
+            'proposed_type' => 'training_weekly',
+            'proposed_params' => ['day' => $day, 'time' => self::PROACTIVE_SESSION_COMPLETED_TIME, 'recurring' => true],
+            'status' => ReminderSuggestionStatus::Pending,
+            'expires_at' => now()->addHours(24),
+        ]);
+
+        $this->reply(
+            $from,
+            sprintf('¿Quieres que te recuerde entrenar %s a las %s? Responde "sí" para confirmar. 💪', $this->describeDay($day, true), self::PROACTIVE_SESSION_COMPLETED_TIME),
+            $tenant,
+        );
+    }
+
+    private function describeDay(?string $day, bool $recurring): string
+    {
+        if ($day === 'tomorrow') {
+            return 'mañana';
+        }
+
+        if ($day === 'today') {
+            return 'hoy';
+        }
+
+        $map = $recurring ? self::WEEKDAY_PLURAL : self::WEEKDAY_SINGULAR;
+
+        return $map[$day] ?? 'ese día';
     }
 
     private function respondToDenial(?string $reason, string $from, Tenant $tenant): void

@@ -6,6 +6,7 @@ use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\IntentClassifierInterface;
 use App\Models\Contact;
+use App\Models\Reminder;
 use App\Training\Enums\TrainingAccessStatus;
 use App\Training\Enums\WorkoutSessionStatus;
 
@@ -61,6 +62,7 @@ class TrainingIntentClassifier implements IntentClassifierInterface
         if ($this->hasIncompleteOnboarding($contact)
             || $this->hasPendingWorkoutSession($contact)
             || $this->hasActiveAccessAwaitingFirstWorkout($contact)
+            || $this->hasAwaitingReminderResponse($contact)
         ) {
             return Intent::Training;
         }
@@ -106,5 +108,21 @@ class TrainingIntentClassifier implements IntentClassifierInterface
         }
 
         return ! $contact->workoutSessions()->exists();
+    }
+
+    /**
+     * Hito 10 (D053) — mismo patrón que `hasActiveAccessAwaitingFirstWorkout()`:
+     * una ventana corta y acotada, no un mecanismo general de "qué se espera
+     * del usuario". Sin esto, la respuesta a un `Reminder` recién disparado
+     * ("sí", "dale") podría perderse en `FallbackChatHandler` — misma clase
+     * de brecha ya documentada para "sesión recién completada" (deuda de
+     * Bloque 9), cerrada aquí para el caso de recordatorios.
+     */
+    private function hasAwaitingReminderResponse(Contact $contact): bool
+    {
+        return Reminder::where('contact_id', $contact->id)
+            ->whereNotNull('awaiting_response_until')
+            ->where('awaiting_response_until', '>', now())
+            ->exists();
     }
 }

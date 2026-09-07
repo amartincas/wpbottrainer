@@ -36,6 +36,7 @@ class TenantFactory extends Factory
             'wa_verify_token' => Str::random(32),
             'currency' => 'COP',
             'country' => 'CO',
+            'timezone' => 'America/Bogota',
             'monthly_price' => 50000,
             'payment_instructions' => 'Incluye tu número de WhatsApp como referencia.',
             'nequi_number' => (string) fake()->numerify('3##-###-####'),

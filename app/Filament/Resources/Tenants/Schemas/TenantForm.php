@@ -69,6 +69,21 @@ class TenantForm
                     ->required()
                     ->columnSpanFull()
                     ->helperText('Verify token for webhook setup'),
+                // Hito 10 — propiedad ESTRUCTURAL, no opcional: WpbotTrainer
+                // debe poder operar en múltiples países. Identificador IANA
+                // (nunca un offset fijo), validado con la regla nativa
+                // `timezone` de Laravel. 'America/Bogota' es solo el valor
+                // inicial sugerido al crear un Tenant — visible y editable,
+                // nunca un fallback oculto (ver App\Training\Support\TimezoneResolver,
+                // que nunca usa este valor por defecto en tiempo de ejecución).
+                Select::make('timezone')
+                    ->label('Timezone (IANA)')
+                    ->searchable()
+                    ->options(array_combine(\DateTimeZone::listIdentifiers(), \DateTimeZone::listIdentifiers()))
+                    ->required()
+                    ->default('America/Bogota')
+                    ->rule('timezone:all')
+                    ->helperText('Zona horaria del negocio — determina cuándo se disparan sus recordatorios (Hito 10). Ej: America/Bogota, America/Mexico_City, America/Lima, Europe/Madrid.'),
             ]);
     }
 }
