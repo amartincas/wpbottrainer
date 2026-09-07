@@ -13,6 +13,7 @@ use App\Core\Messaging\Router;
 use App\Handlers\FallbackChatHandler;
 use App\Payments\Handlers\PaymentHandler;
 use App\Payments\Support\PaymentIntentClassifier;
+use App\Training\Context\CoachContextProvider;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
@@ -89,12 +90,18 @@ class AppServiceProvider extends ServiceProvider
         // Core memory ContextBuilder: same Container-resolution pattern as
         // Dispatcher, but for structured memory providers instead of intent
         // Handlers. `training_profile` (Hito 5) and `active_workout_session`
-        // (Hito 6) are the only real providers — see
+        // (Hito 6) are memory/historial providers — see
         // App\Training\Memory\{TrainingProfileContextProvider,
         // ActiveWorkoutSessionContextProvider} and docs/DECISIONS.md (D019, D020).
+        // `coach_context` (Bloque 9, D052) vive en App\Training\Context — NO
+        // en App\Training\Memory — porque compone contexto de dominio
+        // estructurado para una interacción puntual con el LLM, nunca
+        // memoria persistida en sí misma. Mismo mecanismo genérico, sin
+        // ningún cambio en ContextBuilder/ContextProviderInterface.
         $this->app->singleton(ContextBuilder::class, fn ($app) => new ContextBuilder($app, [
             'training_profile' => TrainingProfileContextProvider::class,
             'active_workout_session' => ActiveWorkoutSessionContextProvider::class,
+            'coach_context' => CoachContextProvider::class,
         ]));
 
         // Bloque 4 — OnboardingRequirementRegistry: mismo patrón de

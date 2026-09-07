@@ -422,16 +422,27 @@ it('falls back to generating a new session when there is no active session to re
     $contact = readyTrainingContact();
     Exercise::factory()->create(['muscle_group' => 'chest']);
 
-    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200)]);
+    // Bloque 9 (D052): sin sesión pendiente, CoachService es la única
+    // llamada de IA de este camino — antes de este bloque no se hacía
+    // ninguna. "continue_training" dispara determinísticamente la entrega
+    // ya existente, sin importar el resto de la respuesta de la IA.
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'safety_signal_text' => null,
+            'intents' => ['continue_training'],
+            'training_reply' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
 
-    // Sin sesión pendiente y sin señal explícita de reporte, el mensaje debe
-    // traer una palabra clave de training para clasificar como tal — igual
-    // que cualquier usuario pidiendo un entrenamiento por primera vez.
     sendMessageAsContact($contact, 'Dame mi entrenamiento de hoy');
 
     expect(ExerciseLog::count())->toBe(0);
     expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(1);
-    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.openai.com'));
+    // Una sola llamada de IA para todo el turno (D052/D026) — el resto de
+    // peticiones son entrega de WhatsApp (deterministas, sin IA).
+    $openAiCalls = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'));
+    expect($openAiCalls)->toHaveCount(1);
 });
 
 // 20. Bloqueado por acceso.

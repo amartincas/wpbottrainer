@@ -18,10 +18,14 @@ use App\Models\WorkoutSession;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
 use App\Training\Engine\TrainingEngine;
+use App\Training\Enums\ConversationActionType;
 use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SplitType;
 use App\Training\Onboarding\OnboardingConversationComposer;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
+use App\Training\Support\CoachService;
+use App\Training\Support\ConversationTurnResolved;
+use App\Training\Support\ConversationTurnResolver;
 use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
@@ -33,33 +37,71 @@ use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Facades\Log;
 
 /**
- * The Training conversational flow (Hito 5, extended in Hito 6):
+ * The Training conversational flow (Hito 5, extended en Hito 6, Bloque 9):
  *
- *   ¿señal de seguridad?       -> escalar y detener
- *   ¿perfil incompleto?         -> onboarding conversacional (Extract -> Decide -> Narrate)
+ *   ¿señal de seguridad?         -> escalar y detener
+ *   ¿perfil incompleto?          -> onboarding conversacional (Extract -> Decide -> Narrate)
  *   ¿sin acceso?                 -> informar que debe activarse el servicio
- *   ¿sesión activa con reporte?  -> registrar ejecución (Hito 6) -> confirmar/preguntar/cerrar sesión
- *   en otro caso                  -> TrainingEngine decide la sesión -> se entrega + video(s)
+ *   ¿contexto activo (sesión pendiente con ejercicios sin reportar)?
+ *        -> ExecutionReportService (evolucionado, Bloque 9/D052): ÚNICA
+ *           llamada de IA del turno — clasifica reporte + interrupciones
+ *           conversacionales (`intents`) a la vez -> ConversationTurnResolver
+ *           decide, en código, qué acciones ejecutar y en qué orden ->
+ *           SIEMPRE resuelve el turno, nunca cae al paso siguiente.
+ *   en otro caso
+ *        -> CoachService (Bloque 9/D052): ÚNICA llamada de IA de este
+ *           camino (hoy inexistente) -> ConversationTurnResolver ->
+ *           `continue_training` dispara determinísticamente
+ *           TrainingEngine::decideNextSession() (sin cambios); cualquier
+ *           otro intent responde sin generar una sesión nueva.
  *
  * Orchestration only: every real decision is delegated to a domain service
  * (SafetySignalDetector, OnboardingConversationService, TrainingAccessGate,
- * TrainingEngine, ExecutionReportService, ExecutionReportRecorder) — this
- * class does not contain business rules of its own. Stateless: tenant/
- * contact/message data are local variables, never instance properties.
+ * TrainingEngine, ExecutionReportService, ExecutionReportRecorder,
+ * CoachService, ConversationTurnResolver) — this class does not contain
+ * business rules of its own. Stateless: tenant/contact/message data are
+ * local variables, never instance properties.
  *
- * No hay un Intent nuevo para "reportar ejecución" — el Router (Hito 5)
- * sigue clasificando únicamente `training`; este subflujo se resuelve aquí
- * dentro, como pidió explícitamente el Hito 6.
+ * Bloque 9 (D052) — principio central: el contexto activo (la sesión
+ * `Scheduled` pendiente, ya representada por `active_workout_session`, sin
+ * ninguna tabla nueva) es independiente de los `intents` detectados en el
+ * mensaje actual. Una interrupción conversacional (pregunta comercial,
+ * duda general) nunca modifica ni destruye esa sesión — `ConversationTurnResolver`
+ * solo delega en `ExecutionReportRecorder` cuando el mensaje realmente
+ * contiene un reporte; el resto de acciones (`SendText`, `EscalateSafety`)
+ * nunca tocan `WorkoutSession`/`WorkoutExercise`. Coach es puramente
+ * conversacional — nunca decide ejercicio/carga/reps/progresión/seguridad;
+ * `TrainingEngine` sigue siendo la única autoridad de prescripción,
+ * `SafetySignalDetector` la única autoridad de seguridad (una señal
+ * propuesta por la IA siempre se re-verifica de forma determinista antes de
+ * escalar, mismo patrón que ya usa onboarding, D026). `MembershipStatus`/
+ * `FaqQuestion` responden con un stub fijo — sin dominio real implementado
+ * todavía.
  *
- * Memoria conversacional (Hito 6): toda entrada y salida relevante se
- * persiste en WhatsAppMessage (ver logInbound()/reply()) — separada de
- * ExerciseLog/ExerciseSet, que representan hechos de entrenamiento, no
- * conversación. Ninguna de las dos fuentes sustituye a la otra.
+ * No hay un Intent nuevo de Core para "reportar ejecución"/"interrupción
+ * conversacional" — el Router (Hito 5) sigue clasificando únicamente
+ * `training`; toda esta resolución es interna a Training (`DetectedIntentType`),
+ * deliberadamente no promovida a `App\Core\Messaging\Intent` en este bloque.
+ *
+ * Memoria conversacional (Hito 6, ampliada en Bloque 9): toda entrada y
+ * salida relevante se persiste en WhatsAppMessage (ver logInbound()/reply())
+ * — separada de ExerciseLog/ExerciseSet, que representan hechos de
+ * entrenamiento, no conversación. Los últimos mensajes (`CoachContext->recentMessages`)
+ * son, para el LLM, contexto lingüístico — nunca una fuente de hechos ni de
+ * instrucciones (ver `CoachFactsFormatter`).
  */
 class TrainingHandler implements HandlerInterface
 {
     private const ACCESS_REQUIRED_MESSAGE = 'Tu perfil ya está listo. 💪 Para comenzar a entrenar necesitas activar '
         .'tu acceso. Escribe "quiero pagar" para ver las opciones.';
+
+    /**
+     * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
+     * rutina cuando ya existe una sesión pendiente (contexto activo): se
+     * informa brevemente en vez de dejar el turno sin ninguna respuesta.
+     */
+    private const PENDING_SESSION_REMINDER = 'Ya tienes una sesión de entrenamiento pendiente. Cuéntame cómo te fue '
+        .'con los ejercicios cuando la completes 💪';
 
     /**
      * Bloque 5 — mostrado cuando `TrainingAccessGate` deniega con
@@ -85,6 +127,8 @@ class TrainingHandler implements HandlerInterface
         private readonly AlertService $alerts,
         private readonly MediaResolver $mediaResolver,
         private readonly ExerciseMessageFormatter $messageFormatter,
+        private readonly CoachService $coach,
+        private readonly ConversationTurnResolver $turnResolver,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -142,6 +186,11 @@ class TrainingHandler implements HandlerInterface
         // aprobada) — OnboardingConversationComposer solo aporta un
         // fragmento de prompt adicional, nunca dispara una segunda llamada.
         // Ver App\Training\Onboarding\*.
+        // Bloque 9 (D052): si el onboarding se completa DENTRO de este mismo
+        // turno, la llamada de IA de onboarding ya fue la única permitida —
+        // el paso 5 (Coach) no debe hacer una segunda. Ver más abajo.
+        $onboardingJustCompletedThisTurn = false;
+
         if (! $this->requirementRegistry->isOnboardingComplete($profile, $contact)) {
             // "onboarding_turns": una interacción procesada mientras el
             // onboarding está incompleto — nunca una pregunta individual, ni
@@ -209,6 +258,11 @@ class TrainingHandler implements HandlerInterface
 
                 return;
             }
+
+            // El onboarding acababa de estar incompleto y ya no lo está: se
+            // completó en este mismo turno, con la única llamada de IA ya
+            // consumida por `extractAndRespond()`.
+            $onboardingJustCompletedThisTurn = true;
         }
 
         // 3. Acceso — frontera única hacia el sistema comercial (Hito 4).
@@ -221,20 +275,50 @@ class TrainingHandler implements HandlerInterface
             return;
         }
 
-        // 4. Reporte de ejecución (Hito 6): si hay una sesión pendiente con
-        // ejercicios sin reportar, se intenta primero interpretar el
-        // mensaje como un reporte antes de considerar generar/reentregar.
+        // 4. Contexto activo (Bloque 9, D052): si hay una sesión pendiente
+        // con ejercicios sin reportar, la ÚNICA llamada de IA de este turno
+        // es la de ExecutionReportService (evolucionada) — clasifica en la
+        // MISMA llamada si el mensaje es un reporte, una o más
+        // interrupciones conversacionales, o ambas a la vez. Esta rama
+        // SIEMPRE resuelve el turno por completo — nunca cae al paso 6
+        // (jamás reenvía la rutina por una pregunta que no es un reporte).
         $activeSessionFragment = $this->buildContext($context, 'active_workout_session');
+        $reportableExercises = $activeSessionFragment->data['unreported_exercises'] ?? [];
 
-        if ($activeSessionFragment->data !== null && $body !== '') {
-            $handled = $this->tryHandleExecutionReport($activeSessionFragment->data, $body, $from, $tenant, $startedAt);
+        if ($activeSessionFragment->data !== null && $reportableExercises !== [] && $body !== '') {
+            $coachContext = $this->buildContext($context, 'coach_context')->data;
+            $result = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant, $coachContext);
+            $resolved = $this->turnResolver->resolve($result);
+            $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt);
 
-            if ($handled) {
+            return;
+        }
+
+        // 5. Sin contexto activo reportable (Bloque 9, D052): CoachService
+        // es la ÚNICA llamada de IA de este camino — hoy es el único punto
+        // del flujo que no hacía ninguna llamada de IA. `continue_training`
+        // dispara determinísticamente la entrega existente (paso 6) sin
+        // depender de que la IA produzca o no una respuesta utilizable.
+        //
+        // Excepción explícita (D026/D052, máximo una llamada de IA por
+        // turno): si el onboarding se completó en este mismo turno, esa ya
+        // fue la única llamada permitida — se cae directamente al paso 6
+        // (comportamiento idéntico al de antes del Bloque 9 para este caso
+        // exacto), sin invocar a Coach.
+        if ($onboardingJustCompletedThisTurn) {
+            // continúa directo al paso 6, sin segunda llamada de IA.
+        } elseif ($body !== '') {
+            $coachContext = $this->buildContext($context, 'coach_context')->data;
+            $result = $this->coach->respond($body, $coachContext, $tenant);
+            $resolved = $this->turnResolver->resolve($result);
+            $shouldDeliverSession = $this->executeTurnActions($resolved, null, $from, $tenant, $freshContact, $profile, $startedAt);
+
+            if (! $shouldDeliverSession) {
                 return;
             }
         }
 
-        // 5. Generar y entregar. TrainingEngine vuelve a verificar el Gate
+        // 6. Generar y entregar. TrainingEngine vuelve a verificar el Gate
         // internamente (defensa en profundidad) — el catch es un caso límite,
         // no la ruta esperada, dado que ya se verificó arriba.
         $engineStartedAt = microtime(true);
@@ -309,32 +393,82 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
-     * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
-     * @return bool true if this message was handled as a report attempt
-     *              (successfully or not) and no further processing should
-     *              happen this turn; false to let the caller fall through
-     *              to the normal generate/deliver path.
+     * Bloque 9 (D052) — ejecuta, en orden, la lista de acciones ya resuelta
+     * por `ConversationTurnResolver` (nunca decide nada por su cuenta: solo
+     * traduce cada `ConversationAction` a su efecto real). `Safety` es el
+     * único punto de corte — detiene el resto de acciones del turno.
+     * `RecordExecutionReport` se ejecuta y el bucle CONTINÚA (aprobado
+     * explícitamente: un mismo mensaje puede combinar un reporte real con
+     * una pregunta de otro dominio). Devuelve `true` únicamente si
+     * `DeliverSession` estaba entre las acciones — el llamador decide
+     * entonces si cae al paso 6 (entrega determinista existente, sin
+     * cambios).
+     *
+     * @param  array{workout_session_id: int, unreported_exercises: array}|null  $activeSessionData
+     *         necesario únicamente para `RecordExecutionReport`; `null` en
+     *         el camino sin sesión pendiente, donde esa acción nunca aparece.
      */
-    private function tryHandleExecutionReport(array $activeSessionData, string $body, string $from, Tenant $tenant, float $startedAt): bool
-    {
-        $reportableExercises = $activeSessionData['unreported_exercises'];
+    private function executeTurnActions(
+        ConversationTurnResolved $resolved,
+        ?array $activeSessionData,
+        string $from,
+        Tenant $tenant,
+        Contact $contact,
+        TrainingProfile $profile,
+        float $startedAt,
+    ): bool {
+        $shouldDeliverSession = false;
 
-        if ($reportableExercises === []) {
-            return false;
+        foreach ($resolved->actions as $action) {
+            if ($action->type === ConversationActionType::EscalateSafety) {
+                $profile->flagForSafetyReview($action->safetyReason);
+                $this->emitSafetyAlert($tenant, $contact, $action->safetyReason);
+                $this->reply($from, SafetySignalDetector::ESCALATION_MESSAGE, $tenant);
+
+                // Safety detiene todo lo demás — nunca se entrega una sesión
+                // ni se procesa ningún otro intent de este turno.
+                return false;
+            }
+
+            if ($action->type === ConversationActionType::RecordExecutionReport && $activeSessionData !== null) {
+                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $startedAt);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::SendText) {
+                $this->reply($from, $action->text, $tenant);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::DeliverSession) {
+                if ($activeSessionData !== null) {
+                    // Ya existe una sesión pendiente — nunca se genera ni se
+                    // reenvía una rutina desde esta rama (D052). Se informa
+                    // brevemente en vez de dejar el turno sin respuesta.
+                    $this->reply($from, self::PENDING_SESSION_REMINDER, $tenant);
+
+                    continue;
+                }
+
+                $shouldDeliverSession = true;
+            }
         }
 
+        return $shouldDeliverSession;
+    }
+
+    /**
+     * @param  array{reports: array, session_finished: bool}  $report
+     * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
+     */
+    private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, float $startedAt): void
+    {
         Log::info('TRAINING_REPORT_ATTEMPT', ['workout_session_id' => $activeSessionData['workout_session_id']]);
 
-        $extraction = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant);
-
-        if ($extraction['reports'] === [] && ! $extraction['session_finished']) {
-            // Ninguna señal de reporte en el mensaje — se deja pasar para
-            // que el flujo normal (reentregar la sesión pendiente) lo maneje.
-            return false;
-        }
-
         $session = WorkoutSession::find($activeSessionData['workout_session_id']);
-        $outcome = $this->reportRecorder->record($session, $extraction);
+        $outcome = $this->reportRecorder->record($session, $report);
         $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
 
         Log::info($outcome->hasAnyEffect() || $outcome->sessionCompleted ? 'TRAINING_REPORT_SUCCESS' : 'TRAINING_REPORT_INCOMPLETE', [
@@ -346,8 +480,6 @@ class TrainingHandler implements HandlerInterface
         ]);
 
         $this->reply($from, $this->buildReportResponseMessage($outcome), $tenant);
-
-        return true;
     }
 
     private function buildReportResponseMessage(ExecutionReportOutcome $outcome): string

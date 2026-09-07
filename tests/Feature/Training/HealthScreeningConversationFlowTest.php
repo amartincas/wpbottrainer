@@ -77,7 +77,20 @@ it('19: once resolved without a restriction, the first routine generates exactly
     DeclaredHealthCondition::factory()->resolvedNoRestriction()->create(['contact_id' => $contact->id]);
     Exercise::factory()->create(['muscle_group' => 'chest']);
 
-    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200)]);
+    // Bloque 9 (D052): sin sesión pendiente, CoachService clasifica el
+    // primer mensaje — "continue_training" entrega determinísticamente. El
+    // segundo mensaje ya encuentra una sesión Scheduled pendiente, así que
+    // pasa por la rama evolucionada de ExecutionReportService — esa rama
+    // nunca genera una sesión nueva por diseño (D052), sin importar la
+    // clasificación, así que la misma respuesta sirve para ambas llamadas.
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null,
+            'intents' => ['continue_training'],
+            'training_reply' => null,
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
 
     sendTrainingMessage($tenant, '573001112233', 'Dame mi entrenamiento');
     expect(WorkoutSession::count())->toBe(1);

@@ -49,10 +49,21 @@ it('continues into Training after a payment is confirmed and the user replies af
     $exercise = Exercise::factory()->create(['muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4']);
 
     Http::fake([
-        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
-            'amount' => 50000, 'date' => '2026-08-20', 'time' => null,
-            'reference' => '123456789', 'entity' => 'Nequi', 'payer_name' => null, 'uncertain' => false,
-        ])]]]], 200),
+        // Bloque 9 (D052): la primera llamada a openai es la extracción del
+        // comprobante de pago (sin cambios); la segunda es CoachService,
+        // clasificando "Sí" como continue_training para que el flujo llegue
+        // determinísticamente a TrainingEngine::decideNextSession() — antes
+        // del Bloque 9 este camino no hacía ninguna llamada de IA.
+        'api.openai.com/v1/chat/completions' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'amount' => 50000, 'date' => '2026-08-20', 'time' => null,
+                'reference' => '123456789', 'entity' => 'Nequi', 'payer_name' => null, 'uncertain' => false,
+            ])]]]], 200)
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'safety_signal_text' => null,
+                'intents' => ['continue_training'],
+                'training_reply' => null,
+            ])]]]], 200),
         'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
     ]);
 

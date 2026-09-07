@@ -254,7 +254,20 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
     $legs = Exercise::factory()->create(['muscle_group' => 'legs', 'name' => 'Sentadilla', 'video_url' => 'https://videos.example.test/squat.mp4']);
     $back = Exercise::factory()->create(['muscle_group' => 'back', 'name' => 'Remo', 'video_url' => 'https://videos.example.test/row.mp4']);
 
-    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200)]);
+    // Bloque 9 (D052): perfil ya completo y sin sesión pendiente ->
+    // CoachService es la única llamada de IA de este turno (antes del
+    // Bloque 9, este camino no hacía ninguna). "continue_training" entrega
+    // determinísticamente la sesión ya existente, sin cambios en esa parte.
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response([
+            'choices' => [['message' => ['content' => json_encode([
+                'safety_signal_text' => null,
+                'intents' => ['continue_training'],
+                'training_reply' => null,
+            ])]]],
+        ], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
 
     sendTrainingMessage($tenant, '573001112233', 'Quiero mi entrenamiento de hoy');
 
@@ -277,8 +290,9 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
             && data_get($request->data(), 'video.link') === $exercise->video_url);
     }
 
-    // Perfil ya completo: cero llamadas al proveedor de IA.
-    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.openai.com'));
+    // Exactamente 1 llamada de IA en todo el turno (D026/D052).
+    $openAiCalls = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'));
+    expect($openAiCalls)->toHaveCount(1);
 });
 
 it('blocks generation and escalates immediately when the message contains a safety signal', function () {

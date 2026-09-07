@@ -130,7 +130,10 @@ it('returns no reports for an empty message without calling the AI provider', fu
 
     $result = (new ExecutionReportService)->extractReport('', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['reports' => [], 'session_finished' => false]);
+    // Bloque 9 (D052): EMPTY_RESULT ahora incluye, de forma aditiva,
+    // safety_signal_text/intents/training_reply — mismo comportamiento de
+    // fondo (sin llamar a la IA), contrato ampliado.
+    expect($result)->toBe(['reports' => [], 'session_finished' => false, 'safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
     Http::assertNothingSent();
 });
 
@@ -139,7 +142,7 @@ it('returns no reports when there is nothing reportable, without calling the AI 
 
     $result = (new ExecutionReportService)->extractReport('hice sentadilla', [], Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['reports' => [], 'session_finished' => false]);
+    expect($result)->toBe(['reports' => [], 'session_finished' => false, 'safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
     Http::assertNothingSent();
 });
 
@@ -148,7 +151,7 @@ it('degrades to no reports when the AI provider fails, without throwing', functi
 
     $result = (new ExecutionReportService)->extractReport('hice sentadilla 10x40', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['reports' => [], 'session_finished' => false]);
+    expect($result)->toBe(['reports' => [], 'session_finished' => false, 'safety_signal_text' => null, 'intents' => [], 'training_reply' => null]);
 });
 
 // ── Hito 8.3: skip_reason + regla de "confirmación sin detalle" ────────
