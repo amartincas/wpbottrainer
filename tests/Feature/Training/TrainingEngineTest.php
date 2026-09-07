@@ -17,9 +17,11 @@ use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingHistoryContextProvider;
 use Illuminate\Support\Facades\Log;
 
 function makeReadyContact(array $profileOverrides = []): Contact
@@ -38,7 +40,14 @@ function makeReadyContact(array $profileOverrides = []): Contact
 
 function trainingEngine(): TrainingEngine
 {
-    return new TrainingEngine(new TrainingAccessGate, new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
+    $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
+
+    return new TrainingEngine(
+        new TrainingAccessGate,
+        $safetyResolver,
+        new TrainingHistoryContextProvider($safetyResolver),
+        new ProgressionEvaluator,
+    );
 }
 
 it('blocks generation with no_access when there is no TrainingAccess', function () {
@@ -147,16 +156,40 @@ it('increases load for the next session when the last reported RPE was manageabl
     $contact = makeReadyContact();
     $exercise = Exercise::factory()->create(['muscle_group' => 'chest']);
 
-    $pastSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
+    // Bloque 8 (D050/D051): ProgressionEvaluator exige al menos 2
+    // ejecuciones `Performed` como evidencia mínima antes de poder devolver
+    // `progress` — una sola ejecución nunca es suficiente (ver D050, gate
+    // de evidencia). Se agrega una ejecución anterior legítima para
+    // conservar la intención original del test (RPE manejable + carga en
+    // aumento -> progresa), no para forzar el resultado.
+    // prescribed_sets = 1 (no 3): cada ejecución solo registra 1 set real —
+    // D050 exige que los sets EJECUTADOS cubran los prescritos para poder
+    // considerar "cumplidas" las reps (fewer_sets_than_prescribed); con
+    // prescribed_sets=3 y un único set real, la evidencia habría sido
+    // insuficiente para progresar por una razón distinta a la que este
+    // test verifica (RPE + carga), así que se alinean para no interferir.
+    $olderSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDays(2)]);
+    $olderWorkoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $olderSession->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_sets' => 1,
+        'prescribed_reps' => 10,
+        'prescribed_load' => 38,
+    ]);
+    $olderLog = ExerciseLog::factory()->create(['workout_exercise_id' => $olderWorkoutExercise->id, 'rpe' => 6, 'logged_at' => now()->subDays(2)]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $olderLog->id, 'actual_reps' => 10, 'actual_load' => 38]);
+
+    $pastSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDay()]);
     $pastWorkoutExercise = WorkoutExercise::factory()->create([
         'workout_session_id' => $pastSession->id,
         'exercise_id' => $exercise->id,
         'exercise_snapshot' => $exercise->toSnapshot(),
-        'prescribed_sets' => 3,
+        'prescribed_sets' => 1,
         'prescribed_reps' => 10,
         'prescribed_load' => 40,
     ]);
-    $log = ExerciseLog::factory()->create(['workout_exercise_id' => $pastWorkoutExercise->id, 'rpe' => 6]);
+    $log = ExerciseLog::factory()->create(['workout_exercise_id' => $pastWorkoutExercise->id, 'rpe' => 6, 'logged_at' => now()->subDay()]);
     ExerciseSet::factory()->create(['exercise_log_id' => $log->id, 'actual_reps' => 10, 'actual_load' => 42]);
 
     $session = trainingEngine()->decideNextSession($contact);
@@ -189,7 +222,28 @@ it('progresses duration instead of load/reps for time-based exercises', function
     $contact = makeReadyContact();
     $exercise = Exercise::factory()->timeBased()->create(['muscle_group' => 'core']);
 
-    $pastSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
+    // Bloque 8 (D050/D051): mismo motivo que el test de carga — se agrega
+    // una ejecución anterior legítima para satisfacer el nuevo gate de
+    // evidencia mínima (>=2 ejecuciones) sin alterar la intención original
+    // del test (RPE manejable + duración en aumento -> progresa).
+    $olderSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDays(2)]);
+    $olderWorkoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $olderSession->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_duration_seconds' => 25,
+        'prescribed_reps' => null,
+        'prescribed_load' => null,
+    ]);
+    $olderLog = ExerciseLog::factory()->create(['workout_exercise_id' => $olderWorkoutExercise->id, 'rpe' => 5, 'logged_at' => now()->subDays(2)]);
+    ExerciseSet::factory()->create([
+        'exercise_log_id' => $olderLog->id,
+        'actual_reps' => null,
+        'actual_load' => null,
+        'actual_duration_seconds' => 25,
+    ]);
+
+    $pastSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDay()]);
     $pastWorkoutExercise = WorkoutExercise::factory()->create([
         'workout_session_id' => $pastSession->id,
         'exercise_id' => $exercise->id,
@@ -198,7 +252,7 @@ it('progresses duration instead of load/reps for time-based exercises', function
         'prescribed_reps' => null,
         'prescribed_load' => null,
     ]);
-    $log = ExerciseLog::factory()->create(['workout_exercise_id' => $pastWorkoutExercise->id, 'rpe' => 5]);
+    $log = ExerciseLog::factory()->create(['workout_exercise_id' => $pastWorkoutExercise->id, 'rpe' => 5, 'logged_at' => now()->subDay()]);
     ExerciseSet::factory()->create([
         'exercise_log_id' => $log->id,
         'actual_reps' => null,

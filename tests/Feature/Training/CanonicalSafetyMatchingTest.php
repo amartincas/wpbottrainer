@@ -9,8 +9,10 @@ use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\BodyRegion;
 use App\Training\Enums\SplitType;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingHistoryContextProvider;
 
 /**
  * Hito de seguridad de restricciones — prueba explícita de la simetría de
@@ -21,7 +23,14 @@ use App\Training\Support\TrainingAccessGate;
  */
 function canonicalTestEngine(): TrainingEngine
 {
-    return new TrainingEngine(new TrainingAccessGate, new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
+    $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
+
+    return new TrainingEngine(
+        new TrainingAccessGate,
+        $safetyResolver,
+        new TrainingHistoryContextProvider($safetyResolver),
+        new ProgressionEvaluator,
+    );
 }
 
 function readyContactWithRestrictions(array $restrictions): Contact

@@ -15,8 +15,10 @@ use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingHistoryContextProvider;
 
 // Nombres deliberadamente distintos a los helpers de TrainingEngineTest.php
 // (makeReadyContact/trainingEngine) para evitar colisión de funciones
@@ -38,7 +40,14 @@ function readyContactForSnapshot(array $profileOverrides = []): Contact
 
 function snapshotEngine(): TrainingEngine
 {
-    return new TrainingEngine(new TrainingAccessGate, new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
+    $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
+
+    return new TrainingEngine(
+        new TrainingAccessGate,
+        $safetyResolver,
+        new TrainingHistoryContextProvider($safetyResolver),
+        new ProgressionEvaluator,
+    );
 }
 
 // ── A: una nueva WorkoutSession obtiene exactamente un snapshot ──

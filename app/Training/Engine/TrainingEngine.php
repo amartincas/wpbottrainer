@@ -7,13 +7,21 @@ use App\Models\Exercise;
 use App\Models\TrainingProfile;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
+use App\Training\Enums\HistoryExerciseOutcome;
+use App\Training\Enums\ProgressionDecision;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\HistoryExerciseEntry;
+use App\Training\Support\HistorySetEntry;
+use App\Training\Support\ProgressionEvaluation;
+use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingHistoryContext;
+use App\Training\Support\TrainingHistoryContextProvider;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -40,8 +48,6 @@ class TrainingEngine
 
     private const RECENT_SESSIONS_LOOKBACK = 5;
 
-    private const PROGRESSION_RPE_THRESHOLD = 7;
-
     /**
      * Hito 8.4: cuántas de las sesiones más recientes cuentan para penalizar
      * (nunca excluir) un ejercicio por repetido — ver sortCandidates(). Un
@@ -63,8 +69,8 @@ class TrainingEngine
      * HEURÍSTICAS INICIALES DE PRODUCTO, revisables en cualquier momento sin
      * migración — NUNCA una prescripción científica universal ni una tabla
      * validada clínicamente. En cuanto existe una ejecución real, la
-     * progresión por RPE (ver progressionFor()) gobierna sets/reps/carga/
-     * duración para ESE ejercicio y contacto — estos valores dejan de
+     * progresión (Bloque 8, ver numericPrescriptionFor()) gobierna sets/reps/
+     * carga/duración para ESE ejercicio y contacto — estos valores dejan de
      * aplicar. `rest_seconds` no tiene mecanismo de progresión por historial
      * (nunca lo tuvo, ver Hito 4-8.3): siempre se deriva del objetivo
      * vigente, con o sin historial.
@@ -108,6 +114,8 @@ class TrainingEngine
     public function __construct(
         private readonly TrainingAccessGate $accessGate,
         private readonly SafetyRestrictionResolver $safetyResolver,
+        private readonly TrainingHistoryContextProvider $historyProvider,
+        private readonly ProgressionEvaluator $progressionEvaluator,
     ) {}
 
     /**
@@ -152,6 +160,12 @@ class TrainingEngine
 
         $exercises = $this->selectExercises($profile, $focus, $recentSessions, $contact);
 
+        // Bloque 8 (D051): el contexto histórico se construye UNA sola vez
+        // por generación, después de que la selección de ejercicios ya está
+        // cerrada — nunca para el pool completo de candidatos, solo para los
+        // pocos ya seleccionados que se prescribirán a continuación.
+        $historyContext = $this->historyProvider->build($contact);
+
         // Bloque 3 — Fundación Temporal (ver docs/DECISIONS.md D046):
         // capturado UNA sola vez. Conceptualmente es `prescribed_at` — el
         // instante en que TrainingEngine tomó la decisión de prescribir —
@@ -182,7 +196,7 @@ class TrainingEngine
         ]);
 
         foreach ($exercises as $index => $exercise) {
-            $this->prescribeExercise($session, $exercise, $index + 1, $contact, $profile);
+            $this->prescribeExercise($session, $exercise, $index + 1, $historyContext, $profile);
         }
 
         $profile->update(['next_focus' => $this->nextInRotation($focus, $profile->split_type)]);
@@ -493,9 +507,14 @@ class TrainingEngine
         return array_diff($equipmentNeeded, $available) === [];
     }
 
-    private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, Contact $contact, TrainingProfile $profile): WorkoutExercise
+    private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, TrainingHistoryContext $historyContext, TrainingProfile $profile): WorkoutExercise
     {
-        $progression = $this->progressionFor($exercise, $contact, $profile);
+        // Bloque 8 (D051): ProgressionEvaluator es la única autoridad sobre
+        // la DIRECCIÓN de progresión (progress/maintain/reduce/
+        // insufficient_data); TrainingEngine sigue siendo la única
+        // autoridad sobre la PRESCRIPCIÓN numérica concreta.
+        $evaluation = $this->progressionEvaluator->evaluate($historyContext, $exercise->id, $exercise->tracking_type);
+        $progression = $this->numericPrescriptionFor($exercise, $evaluation, $historyContext, $profile);
 
         return WorkoutExercise::create([
             'workout_session_id' => $session->id,
@@ -511,47 +530,67 @@ class TrainingEngine
     }
 
     /**
-     * Regla de progresión mínima: si la última ejecución reportada de este
-     * ejercicio tuvo un RPE bajo (esfuerzo percibido manejable) y se
-     * completó, se sube ligeramente la carga/duración. Si no hay ejecución
-     * previa, se usan los valores de arranque del objetivo vigente
-     * (GOAL_DEFAULTS, Hito 8.4 — antes de esto eran constantes fijas sin
-     * relación con el objetivo). Nunca se recalculan WorkoutExercise ya
-     * creados — esto solo afecta a la sesión nueva.
+     * Bloque 8 (D051) — traduce una `ProgressionEvaluation` (dirección,
+     * decidida por `ProgressionEvaluator`) en una prescripción numérica
+     * concreta. Ningún dato nuevo se consulta a la base de datos: toda la
+     * evidencia histórica ya viene en `$historyContext` (construido UNA
+     * vez por generación) y en `$evaluation` (evaluada sin SQL propio).
      *
-     * `rest_seconds` nunca tuvo progresión por historial (ver GOAL_DEFAULTS)
-     * — siempre refleja el objetivo vigente, exista o no ejecución previa.
+     * - `insufficient_data`: prescripción inicial de `GOAL_DEFAULTS`,
+     *   idéntica al comportamiento histórico de "sin ejecución previa" —
+     *   nunca se inventa una progresión sobre evidencia insuficiente.
+     * - `maintain`: conserva el carry-forward existente — intensidad REAL
+     *   de la ejecución más reciente (`evaluation->metrics->lastIntensity`),
+     *   con fallback a la prescripción histórica de esa misma ejecución
+     *   (Bloque 7, `prescribedLoad`/`prescribedReps`/`prescribedSets`) y
+     *   finalmente a `GOAL_DEFAULTS`.
+     * - `progress`: mismos incrementos existentes (`+2.5` carga, `+10s`
+     *   duración) — lo nuevo es que la DECISIÓN de progresar ya no la toma
+     *   este método, la toma `ProgressionEvaluator` con más evidencia.
+     * - `reduce`: **sin política numérica propia en v1** (ver D051) — se
+     *   traduce exactamente igual que `maintain`, nunca se inventa una
+     *   magnitud de reducción. Los `reasonCodes`/métricas de `reduce`
+     *   siguen disponibles en `$evaluation` para un futuro Coach o una
+     *   futura política numérica, aunque este método no los traduzca a un
+     *   número distinto todavía.
+     *
+     * `rest_seconds` y `sets` nunca tuvieron progresión por historial —
+     * sin cambios respecto al comportamiento anterior.
      *
      * @return array{sets: ?int, reps: ?int, load: ?float, duration_seconds: ?int, rest_seconds: int}
      */
-    private function progressionFor(Exercise $exercise, Contact $contact, TrainingProfile $profile): array
-    {
+    private function numericPrescriptionFor(
+        Exercise $exercise,
+        ProgressionEvaluation $evaluation,
+        TrainingHistoryContext $historyContext,
+        TrainingProfile $profile,
+    ): array {
         $isTimeBased = $exercise->tracking_type === TrackingType::TimeBased;
         $goalDefaults = self::GOAL_DEFAULTS[$profile->goal?->value] ?? self::GOAL_DEFAULTS['general_fitness'];
 
-        $lastExecution = WorkoutExercise::query()
-            ->where('exercise_id', $exercise->id)
-            ->whereHas('workoutSession', fn ($query) => $query->where('contact_id', $contact->id))
-            ->whereHas('exerciseLog')
-            ->with('exerciseLog.exerciseSets')
-            ->latest('id')
-            ->first();
-
-        if ($lastExecution === null || $lastExecution->exerciseLog === null) {
+        if ($evaluation->decision === ProgressionDecision::InsufficientData) {
             return $isTimeBased
                 ? ['sets' => $goalDefaults['sets'], 'reps' => null, 'load' => null, 'duration_seconds' => $goalDefaults['duration_seconds'], 'rest_seconds' => $goalDefaults['rest_seconds']]
                 : ['sets' => $goalDefaults['sets'], 'reps' => $goalDefaults['reps'], 'load' => null, 'duration_seconds' => null, 'rest_seconds' => $goalDefaults['rest_seconds']];
         }
 
-        $log = $lastExecution->exerciseLog;
-        $topSet = $log->exerciseSets->sortByDesc('actual_load')->first() ?? $log->exerciseSets->first();
-        $shouldProgress = $log->rpe !== null && $log->rpe <= self::PROGRESSION_RPE_THRESHOLD;
+        $mostRecent = $this->mostRecentEntryFor($historyContext, $exercise->id);
+        $sets = $mostRecent?->prescribedSets ?? $goalDefaults['sets'];
+
+        // `reduce` no tiene política numérica propia en v1 (D051): se
+        // traduce igual que `maintain` — nunca se inventa una magnitud de
+        // reducción. Solo `progress` incrementa.
+        $shouldProgress = $evaluation->decision === ProgressionDecision::Progress;
 
         if ($isTimeBased) {
-            $lastDuration = $topSet?->actual_duration_seconds ?? $lastExecution->prescribed_duration_seconds ?? $goalDefaults['duration_seconds'];
+            // Bloque 8: corrección aprobada — `lastIntensity` ya representa
+            // el MÁXIMO `actual_duration_seconds` entre los sets de la
+            // ejecución más reciente (D050), nunca el primer set por
+            // accidente de un `sortByDesc('actual_load')` degenerado.
+            $lastDuration = $evaluation->metrics->lastIntensity ?? $goalDefaults['duration_seconds'];
 
             return [
-                'sets' => $lastExecution->prescribed_sets ?? $goalDefaults['sets'],
+                'sets' => $sets,
                 'reps' => null,
                 'load' => null,
                 'duration_seconds' => $shouldProgress ? $lastDuration + 10 : $lastDuration,
@@ -559,15 +598,66 @@ class TrainingEngine
             ];
         }
 
-        $lastLoad = $topSet?->actual_load ?? $lastExecution->prescribed_load;
-        $lastReps = $topSet?->actual_reps ?? $lastExecution->prescribed_reps ?? $goalDefaults['reps'];
+        $topSet = $this->topSetByLoad($mostRecent);
+
+        $lastLoad = $evaluation->metrics->lastIntensity ?? $mostRecent?->prescribedLoad;
+        $lastReps = $topSet?->reps ?? $mostRecent?->prescribedReps ?? $goalDefaults['reps'];
 
         return [
-            'sets' => $lastExecution->prescribed_sets ?? $goalDefaults['sets'],
+            'sets' => $sets,
             'reps' => $lastReps,
-            'load' => $lastLoad !== null && $shouldProgress ? ((float) $lastLoad + 2.5) : ($lastLoad !== null ? (float) $lastLoad : null),
+            'load' => $lastLoad !== null && $shouldProgress ? ($lastLoad + 2.5) : $lastLoad,
             'duration_seconds' => null,
             'rest_seconds' => $goalDefaults['rest_seconds'],
         ];
+    }
+
+    /**
+     * Bloque 8 (D051) — recupera del `TrainingHistoryContext` YA
+     * CONSTRUIDO (sin ninguna consulta nueva) la MISMA ejecución E que
+     * `ProgressionEvaluator` usa conceptualmente para decidir la dirección
+     * (D050: "la ejecución `Performed` cronológicamente más reciente del
+     * ejercicio") — nunca una entrada `Skipped` ni `Unreported`, aunque sea
+     * más reciente. Un `Skipped` reciente puede seguir apareciendo como
+     * dato informativo (`reasonCode = most_recent_execution_skipped` en la
+     * evaluación), pero nunca como fuente de reps/carga/duración/
+     * prescripción histórica para el carry-forward numérico — hacerlo
+     * mezclaría dos fuentes distintas de "E" entre el evaluador y el
+     * motor. Si no existe ninguna ejecución `Performed`, devuelve `null` —
+     * `numericPrescriptionFor()` nunca llega a usar este resultado en ese
+     * caso porque `$evaluation->decision` ya es `insufficient_data`.
+     * Es un simple recorrido de lectura, nunca una segunda autoridad de
+     * dirección: `ProgressionEvaluator` sigue siendo quien decide
+     * progress/maintain/reduce/insufficient_data; este helper solo
+     * recupera los datos crudos necesarios para traducir esa decisión a
+     * números.
+     */
+    private function mostRecentEntryFor(TrainingHistoryContext $historyContext, int $exerciseId): ?HistoryExerciseEntry
+    {
+        foreach ($historyContext->sessions as $session) {
+            foreach ($session->exercises as $exerciseEntry) {
+                if ($exerciseEntry->exerciseId === $exerciseId
+                    && $exerciseEntry->outcome === HistoryExerciseOutcome::Performed) {
+                    return $exerciseEntry;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Mismo criterio que el código anterior usaba (`sortByDesc('actual_load')
+     * ->first() ?? first()`), replicado sobre `HistorySetEntry` en vez de
+     * `ExerciseSet` — el set de mayor carga entre los de esta ejecución, o
+     * el primero si ninguno tiene carga.
+     */
+    private function topSetByLoad(?HistoryExerciseEntry $entry): ?HistorySetEntry
+    {
+        if ($entry === null || $entry->sets === []) {
+            return null;
+        }
+
+        return collect($entry->sets)->sortByDesc('load')->first();
     }
 }
