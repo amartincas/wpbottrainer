@@ -3,6 +3,7 @@
 namespace App\Training\Context;
 
 use App\Training\Enums\HistoryExerciseOutcome;
+use App\Training\Enums\TrackingType;
 use App\Training\Support\HistorySetEntry;
 
 /**
@@ -29,6 +30,7 @@ final readonly class CoachExerciseSnapshot
         public ?int $prescribedReps,
         public ?float $prescribedLoad,
         public ?int $prescribedDurationSeconds,
+        public TrackingType $trackingType,
         public HistoryExerciseOutcome $outcome,
         public array $actualSets,
         public ?int $rpe,

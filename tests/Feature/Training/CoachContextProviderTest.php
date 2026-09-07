@@ -13,6 +13,7 @@ use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Training\Context\CoachContextProvider;
 use App\Training\Enums\HistoryExerciseOutcome;
+use App\Training\Enums\TrackingType;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\ProgressionEvaluator;
@@ -117,6 +118,41 @@ it('computes ProgressionEvaluation for each exercise of the current session, key
 
     expect($context->progressionEvaluations)->toHaveKey($exercise->id);
     expect($context->progressionEvaluations[$exercise->id]->exerciseId)->toBe($exercise->id);
+});
+
+it('trackingType comes from Exercise::tracking_type, never inferred from prescribedDurationSeconds (correction after Bloque 9 review)', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000009']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+
+    // Ejercicio TimeBased en el catálogo, pero SIN prescribed_duration_seconds
+    // en este WorkoutExercise (prescripción incompleta) — el heurístico
+    // anterior habría inferido erróneamente RepsAndLoad a partir de este
+    // dato faltante; la fuente de verdad real (Exercise::tracking_type)
+    // sigue siendo TimeBased sin importar el estado de la prescripción.
+    $timeBasedExercise = Exercise::factory()->timeBased()->create(['name' => 'Plancha']);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $timeBasedExercise->id, 'exercise_snapshot' => $timeBasedExercise->toSnapshot(),
+        'order' => 1, 'prescribed_reps' => 10, 'prescribed_load' => 20, 'prescribed_duration_seconds' => null,
+    ]);
+
+    // Ejercicio RepsAndLoad, pero CON prescribed_duration_seconds poblado
+    // (dato inconsistente/legacy) — el heurístico anterior habría inferido
+    // erróneamente TimeBased a partir de la sola presencia de ese dato.
+    $repsAndLoadExercise = Exercise::factory()->create(['name' => 'Curl de bíceps']);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $repsAndLoadExercise->id, 'exercise_snapshot' => $repsAndLoadExercise->toSnapshot(),
+        'order' => 2, 'prescribed_duration_seconds' => 30,
+    ]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000009'))->data;
+
+    $byExerciseId = collect($context->currentSession->exercises)->keyBy('exerciseId');
+
+    expect($byExerciseId[$timeBasedExercise->id]->trackingType)->toBe(TrackingType::TimeBased);
+    expect($byExerciseId[$repsAndLoadExercise->id]->trackingType)->toBe(TrackingType::RepsAndLoad);
 });
 
 it('a deleted exercise (exercise_id null) in the current session is excluded from progressionEvaluations but still appears in exercises', function () {

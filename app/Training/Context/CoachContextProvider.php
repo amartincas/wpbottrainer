@@ -89,13 +89,13 @@ class CoachContextProvider implements ContextProviderInterface
     {
         $session = $contact->workoutSessions()
             ->where('status', WorkoutSessionStatus::Scheduled)
-            ->with('workoutExercises.exerciseLog.exerciseSets')
+            ->with(['workoutExercises.exercise', 'workoutExercises.exerciseLog.exerciseSets'])
             ->orderByDesc('scheduled_at')
             ->first();
 
         $session ??= $contact->workoutSessions()
             ->whereIn('status', [WorkoutSessionStatus::Completed, WorkoutSessionStatus::Skipped])
-            ->with('workoutExercises.exerciseLog.exerciseSets')
+            ->with(['workoutExercises.exercise', 'workoutExercises.exerciseLog.exerciseSets'])
             ->orderByDesc('scheduled_at')
             ->first();
 
@@ -152,6 +152,13 @@ class CoachContextProvider implements ContextProviderInterface
             prescribedReps: $workoutExercise->prescribed_reps,
             prescribedLoad: $workoutExercise->prescribed_load !== null ? (float) $workoutExercise->prescribed_load : null,
             prescribedDurationSeconds: $workoutExercise->prescribed_duration_seconds,
+            // Misma fuente de verdad que TrainingEngine::prescribeExercise()
+            // (Exercise::tracking_type) — nunca inferido de prescribedDurationSeconds.
+            // exercise_id es nullOnDelete (ver migración de workout_exercises):
+            // si la relación no resuelve es porque exercise_id ya es null, así
+            // que este fallback nunca se ejercita en la práctica; se mantiene
+            // solo como defensa, nunca como un segundo criterio real.
+            trackingType: $workoutExercise->exercise?->tracking_type ?? TrackingType::RepsAndLoad,
             outcome: $outcome,
             actualSets: $sets,
             rpe: $log?->rpe,
@@ -175,14 +182,10 @@ class CoachContextProvider implements ContextProviderInterface
                 continue;
             }
 
-            $trackingType = $exerciseSnapshot->prescribedDurationSeconds !== null
-                ? TrackingType::TimeBased
-                : TrackingType::RepsAndLoad;
-
             $evaluations[$exerciseSnapshot->exerciseId] = $this->progressionEvaluator->evaluate(
                 $historyContext,
                 $exerciseSnapshot->exerciseId,
-                $trackingType,
+                $exerciseSnapshot->trackingType,
             );
         }
 
