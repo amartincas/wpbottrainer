@@ -60,6 +60,21 @@ class Contact extends Model
     }
 
     /**
+     * Hito de seguridad de restricciones (Bloque 2). Solo lectura desde
+     * Cliente (Hito 12) — el flujo de revisión real sigue siendo
+     * `DeclaredHealthConditionRecorder`, nunca reimplementado aquí.
+     */
+    public function declaredHealthConditions(): HasMany
+    {
+        return $this->hasMany(DeclaredHealthCondition::class);
+    }
+
+    public function trainingRestrictions(): HasMany
+    {
+        return $this->hasMany(TrainingRestriction::class);
+    }
+
+    /**
      * Hito 10 — dominio Reminder. Mismo criterio que el resto: Contact sigue
      * siendo la única identidad, estas relaciones exponen datos que
      * pertenecen a Reminder, no a Core ni a Training en sí.
