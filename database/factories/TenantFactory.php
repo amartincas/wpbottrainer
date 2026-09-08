@@ -3,6 +3,7 @@
 namespace Database\Factories;
 
 use App\Models\Tenant;
+use App\Payments\Models\MembershipPlan;
 use Illuminate\Database\Eloquent\Factories\Factory;
 use Illuminate\Support\Str;
 
@@ -12,6 +13,33 @@ use Illuminate\Support\Str;
 class TenantFactory extends Factory
 {
     protected $model = Tenant::class;
+
+    /**
+     * Hito 11 — todo Tenant de test creado con `monthly_price` (el default
+     * de esta factory) recibe automáticamente un `MembershipPlan` de 1 mes
+     * equivalente — mismo criterio que la migración de compatibilidad para
+     * Tenants reales. Sin esto, CADA test existente que ya asumía un
+     * precio único por Tenant (la enorme mayoría de los tests de Payments,
+     * de antes de este hito) tendría que crear su propio MembershipPlan a
+     * mano. Un test que necesite el caso "sin membresía configurada" o
+     * "varias membresías" debe borrar/agregar explícitamente después de
+     * crear el Tenant — esto es solo el comportamiento por defecto.
+     */
+    public function configure(): static
+    {
+        return $this->afterCreating(function (Tenant $tenant) {
+            if ($tenant->monthly_price !== null) {
+                MembershipPlan::create([
+                    'tenant_id' => $tenant->id,
+                    'label' => '1 mes',
+                    'duration_months' => 1,
+                    'price' => $tenant->monthly_price,
+                    'currency' => $tenant->currency,
+                    'is_active' => true,
+                ]);
+            }
+        });
+    }
 
     /**
      * Define the model's default state.

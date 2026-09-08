@@ -32,7 +32,10 @@ class PaymentsTable
                 TextColumn::make('id')->label('Pago #')->sortable(),
                 TextColumn::make('contact.customer_phone')->label('Usuario')->searchable(),
                 TextColumn::make('method_label')->label('Método'),
-                TextColumn::make('amount')->label('Monto')->money(fn (Payment $record) => $record->currency)->sortable(),
+                // Hito 11: amount/currency son nullable — un Payment recién
+                // creado (método elegido, membresía todavía sin elegir) no
+                // tiene precio todavía.
+                TextColumn::make('amount')->label('Monto')->money(fn (Payment $record) => $record->currency ?? 'COP')->placeholder('Sin membresía elegida')->sortable(),
                 TextColumn::make('status')
                     ->badge()
                     ->color(fn (PaymentStatus $state): string => match ($state) {

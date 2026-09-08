@@ -14,8 +14,10 @@ use App\Models\Tenant;
 use App\Models\WhatsAppMessage;
 use App\Payments\Enums\PaymentMethodType;
 use App\Payments\Enums\PaymentStatus;
+use App\Payments\Models\MembershipPlan;
 use App\Payments\Support\PaymentValidationService;
 use App\Payments\Support\ReceiptExtractionService;
+use Illuminate\Support\Collection;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
 use Illuminate\Support\Facades\Log;
@@ -28,7 +30,8 @@ use Illuminate\Support\Str;
  * mismo Handler, igual que Training resuelve onboarding/reporte dentro de
  * un único TrainingHandler):
  *
- *   ¿hay un Payment abierto (pending/under_review)? -> receipt_submission
+ *   ¿hay un Payment abierto SIN membresía elegida? -> plan_selection (Hito 11)
+ *   ¿hay un Payment abierto CON membresía elegida? -> receipt_submission
  *   ¿pregunta por el estado?                          -> payment_status
  *   ¿ya eligió un método (nequi/daviplata)?            -> payment_instructions
  *   en otro caso                                        -> payment_options
@@ -38,6 +41,15 @@ use Illuminate\Support\Str;
  * desde la acción de Filament (confirmar/rechazar), nunca desde aquí. La
  * IA (ReceiptExtractionService) solo extrae; PaymentValidationService
  * (determinista) solo marca banderas; el humano decide.
+ *
+ * Hito 11 — un Payment ahora nace en dos pasos: se crea al elegir MÉTODO
+ * (como siempre), pero sin `amount`/`currency`/`membership_plan_id` hasta
+ * que el usuario elige una membresía (`Payment::needsPlanSelection()`).
+ * Reutiliza el ÚNICO mecanismo de estado que este Handler ya tenía ("hay
+ * un Payment abierto") — no se agrega ninguna tabla de estado
+ * conversacional nueva, solo un chequeo adicional sobre esa misma señal.
+ * Nunca se piden instrucciones de pago ni se acepta un comprobante antes
+ * de que exista una membresía válida seleccionada.
  */
 class PaymentHandler implements HandlerInterface
 {
@@ -68,6 +80,12 @@ class PaymentHandler implements HandlerInterface
             ->whereIn('status', [PaymentStatus::Pending, PaymentStatus::UnderReview])
             ->latest()
             ->first();
+
+        if ($openPayment !== null && $openPayment->needsPlanSelection()) {
+            $this->handlePlanSelection($openPayment, $rawBody, $from, $tenant);
+
+            return;
+        }
 
         if ($openPayment !== null) {
             $this->handleReceiptSubmission($openPayment, $rawBody, $messageType, $mediaId, $tenant, $from);
@@ -104,11 +122,12 @@ class PaymentHandler implements HandlerInterface
             return;
         }
 
-        $price = $tenant->monthly_price !== null
-            ? number_format((float) $tenant->monthly_price, 0, ',', '.').' '.$tenant->currency
-            : 'el precio vigente (te lo confirmamos al elegir un método)';
-
-        $lines = ["💳 Para activar tu servicio, el valor es {$price}. Elige un método:"];
+        // Hito 11: el precio ya no es único por Tenant — depende de la
+        // membresía que se elija después de esto (1/3/6/12 meses...), así
+        // que no se anticipa ningún monto aquí. El precio real se muestra
+        // en handlePlanSelection()/applyPlanSelection(), una vez elegido
+        // el método.
+        $lines = ['💳 Para activar tu servicio, elige un método de pago:'];
 
         foreach ($methods as $label) {
             $lines[] = "- {$label}";
@@ -159,38 +178,163 @@ class PaymentHandler implements HandlerInterface
 
     // ── Subflujo: payment_instructions ─────────────────────────────────
 
+    /**
+     * Hito 11: el Payment nace aquí SIN precio/membresía todavía — el
+     * método ya se sabe (`$chosen`), pero `amount`/`currency`/
+     * `membership_plan_id` quedan nulos hasta elegir una membresía. Si el
+     * Tenant solo tiene UNA opción activa, se auto-selecciona de inmediato
+     * (mismo comportamiento de fricción que antes de este hito, cuando
+     * solo existía un precio); con varias, se pregunta.
+     */
     private function handlePaymentInstructions(Contact $contact, array $chosen, string $from, Tenant $tenant): void
     {
-        if ($tenant->monthly_price === null) {
-            $this->reply($from, 'Este servicio todavía no tiene un precio configurado. Contáctanos para activarlo manualmente.', $tenant);
+        $activePlans = $this->activePlans($tenant);
+
+        if ($activePlans->isEmpty()) {
+            $this->reply($from, 'Este servicio todavía no tiene ninguna membresía configurada. Contáctanos para activarlo manualmente.', $tenant);
 
             return;
         }
 
         $payment = Payment::create([
             'contact_id' => $contact->id,
-            'amount' => $tenant->monthly_price,
-            'currency' => $tenant->currency,
             'method' => $chosen['type'],
             'method_label' => $chosen['label'],
             'status' => PaymentStatus::Pending,
             'expires_at' => now()->addHours(48),
         ]);
 
-        $amount = number_format((float) $tenant->monthly_price, 0, ',', '.').' '.$tenant->currency;
+        if ($activePlans->count() === 1) {
+            $this->applyPlanSelection($payment, $activePlans->first(), $chosen, $tenant, $from);
+
+            return;
+        }
+
+        $this->sendPlanOptions($activePlans, $from, $tenant);
+    }
+
+    // ── Subflujo: plan_selection (Hito 11) ──────────────────────────────
+
+    /**
+     * @return Collection<int, MembershipPlan>
+     */
+    private function activePlans(Tenant $tenant): Collection
+    {
+        return MembershipPlan::where('tenant_id', $tenant->id)
+            ->where('is_active', true)
+            ->orderBy('sort_order')
+            ->orderBy('duration_months')
+            ->get();
+    }
+
+    private function sendPlanOptions(Collection $plans, string $from, Tenant $tenant): void
+    {
+        $lines = ['Elige la membresía que quieres activar:'];
+
+        foreach ($plans as $plan) {
+            $price = number_format((float) $plan->price, 0, ',', '.').' '.$plan->currency;
+            $lines[] = "- {$plan->label}: {$price}";
+        }
+
+        $lines[] = 'Responde con la que prefieras.';
+
+        $this->reply($from, implode("\n", $lines), $tenant);
+    }
+
+    /**
+     * Detecta la membresía elegida contra el catálogo ACTIVO del Tenant —
+     * un plan `is_active=false` nunca puede seleccionarse porque ni
+     * siquiera entra en esta consulta. Sin IA, mismo criterio determinista
+     * que detectChosenMethod(): primero por `label` (más específico, ej.
+     * "el de 3 meses"), luego por el número de meses solo ("3").
+     */
+    private function detectChosenPlan(string $body, Collection $activePlans): ?MembershipPlan
+    {
+        $normalized = mb_strtolower(trim($body));
+
+        foreach ($activePlans as $plan) {
+            if (str_contains($normalized, mb_strtolower($plan->label))) {
+                return $plan;
+            }
+        }
+
+        foreach ($activePlans as $plan) {
+            if (preg_match('/(?<!\d)'.$plan->duration_months.'(?!\d)/', $normalized) === 1) {
+                return $plan;
+            }
+        }
+
+        return null;
+    }
+
+    private function handlePlanSelection(Payment $payment, string $rawBody, string $from, Tenant $tenant): void
+    {
+        $activePlans = $this->activePlans($tenant);
+
+        if ($activePlans->isEmpty()) {
+            $this->reply($from, 'Este servicio todavía no tiene ninguna membresía configurada. Contáctanos para activarlo manualmente.', $tenant);
+
+            return;
+        }
+
+        $plan = $this->detectChosenPlan($rawBody, $activePlans);
+
+        if ($plan === null) {
+            $this->sendPlanOptions($activePlans, $from, $tenant);
+
+            return;
+        }
+
+        $chosen = ['label' => $payment->method_label, 'type' => $payment->method, 'number' => $this->methodNumberFor($payment, $tenant)];
+
+        $this->applyPlanSelection($payment, $plan, $chosen, $tenant, $from);
+    }
+
+    private function methodNumberFor(Payment $payment, Tenant $tenant): ?string
+    {
+        return match ($payment->method) {
+            PaymentMethodType::ManualTransfer => $payment->method_label === 'Nequi' ? $tenant->nequi_number : $tenant->daviplata_number,
+            default => null,
+        };
+    }
+
+    /**
+     * Congela el snapshot (`membership_plan_id`/`membership_months`/
+     * `amount`/`currency`) en el Payment ya existente — a partir de aquí,
+     * ese Payment NUNCA vuelve a consultar el MembershipPlan para saber
+     * cuánto vale o cuánto dura, ni siquiera si el catálogo cambia después
+     * (ver docs/DECISIONS.md). Envía las instrucciones de pago reales —
+     * antes de esto, el usuario nunca vio un monto ni un número de cuenta.
+     *
+     * @param  array{label: string, type: PaymentMethodType, number: ?string}  $chosen
+     */
+    private function applyPlanSelection(Payment $payment, MembershipPlan $plan, array $chosen, Tenant $tenant, string $from): void
+    {
+        $payment->update([
+            'membership_plan_id' => $plan->id,
+            'membership_months' => $plan->duration_months,
+            'amount' => $plan->price,
+            'currency' => $plan->currency,
+        ]);
+
+        $amount = number_format((float) $plan->price, 0, ',', '.').' '.$plan->currency;
         $instructions = $tenant->payment_instructions
             ? "\n\n{$tenant->payment_instructions}"
             : '';
+        $numberLine = $chosen['number'] !== null ? "Número: {$chosen['number']}\n" : '';
 
-        $message = "Perfecto, para pagar con {$chosen['label']}:\n"
-            ."Número: {$chosen['number']}\n"
+        $message = "Perfecto, {$plan->label} con {$chosen['label']}:\n"
+            .$numberLine
             ."Valor: {$amount}{$instructions}\n\n"
             .'Cuando hagas la transferencia, envíame el comprobante (foto o descríbemelo) y lo verificamos. '
             .'Tu acceso se activa solo después de confirmar el pago — te aviso en cuanto quede listo. 💪';
 
         $this->reply($from, $message, $tenant);
 
-        Log::info('PAYMENT_INSTRUCTIONS_SENT', ['payment_id' => $payment->id, 'tenant_id' => $tenant->id, 'method' => $chosen['label']]);
+        Log::info('PAYMENT_INSTRUCTIONS_SENT', [
+            'payment_id' => $payment->id, 'tenant_id' => $tenant->id,
+            'method' => $chosen['label'], 'membership_plan_id' => $plan->id, 'membership_months' => $plan->duration_months,
+        ]);
     }
 
     // ── Subflujo: receipt_submission ───────────────────────────────────
@@ -199,12 +343,27 @@ class PaymentHandler implements HandlerInterface
     {
         $isImage = $messageType === 'image' && $mediaId !== null;
         $downloadedPath = null;
+        $hash = null;
 
         if ($isImage) {
             $downloadedPath = WhatsAppService::downloadMedia($mediaId, $tenant);
 
             if ($downloadedPath === null) {
                 $this->reply($from, 'No pude descargar esa imagen. ¿Puedes reenviarla o describirme los datos del pago (monto, referencia, fecha)?', $tenant);
+
+                return;
+            }
+
+            $hash = hash('sha256', Storage::disk('local')->get($downloadedPath));
+
+            // Hito 11 (D3) — el mismo archivo, reenviado con un WAMID
+            // distinto (el dedup de Meta en WhatsAppController no aplica
+            // aquí, son mensajes genuinamente distintos), no debe volver a
+            // gastar una llamada de IA, crear un segundo PaymentReceipt, ni
+            // emitir una segunda alerta idéntica al superadmin — se
+            // detecta ANTES de extraer nada.
+            if (PaymentReceipt::where('payment_id', $payment->id)->where('file_hash', $hash)->exists()) {
+                $this->reply($from, 'Ya recibí este comprobante — lo sigo revisando, te aviso apenas quede confirmado. 🙏', $tenant);
 
                 return;
             }
@@ -224,7 +383,7 @@ class PaymentHandler implements HandlerInterface
             return;
         }
 
-        $receiptPath = $isImage ? $this->persistReceiptFile($downloadedPath, $tenant) : null;
+        $receiptPath = $isImage ? $this->persistReceiptFile($downloadedPath, $tenant, $hash) : null;
 
         PaymentReceipt::create([
             'payment_id' => $payment->id,
@@ -265,14 +424,14 @@ class PaymentHandler implements HandlerInterface
      * Copia el archivo ya descargado (transitorio, en whatsapp_media/) a
      * una ubicación permanente propia de Payments — un comprobante es
      * evidencia de auditoría, nunca se borra (a diferencia del audio de
-     * Ingest, que se elimina tras transcribir).
+     * Ingest, que se elimina tras transcribir). `$hash` ya viene calculado
+     * por el chequeo de duplicados (Hito 11, D3) — nunca se recalcula.
      */
-    private function persistReceiptFile(string $relativePath, Tenant $tenant): array
+    private function persistReceiptFile(string $relativePath, Tenant $tenant, string $hash): array
     {
         $contents = Storage::disk('local')->get($relativePath);
         $extension = pathinfo($relativePath, PATHINFO_EXTENSION);
         $mime = Storage::disk('local')->mimeType($relativePath) ?: 'application/octet-stream';
-        $hash = hash('sha256', $contents);
 
         $destination = "receipts/{$tenant->id}/".Str::uuid().".{$extension}";
         Storage::disk('local')->put($destination, $contents);

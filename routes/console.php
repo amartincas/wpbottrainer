@@ -19,3 +19,8 @@ Artisan::command('inspire', function () {
 // existente y sin cambios.
 Schedule::command('reminders:dispatch-due')->everyMinute()->withoutOverlapping();
 Schedule::command('reminders:recover-stuck')->everyFiveMinutes()->withoutOverlapping();
+
+// Hito 11 (D2) — mismo contenedor `scheduler` de Hito 10, sin infraestructura
+// nueva. Cierra un gap real: `PaymentStatus::Expired` existía pero nada lo
+// asignaba nunca (ver App\Console\Commands\ExpireStalePayments).
+Schedule::command('payments:expire-stale')->everyFiveMinutes()->withoutOverlapping();
