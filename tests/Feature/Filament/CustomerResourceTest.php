@@ -3,11 +3,16 @@
 use App\Filament\Resources\Customer\Pages\ListCustomers;
 use App\Filament\Resources\Customer\Pages\ViewCustomer;
 use App\Models\Contact;
+use App\Models\DeclaredHealthCondition;
 use App\Models\Payment;
 use App\Models\Tenant;
 use App\Models\TrainingAccess;
 use App\Models\TrainingAccessAudit;
+use App\Models\TrainingProfile;
+use App\Models\TrainingRestriction;
 use App\Models\User;
+use App\Payments\Enums\PaymentStatus;
+use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\TrainingAccessStatus;
 use Livewire\Livewire;
 
@@ -248,4 +253,61 @@ it('reactivate to Free never restores the previous expires_at automatically', fu
     $fresh = $access->fresh();
     expect($fresh->status)->toBe(TrainingAccessStatus::Free);
     expect($fresh->expires_at)->toBeNull();
+});
+
+// ── Renderizado del Infolist con datos reales en las 6 secciones ────────
+// Regresión: un hallazgo real en staging (customers/{id} -> 500) mostró que
+// ningún test anterior ejercitaba ViewCustomer para un Contact con
+// TrainingProfile/salud/restricciones/pagos REALES — todas las relaciones
+// venían vacías, así que un closure con un type-hint incorrecto (?string en
+// vez del enum real que el modelo castea) nunca se ejecutaba con un valor
+// no-null y el error quedaba invisible. Estos tests fuerzan cada sección a
+// tener datos reales.
+
+it('renders the full customer detail page for a contact with a complete TrainingProfile (safety_status Normal)', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->for($contact)->create(['safety_status' => SafetyStatus::Normal]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertOk();
+});
+
+it('renders the full customer detail page when safety_status is FlaggedForReview, the other real enum case', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->for($contact)->create(['safety_status' => SafetyStatus::FlaggedForReview]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertOk();
+});
+
+it('renders the full customer detail page with real health conditions, restrictions, payments, and audit history all populated at once', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->for($contact)->create();
+    DeclaredHealthCondition::factory()->for($contact)->create();
+    TrainingRestriction::factory()->for($contact)->create();
+    $payment = Payment::factory()->for($contact)->create(['status' => PaymentStatus::Confirmed]);
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active, 'payment_id' => $payment->id]);
+    app(\App\Training\Support\TrainingAccessAdministrationService::class)->extend($contact, $superAdmin, 1, 'para poblar el historial de auditoría');
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertOk();
+});
+
+it('renders the customers list and detail page for a contact with no related data at all, without failing', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+
+    Livewire::actingAs($superAdmin)
+        ->test(ListCustomers::class)
+        ->assertOk();
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertOk();
 });

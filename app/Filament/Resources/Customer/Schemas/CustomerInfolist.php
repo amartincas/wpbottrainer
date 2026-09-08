@@ -4,6 +4,7 @@ namespace App\Filament\Resources\Customer\Schemas;
 
 use App\Models\Contact;
 use App\Payments\Enums\PaymentStatus;
+use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\TrainingAccessAuditAction;
 use App\Training\Enums\TrainingAccessStatus;
 use Filament\Infolists\Components\RepeatableEntry;
@@ -110,7 +111,7 @@ class CustomerInfolist
                         TextEntry::make('trainingProfile.safety_status')
                             ->label('Estado de seguridad')
                             ->badge()
-                            ->color(fn (?string $state): string => $state === 'flagged_for_review' ? 'danger' : 'success')
+                            ->color(fn (?SafetyStatus $state): string => $state === SafetyStatus::FlaggedForReview ? 'danger' : 'success')
                             ->placeholder('—'),
                     ]),
 
