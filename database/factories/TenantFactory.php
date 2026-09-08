@@ -71,6 +71,15 @@ class TenantFactory extends Factory
             'daviplata_number' => null,
             'gateway_provider' => null,
             'gateway_config' => null,
+            // Hito 13 — igual criterio que el resto de esta factory: valores
+            // por defecto EXPLÍCITOS en el modelo en memoria, nunca confiar
+            // en el DEFAULT de la columna en BD (Eloquent no re-lee la fila
+            // tras el INSERT; un atributo ausente aquí queda `null` en el
+            // objeto en memoria aunque la BD sí aplique su default, lo que
+            // rompe cualquier chequeo `!$tenant->referral_program_enabled`).
+            'wa_display_phone_number' => null,
+            'referral_reward_days' => 3,
+            'referral_program_enabled' => true,
         ];
     }
 }

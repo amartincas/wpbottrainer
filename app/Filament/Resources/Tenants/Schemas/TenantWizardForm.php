@@ -2,10 +2,11 @@
 
 namespace App\Filament\Resources\Tenants\Schemas;
 
-use Filament\Forms\Components\Section;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\Textarea;
+use Filament\Forms\Components\Toggle;
+use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Schema;
 
@@ -148,6 +149,31 @@ class TenantWizardForm
                         return self::$personaTemplates[$personality] ?? '';
                     })
                     ->reactive(),
+
+                // === REFERRALS (Hito 13) ===
+                // wa_display_phone_number es genérico de WhatsApp (el
+                // número marcable real, distinto de wa_phone_number_id),
+                // necesario para construir el link de invitación wa.me.
+                Section::make('Programa de Referidos')
+                    ->columns(2)
+                    ->columnSpanFull()
+                    ->schema([
+                        TextInput::make('wa_display_phone_number')
+                            ->label('Número de WhatsApp marcable')
+                            ->helperText('Formato internacional sin "+" (ej: 573001234567) — usado para construir el link de invitación wa.me. Si se deja vacío, la invitación se entrega solo como texto para reenviar.')
+                            ->columnSpanFull(),
+                        TextInput::make('referral_reward_days')
+                            ->label('Días de recompensa por referido')
+                            ->numeric()
+                            ->required()
+                            ->minValue(1)
+                            ->default(3)
+                            ->helperText('Cambiar este valor nunca afecta recompensas ya otorgadas — cada una queda congelada con el valor vigente al momento de generarse.'),
+                        Toggle::make('referral_program_enabled')
+                            ->label('Programa activo')
+                            ->default(true)
+                            ->helperText('Desactivarlo detiene nuevas atribuciones — nunca invalida atribuciones ya existentes.'),
+                    ]),
             ]);
     }
 }

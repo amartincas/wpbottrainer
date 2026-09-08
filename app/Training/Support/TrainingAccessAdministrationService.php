@@ -30,8 +30,14 @@ use Illuminate\Support\Facades\Log;
  * Cada método escribe `TrainingAccess` y crea EXACTAMENTE una fila en
  * `TrainingAccessAudit` (append-only, nunca se edita) — salvo los no-ops
  * idempotentes (`revoke()` sobre un acceso ya revocado, `reactivate()`
- * sobre un acceso que no está revocado), que no auditan nada nuevo porque
- * no hay ninguna transición real que registrar.
+ * sobre un acceso que no está revocado, `extendByDays()` sobre un Free
+ * indefinido), que no auditan nada nuevo porque no hay ninguna transición
+ * real que registrar.
+ *
+ * Hito 13 — `extendByDays()` es el único punto de entrada usado por
+ * `App\Referrals` (nunca `extend()`, que trabaja en meses, no en días) —
+ * ver docs/DECISIONS.md. `App\Referrals` no depende de ningún otro método
+ * de esta clase.
  */
 class TrainingAccessAdministrationService
 {
@@ -207,21 +213,101 @@ class TrainingAccessAdministrationService
         return $access;
     }
 
+    /**
+     * Hito 13 — extiende `expires_at` en DÍAS (no meses) — necesario para
+     * la recompensa de Referidos (reward_days), que nunca es una cantidad
+     * de meses. Método hermano de `extend()`, deliberadamente NO una
+     * variante de él: reutiliza el mismo `extensionBaseDate()` (vigente ->
+     * desde `expires_at`; vencido -> desde `now()`), pero difiere en dos
+     * puntos que `extend()` no necesita porque nunca los enfrenta desde
+     * Filament (siempre hay un admin humano decidiendo conscientemente):
+     *
+     * - `$admin` es NULLABLE — el origen puede ser el sistema (una
+     *   recompensa), no un humano. Ver `recordAudit()`.
+     * - Si `expires_at` ya es `null` (Free indefinido), NO se modifica
+     *   nada — indefinido + N días sigue siendo indefinido, no hay ninguna
+     *   extensión material que hacer. A diferencia de `extend()` (que
+     *   asumiría vencido y fijaría una fecha, convirtiendo un acceso
+     *   ilimitado en uno acotado — un defecto latente de `extend()` en ese
+     *   caso específico, no corregido aquí porque pertenece a Hito 12 y
+     *   ningún llamador real lo ha ejercitado todavía; `extendByDays()`
+     *   simplemente no hereda el mismo defecto). En ese caso, este método
+     *   retorna sin escribir NADA — ni `TrainingAccess` ni
+     *   `TrainingAccessAudit` — porque no hubo ninguna transición real que
+     *   auditar (ver docs/DECISIONS.md: una `ReferralReward`
+     *   `not_applicable` nunca debe generar una fila `Extended` sin
+     *   modificación real).
+     *
+     * Mismas guardas que `extend()`: lanza si no existe `TrainingAccess`,
+     * lanza si está `Revoked` (nunca se auto-reactiva desde aquí tampoco).
+     */
+    public function extendByDays(Contact $contact, ?User $admin, int $days, ?string $reason = null, ?int $referralRewardId = null): TrainingAccess
+    {
+        $access = $contact->trainingAccess;
+
+        if ($access === null) {
+            throw new TrainingAccessAdministrationException(
+                "No existe TrainingAccess para el contacto #{$contact->id} — no se puede extender."
+            );
+        }
+
+        if ($access->status === TrainingAccessStatus::Revoked) {
+            throw new TrainingAccessAdministrationException(
+                'No se puede extender un acceso revocado — reactívelo primero.'
+            );
+        }
+
+        if ($access->expires_at === null) {
+            // Free indefinido: ya ilimitado, ninguna modificación real —
+            // sin auditoría (no hay ninguna transición que registrar).
+            return $access;
+        }
+
+        $previousStatus = $access->status;
+        $previousExpiresAt = $access->expires_at;
+        $newExpiresAt = $access->extensionBaseDate()->addDays($days);
+
+        $access->update(['expires_at' => $newExpiresAt]);
+
+        $this->recordAudit($access, $admin, TrainingAccessAuditAction::Extended, $previousStatus, $access->status, $previousExpiresAt, $newExpiresAt, $reason, $referralRewardId);
+
+        return $access;
+    }
+
+    /**
+     * Hito 13 — `$admin` y `$referralRewardId` son mutuamente excluyentes,
+     * y exactamente uno de los dos es obligatorio: toda fila de
+     * `TrainingAccessAudit` tiene un origen identificable — un
+     * administrador humano (`performed_by`) O una recompensa de Referidos
+     * (`referral_reward_id`), nunca ambos, nunca ninguno. Esto se impone
+     * aquí en CÓDIGO — no queda como un supuesto que solo los tests
+     * verifican — precisamente porque este es el único método que escribe
+     * en la tabla; si la invariante se rompe, se rompe aquí, de forma
+     * explícita y ruidosa, nunca en silencio.
+     */
     private function recordAudit(
         TrainingAccess $access,
-        User $admin,
+        ?User $admin,
         TrainingAccessAuditAction $action,
         ?TrainingAccessStatus $previousStatus,
         TrainingAccessStatus $newStatus,
         ?CarbonInterface $previousExpiresAt,
         ?CarbonInterface $newExpiresAt,
         ?string $reason,
+        ?int $referralRewardId = null,
     ): void {
+        if (($admin === null) === ($referralRewardId === null)) {
+            throw new TrainingAccessAdministrationException(
+                'recordAudit() requiere EXACTAMENTE uno de $admin o $referralRewardId — nunca ambos, nunca ninguno.'
+            );
+        }
+
         TrainingAccessAudit::create([
             'contact_id' => $access->contact_id,
             'training_access_id' => $access->id,
             'action' => $action,
-            'performed_by' => $admin->id,
+            'performed_by' => $admin?->id,
+            'referral_reward_id' => $referralRewardId,
             'previous_status' => $previousStatus?->value,
             'new_status' => $newStatus->value,
             'previous_expires_at' => $previousExpiresAt,

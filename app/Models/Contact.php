@@ -100,6 +100,34 @@ class Contact extends Model
     }
 
     /**
+     * Hito 13 — dominio Referrals. Mismo criterio que el resto: Contact
+     * sigue siendo la única identidad, estas relaciones exponen datos que
+     * pertenecen a Referrals, no a Core.
+     */
+    public function referralCode(): HasOne
+    {
+        return $this->hasOne(\App\Referrals\Models\ReferralCode::class);
+    }
+
+    /**
+     * La atribución en la que ESTE contacto es el referido (como máximo
+     * una en toda su vida — ver App\Referrals\Models\Referral).
+     */
+    public function referredBy(): HasOne
+    {
+        return $this->hasOne(\App\Referrals\Models\Referral::class, 'referred_contact_id');
+    }
+
+    /**
+     * Todas las atribuciones en las que ESTE contacto es el referente —
+     * sin límite de cantidad (ver docs/DECISIONS.md).
+     */
+    public function referralsMade(): HasMany
+    {
+        return $this->hasMany(\App\Referrals\Models\Referral::class, 'referrer_contact_id');
+    }
+
+    /**
      * Mark the contact as processed.
      */
     public function markAsProcessed(): void

@@ -19,10 +19,21 @@ namespace App\Core\Messaging;
  * shape as Training: its own classifier (App\Payments\Support\
  * PaymentIntentClassifier) and its own single Handler (App\Payments\
  * Handlers\PaymentHandler), never mixed into TrainingHandler.
+ *
+ * `Referral` was added in Hito 13, the third real domain intent — same
+ * shape again: its own classifier (App\Referrals\Support\
+ * ReferralIntentClassifier) and its own single Handler (App\Referrals\
+ * Handlers\ReferralHandler). Attribution itself (recognizing a referral
+ * code on a contact's first relevant message) does NOT happen here — that
+ * runs earlier, in App\Referrals\Support\ReferralAttributionPreRoutingScreen
+ * (PreRoutingScreener, before this Intent is even classified) precisely
+ * because it must run regardless of which Intent the message would
+ * otherwise resolve to.
  */
 enum Intent: string
 {
     case FallbackChat = 'fallback_chat';
     case Training = 'training';
     case Payment = 'payment';
+    case Referral = 'referral';
 }

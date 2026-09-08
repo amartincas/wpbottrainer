@@ -314,3 +314,138 @@ it('TrainingAccessAudit rows are never updated after creation — no updated_at 
 
     expect($audit->getAttributes())->not->toHaveKey('updated_at');
 });
+
+// ── extendByDays() (Hito 13, usado por Referrals) ───────────────────────
+
+it('extendByDays() on a still-valid access extends from its CURRENT expires_at, never from now', function () {
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create([
+        'status' => TrainingAccessStatus::Active,
+        'expires_at' => now()->addDays(10),
+    ]);
+    $rewardId = \App\Referrals\Models\ReferralReward::factory()->create()->id;
+
+    $result = taAdmin()->extendByDays($contact, null, 3, 'recompensa de prueba', $rewardId);
+
+    expect($result->expires_at->toDateString())->toBe(now()->addDays(13)->toDateString());
+    expect($result->status)->toBe(TrainingAccessStatus::Active); // nunca cambia el status
+});
+
+it('extendByDays() on an already-expired access extends from NOW, not from the past expiry', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->for($contact)->create([
+        'status' => TrainingAccessStatus::Trial,
+        'expires_at' => now()->subDays(5),
+    ]);
+    $rewardId = \App\Referrals\Models\ReferralReward::factory()->create()->id;
+
+    $result = taAdmin()->extendByDays($contact, null, 3, null, $rewardId);
+
+    expect($result->expires_at->toDateString())->toBe(now()->addDays(3)->toDateString());
+});
+
+it('extendByDays() on Free INDEFINIDO (expires_at null) does NOT modify anything and does NOT write a TrainingAccessAudit row', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->for($contact)->create([
+        'status' => TrainingAccessStatus::Free,
+        'expires_at' => null,
+    ]);
+
+    $countBefore = TrainingAccessAudit::count();
+    $result = taAdmin()->extendByDays($contact, null, 3, null, 999);
+
+    expect($result->expires_at)->toBeNull();
+    expect($result->status)->toBe(TrainingAccessStatus::Free);
+    expect(TrainingAccessAudit::count())->toBe($countBefore); // ni una fila — no hubo transición real
+});
+
+it('extendByDays() throws on a Revoked access — never auto-reactivates', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->for($contact)->revoked()->create();
+
+    taAdmin()->extendByDays($contact, null, 3, null, 999);
+})->throws(TrainingAccessAdministrationException::class);
+
+it('extendByDays() throws when the contact has no TrainingAccess at all', function () {
+    $contact = Contact::factory()->create();
+
+    taAdmin()->extendByDays($contact, null, 3, null, 999);
+})->throws(TrainingAccessAdministrationException::class);
+
+it('extendByDays() never creates a Payment', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+    $paymentCountBefore = Payment::count(); // el propio setup del reward de prueba crea un Payment ajeno
+    $rewardId = \App\Referrals\Models\ReferralReward::factory()->create()->id;
+    $paymentCountAfterRewardSetup = Payment::count();
+
+    taAdmin()->extendByDays($contact, null, 3, null, $rewardId);
+
+    // extendByDays() en sí mismo no crea ningún Payment adicional al ya
+    // creado por el setup del reward de prueba.
+    expect(Payment::count())->toBe($paymentCountAfterRewardSetup);
+});
+
+it('extendByDays() records exactly one audit row, with performed_by NULL and referral_reward_id set', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active, 'expires_at' => now()->addDays(5)]);
+    $rewardId = \App\Referrals\Models\ReferralReward::factory()->create()->id;
+
+    $result = taAdmin()->extendByDays($contact, null, 3, 'motivo de prueba', $rewardId);
+
+    $audit = TrainingAccessAudit::where('training_access_id', $result->id)->sole();
+    expect($audit->action)->toBe(TrainingAccessAuditAction::Extended);
+    expect($audit->performed_by)->toBeNull();
+    expect($audit->referral_reward_id)->toBe($rewardId);
+    expect($audit->reason)->toBe('motivo de prueba');
+});
+
+// ── recordAudit() — invariante estructural performed_by XOR referral_reward_id ──
+
+it('recordAudit() throws if BOTH admin and referralRewardId would be provided — enforced structurally, not just by tests', function () {
+    // grantTrial() siempre pasa un $admin real y nunca un referralRewardId
+    // — no hay forma pública de invocar la violación directamente sin
+    // reflection, así que se prueba a través del único método que SÍ
+    // permite variar ambos parámetros: extendByDays(). Un $admin no-null Y
+    // un $referralRewardId no-null a la vez debe ser rechazado.
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+    $admin = User::factory()->create(['is_super_admin' => true]);
+
+    $method->invoke(
+        taAdmin(),
+        $access,
+        $admin, // admin no-null
+        TrainingAccessAuditAction::Extended,
+        $access->status,
+        $access->status,
+        $access->expires_at,
+        $access->expires_at,
+        null,
+        123, // Y referralRewardId no-null — inválido
+    );
+})->throws(TrainingAccessAdministrationException::class);
+
+it('recordAudit() throws if NEITHER admin nor referralRewardId is provided', function () {
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+
+    $method->invoke(
+        taAdmin(),
+        $access,
+        null, // ni admin...
+        TrainingAccessAuditAction::Extended,
+        $access->status,
+        $access->status,
+        $access->expires_at,
+        $access->expires_at,
+        null,
+        null, // ...ni referralRewardId — inválido
+    );
+})->throws(TrainingAccessAdministrationException::class);

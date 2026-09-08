@@ -19,12 +19,20 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * exclusivamente `TrainingAccess.status`/`expires_at`. Esta tabla solo
  * responde "qué pasó, quién lo hizo, cuándo, por qué" — nunca "¿tiene
  * acceso ahora mismo?" (eso es `TrainingAccess::isCurrentlyValid()`).
+ *
+ * Hito 13 — `performed_by` es nullable exclusivamente cuando el origen es
+ * una recompensa de Referidos (`referral_reward_id` no nulo) — nunca un
+ * usuario "sistema" ficticio. `TrainingAccessAdministrationService::
+ * recordAudit()` impone en código, no solo por convención, que
+ * `performed_by IS NULL` si y solo si `referral_reward_id IS NOT NULL`
+ * (nunca ambos, nunca ninguno). Ver docs/DECISIONS.md.
  */
 #[Fillable([
     'contact_id',
     'training_access_id',
     'action',
     'performed_by',
+    'referral_reward_id',
     'previous_status',
     'new_status',
     'previous_expires_at',
@@ -62,5 +70,15 @@ class TrainingAccessAudit extends Model
     public function performedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'performed_by');
+    }
+
+    /**
+     * Hito 13 — presente si y solo si esta fila fue causada por una
+     * recompensa de Referidos (nunca por un administrador). Ver
+     * App\Referrals\Models\ReferralReward.
+     */
+    public function referralReward(): BelongsTo
+    {
+        return $this->belongsTo(\App\Referrals\Models\ReferralReward::class);
     }
 }

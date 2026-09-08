@@ -91,7 +91,7 @@ class CustomerInfolist
                                 TextEntry::make('new_status')->label('Estado nuevo'),
                                 TextEntry::make('previous_expires_at')->label('Vencía')->dateTime()->placeholder('—'),
                                 TextEntry::make('new_expires_at')->label('Vence ahora')->dateTime()->placeholder('—'),
-                                TextEntry::make('performedBy.name')->label('Administrador'),
+                                TextEntry::make('performedBy.name')->label('Administrador')->placeholder('Sistema (recompensa por referido)'),
                                 TextEntry::make('reason')->label('Motivo')->placeholder('—')->columnSpanFull(),
                                 TextEntry::make('created_at')->label('Fecha')->dateTime(),
                             ])

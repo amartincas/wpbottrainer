@@ -19,6 +19,9 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'wa_phone_number_id',
     'wa_business_account_id',
     'wa_verify_token',
+    'wa_display_phone_number',
+    'referral_reward_days',
+    'referral_program_enabled',
     'currency',
     'country',
     'timezone',
@@ -47,6 +50,10 @@ class Tenant extends Model
             // en el futuro — cifrado igual que ai_api_key/wa_access_token,
             // aunque hoy (sin pasarela integrada) normalmente esté vacío.
             'gateway_config' => 'encrypted',
+            // Hito 13 — configuración del programa de Referidos, tenant-scoped
+            // (mismo criterio que monthly_price/nequi_number para Payments).
+            'referral_reward_days' => 'integer',
+            'referral_program_enabled' => 'boolean',
         ];
     }
 

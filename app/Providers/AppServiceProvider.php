@@ -12,8 +12,13 @@ use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Core\Reminders\ReminderDispatcher;
 use App\Handlers\FallbackChatHandler;
+use App\Payments\Events\PaymentConfirmed;
 use App\Payments\Handlers\PaymentHandler;
 use App\Payments\Support\PaymentIntentClassifier;
+use App\Referrals\Handlers\ReferralHandler;
+use App\Referrals\Listeners\ApplyReferralRewardOnPaymentConfirmed;
+use App\Referrals\Support\ReferralAttributionPreRoutingScreen;
+use App\Referrals\Support\ReferralIntentClassifier;
 use App\Training\Context\CoachContextProvider;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
@@ -34,6 +39,7 @@ use App\Training\Support\TrainingReminderExecutor;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\ServiceProvider;
@@ -55,16 +61,21 @@ class AppServiceProvider extends ServiceProvider
         $this->app->singleton(Router::class, fn ($app) => new Router($app, [
             TrainingIntentClassifier::class,
             PaymentIntentClassifier::class,
+            ReferralIntentClassifier::class,
         ]));
 
-        // Core messaging PreRoutingScreener (Hito 7): ordered list of
-        // PreRoutingScreen classes tried BEFORE Router, regardless of what
-        // Intent the message would otherwise classify as. Today only
-        // SafetySignalPreRoutingScreen is registered — a safety signal must
-        // never depend on session state or on the Router's classification.
+        // Core messaging PreRoutingScreener (Hito 7, extendido Hito 13):
+        // ordered list of PreRoutingScreen classes tried BEFORE Router,
+        // regardless of what Intent the message would otherwise classify
+        // as. SafetySignalPreRoutingScreen puede reclamar el pipeline
+        // (retorna true); ReferralAttributionPreRoutingScreen NUNCA lo
+        // reclama (siempre retorna false) — es puramente un efecto
+        // secundario de atribución que debe correr sin importar a qué
+        // Handler termine yendo el mensaje (ver docs/DECISIONS.md).
         // See App\Core\Messaging\PreRoutingScreener and docs/DECISIONS.md.
         $this->app->singleton(PreRoutingScreener::class, fn ($app) => new PreRoutingScreener($app, [
             SafetySignalPreRoutingScreen::class,
+            ReferralAttributionPreRoutingScreen::class,
         ]));
 
         // Core AlertService (Hito 7.1): infraestructura transversal, no
@@ -87,6 +98,7 @@ class AppServiceProvider extends ServiceProvider
             Intent::FallbackChat->value => FallbackChatHandler::class,
             Intent::Training->value => TrainingHandler::class,
             Intent::Payment->value => PaymentHandler::class,
+            Intent::Referral->value => ReferralHandler::class,
         ]));
 
         // Core memory ContextBuilder: same Container-resolution pattern as
@@ -157,6 +169,12 @@ class AppServiceProvider extends ServiceProvider
         }
 
         $this->configureDefaults();
+
+        // Hito 13 — primer listener real de PaymentConfirmed (el seam que
+        // Hito 11 dejó preparado, sin consumidor hasta ahora). Registro
+        // directo (no hay EventServiceProvider en este proyecto todavía) —
+        // App\Payments no se toca ni se entera de que este listener existe.
+        Event::listen(PaymentConfirmed::class, ApplyReferralRewardOnPaymentConfirmed::class);
 
         // Register Livewire components
         Livewire::component('whats-app-chat-center', \App\Livewire\WhatsAppChatCenter::class);
