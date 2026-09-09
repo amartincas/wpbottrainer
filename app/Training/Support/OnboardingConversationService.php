@@ -221,6 +221,28 @@ class OnboardingConversationService
         return "\nLa pregunta que ACABAS de hacerle al usuario, a la que este mensaje probablemente responde, es sobre: {$label}.\n";
     }
 
+    /**
+     * Ronda 2 (piloto real) — hallazgo: preguntar "¿qué equipo tienes
+     * disponible?" sin más contexto induce a un usuario de gimnasio a
+     * enumerar solo lo que recuerda en ese momento, en vez de declarar
+     * acceso amplio (`equipment_fully_equipped`, ya existente desde Hito
+     * 8.3). Este hint SOLO se agrega cuando el campo pendiente es
+     * "available_equipment" Y ya se sabe que `training_location=gym` — no
+     * cambia el vocabulario ni el contrato JSON, solo invita a la respuesta
+     * que ya está soportada.
+     */
+    private function buildGymEquipmentHint(?string $pendingField, array $knownProfile): string
+    {
+        if ($pendingField !== 'available_equipment' || ($knownProfile['training_location'] ?? null) !== 'gym') {
+            return '';
+        }
+
+        return "\nEste usuario entrena en un gimnasio. Al preguntarle qué equipo tiene disponible, ofrécele explícitamente la "
+            ."opción de responder que tiene acceso a la mayoría del equipo de un gimnasio (ej. \"tengo acceso a todo\", "
+            ."\"lo normal de un gimnasio\") en vez de tener que enumerar cada aparato — eso corresponde a "
+            ."\"equipment_fully_equipped\": true, sin necesidad de listar nada.\n";
+    }
+
     private function isUsableResponse(?string $response): bool
     {
         if ($response === null) {
@@ -284,12 +306,13 @@ class OnboardingConversationService
         $known = json_encode($knownProfile);
         $pendingContext = $this->buildPendingFieldContext($pendingField);
         $opportunisticContext = $opportunisticInvitation ?? '';
+        $gymEquipmentHint = $this->buildGymEquipmentHint($pendingField, $knownProfile);
 
         return <<<PROMPT
 Eres un entrenador personal cercano, escribiendo por WhatsApp en español, ayudando a un usuario a configurar su perfil de entrenamiento.
 
 Perfil ya conocido (no lo repitas ni lo cambies si ya está aquí, salvo que el usuario lo corrija explícitamente): {$known}
-{$pendingContext}{$opportunisticContext}
+{$pendingContext}{$opportunisticContext}{$gymEquipmentHint}
 Del mensaje del usuario, extrae ÚNICAMENTE lo que menciona explícitamente. NUNCA inventes ni asumas un valor que no fue mencionado.
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown, sin explicación) con esta forma exacta:
@@ -327,6 +350,7 @@ Reglas de "extracted":
   - "health_declaration_category": clasifica el texto de "health_condition_text" (cuando no es "" ni null) en "possible_injury" (lesión/dolor/molestia propia, el caso por defecto), "possible_recovery" (el usuario dice que ya se recuperó, ya está bien, ya sanó de algo que tenía antes), o "professional_indication" (el usuario reporta que un profesional de la salud —médico, fisioterapeuta, etc.— le dio una indicación). Si no es evidente cuál aplica, usa "possible_injury".
   - "functional_limitation_text": SOLO cuando el usuario describe EXPLÍCITAMENTE qué movimiento, ejercicio o acción física no puede realizar o debe evitar (ej. "no puedo levantar el brazo por encima de la cabeza", "no puedo hacer sentadillas profundas", "debo evitar cargar peso en la espalda") — NUNCA lo infieras ni lo generes a partir de solo mencionar una lesión o dolor sin ese detalle. Si el usuario solo dice "tengo una lesión de hombro" sin especificar qué movimiento evitar, deja este campo en null aunque sí llenes "health_condition_text". Preserva el texto LITERAL — nunca resumas ni traduzcas esto a una zona del cuerpo; esa traducción la hace el código, nunca tú.
 - "equipment_fully_equipped": true SOLO si el usuario indica acceso amplio o completo a equipo SIN enumerar (ej. "tengo de todo", "tengo todo", "lo normal de un gimnasio", "está bien equipado") — en ese caso "available_equipment" puede quedar null o vacío, NUNCA inventes una lista de aparatos. Si el usuario menciona equipo específico (ej. "solo pesas", "tengo mancuernas y bandas", o incluso solo dice "gimnasio" sin más detalle sobre qué tiene), usa "available_equipment" con lo mencionado (o null si solo dijo el lugar, sin hablar de equipo) y deja "equipment_fully_equipped" en null — decir dónde entrena no es lo mismo que declarar que tiene todo el equipo.
+- Preferencia/comodidad vs. disponibilidad real: si el usuario expresa que PREFIERE o se siente mejor con cierto equipo (ej. "prefiero las mancuernas", "me siento mejor con máquinas", "me gusta más la barra") SIN negar explícitamente tener acceso a otro equipo, esto NUNCA es una declaración de qué tiene disponible — deja "available_equipment" y "equipment_fully_equipped" en null en ese turno (no los inventes ni los reduzcas a solo lo preferido). Solo una NEGACIÓN explícita de disponibilidad (ej. "no tengo barra", "ahí no hay máquinas", "solo tengo eso") debe reflejarse en "available_equipment".
 - "available_equipment": traduce cada aparato mencionado a este vocabulario cerrado (igual criterio que "primary_focus" — nunca dejes el término en español libre, nunca inventes un valor fuera de esta lista), usando esta tabla:
   - "mancuernas"/"pesas" (sin más detalle)/"pesas de mano" → "dumbbells"
   - "barra"/"barra olímpica" → "barbell"

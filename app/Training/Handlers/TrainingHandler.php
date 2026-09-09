@@ -16,6 +16,7 @@ use App\Models\Contact;
 use App\Models\Reminder;
 use App\Models\ReminderSuggestion;
 use App\Models\Tenant;
+use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
 use App\Models\WhatsAppMessage;
 use App\Models\WorkoutSession;
@@ -139,6 +140,36 @@ class TrainingHandler implements HandlerInterface
     private const HEALTH_SCREENING_PENDING_MESSAGE = 'Gracias por contarme. Antes de armar tu primera rutina, '
         .'un miembro de nuestro equipo va a revisar la información que compartiste para asegurarnos de adaptarla '
         .'bien. Te aviso en cuanto esté lista 💪';
+
+    /**
+     * Hito 15.1 (Ronda 2, Cambio 2) — se envía UNA sola vez, en el mismo
+     * turno en que `AutomaticTrialProvisioner::provisionIfEligible()`
+     * concede el Trial por primera vez — nunca porque un Trial ya vigente
+     * exista (eso sería reenviarlo en cada turno posterior). Usa
+     * EXCLUSIVAMENTE datos reales ya disponibles en el `TrainingAccess`
+     * recién creado y en `Tenant::trial_duration_days` — determinista, sin
+     * IA, sin prometer ninguna notificación de vencimiento (no existe
+     * ningún mecanismo de ese tipo hoy — ver docs/DECISIONS.md).
+     */
+    private const TRIAL_GRANTED_MESSAGE = '🎁 Te activé tu período de prueba gratis: %d días, válidos hasta el %s. '
+        .'Durante este tiempo puedes entrenar con tu plan personalizado sin costo. Cuando termine, si quieres '
+        .'seguir, puedes escribirme para conocer la membresía.';
+
+    /**
+     * Hito 15.1 (Ronda 2, Cambio 4) — se envía UNA sola vez, siempre después
+     * de todos los mensajes de la entrega (header + cada ejercicio + video),
+     * únicamente cuando el paso 6 genera una sesión genuinamente nueva en
+     * este turno (los guards existentes del paso 4 garantizan que este punto
+     * nunca se alcanza mientras haya una sesión pendiente sin reportar).
+     * Describe ÚNICAMENTE capacidades que ya existen en
+     * `ExecutionReportService`/`ExecutionReportRecorder` — nunca afirma
+     * sustitución de ejercicios ni envío secuencial, ninguno de los dos
+     * implementado.
+     */
+    private const EXECUTION_INSTRUCTIONS_MESSAGE = 'Puedes reportar los ejercicios en el orden que quieras. '
+        .'Dime "listo" o cuéntame las series, repeticiones y peso que hiciste (ej. "10, 10, 8 con 20kg"). '
+        .'Si no puedes hacer alguno, dímelo y lo registro así. Pregúntame cuántos te faltan cuando quieras. '
+        .'Cuando termines todos, escríbeme "ya terminé" para cerrar la sesión. 💪';
 
     /**
      * Hito 10 — atajo determinista (cero IA) para una afirmación corta
@@ -355,6 +386,13 @@ class TrainingHandler implements HandlerInterface
             $grantedTrial = $this->trialProvisioner->provisionIfEligible($freshContact);
 
             if ($grantedTrial !== null) {
+                // Se envía AQUÍ, no diferido a la entrega del paso 6: este
+                // turno puede no llegar nunca a generar una rutina (ej. el
+                // mensaje que disparó la concesión no pedía entrenar) y
+                // trial_granted_at es inmutable — este es el único punto
+                // que garantiza el aviso exactamente una vez, en el turno
+                // real de la concesión.
+                $this->sendTrialGrantedNotice($from, $tenant, $grantedTrial);
                 $freshContact = $freshContact->fresh();
                 $gateResult = $this->accessGate->authorize($freshContact);
             }
@@ -475,6 +513,12 @@ class TrainingHandler implements HandlerInterface
                 ]);
             }
         }
+
+        // Hito 15.1 (Cambio 4) — siempre al final, después de header +
+        // todos los ejercicios + sus videos: nunca antes, para no
+        // fragmentar la entrega ni competir con el contenido del
+        // entrenamiento mismo.
+        $this->reply($from, self::EXECUTION_INSTRUCTIONS_MESSAGE, $tenant);
     }
 
     /**
@@ -921,6 +965,23 @@ class TrainingHandler implements HandlerInterface
         $map = $recurring ? self::WEEKDAY_PLURAL : self::WEEKDAY_SINGULAR;
 
         return $map[$day] ?? 'ese día';
+    }
+
+    /**
+     * Hito 15.1 (Cambio 2) — datos EXCLUSIVAMENTE del `TrainingAccess` ya
+     * concedido (`expires_at`) y del `Tenant` (`trial_duration_days`) —
+     * nunca recalculados ni inventados aquí. Formato de fecha numérico
+     * (d/m/Y), independiente de locale.
+     */
+    private function sendTrialGrantedNotice(string $from, Tenant $tenant, TrainingAccess $grantedTrial): void
+    {
+        $message = sprintf(
+            self::TRIAL_GRANTED_MESSAGE,
+            $tenant->trial_duration_days,
+            $grantedTrial->expires_at->format('d/m/Y'),
+        );
+
+        $this->reply($from, $message, $tenant);
     }
 
     private function respondToDenial(?string $reason, string $from, Tenant $tenant): void

@@ -234,6 +234,40 @@ it('includes the real candidate list (question AND answer) when activeFaqs has c
     expect($result['faq_response_text'])->toBe('Redacción de la IA.');
 });
 
+// ── Ronda 2 (piloto real), Cambio 6: prioridad FAQ vs. membership_status ──
+
+it('the prompt instructs that a confident FAQ match must exclude membership_status for the same question, when the FAQ gate is activated', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => 3, 'faq_response_text' => 'Redacción.',
+        'customer_service_needed' => false, 'customer_service_message' => null,
+    ]))]);
+
+    $candidate = new \App\Training\Context\CoachFaqCandidate(3, '¿Puedo referir a alguien?', 'Sí, puedes invitar a tus amigos.');
+    (new CoachService)->respond('¿puedo referir a alguien?', minimalCoachContext(['activeFaqs' => [$candidate]]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], 'NUNCA incluyas también "membership_status"')
+            && str_contains($systemMessage['content'], 'vencimiento de LA PROPIA cuenta');
+    });
+});
+
+it('never adds the FAQ-vs-membership_status priority rule when the FAQ gate is not activated (activeFaqs null)', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+    ]))]);
+
+    (new CoachService)->respond('mensaje', minimalCoachContext(['activeFaqs' => null]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return ! str_contains($systemMessage['content'], 'NUNCA incluyas también "membership_status"');
+    });
+});
+
 it('parses faq_match_id/faq_response_text/customer_service_needed/customer_service_message defensively', function () {
     Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
         'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,

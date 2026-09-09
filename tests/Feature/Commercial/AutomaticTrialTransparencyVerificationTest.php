@@ -131,14 +131,69 @@ it('produces the exact same outbound reply, WorkoutSession, and prescribed exerc
     expect(TrainingAccess::where('contact_id', $contactA->id)->sole()->granted_by)->not->toBe('system_auto_trial');
     expect(TrainingAccess::where('contact_id', $contactB->id)->sole()->granted_by)->toBe('system_auto_trial');
 
+    // Hito 15.1 (Ronda 2, Cambio 2) — el ÚNICO mensaje adicional legítimo
+    // en B es el aviso de Trial: nunca aparece en A porque su
+    // TrainingAccess ya existía ANTES del turno (no hubo concesión EN este
+    // turno, ver transparencyReadyProfile()+TrainingAccess::factory()
+    // arriba). Se envía en el paso 3 (antes que cualquier otra cosa del
+    // turno), así que siempre es el PRIMER mensaje saliente. Se separa
+    // explícitamente antes de comparar mensaje a mensaje el resto, que
+    // debe seguir siendo idéntico entre A y B.
+    expect(count($replyTextsB))->toBe(count($replyTextsA) + 1);
+    $trialNoticeB = array_shift($replyTextsB);
+    expect($trialNoticeB)->toContain('período de prueba gratis');
+    expect($trialNoticeB)->toContain((string) $tenantB->trial_duration_days);
+    expect($replyTextsA)->not->toContain($trialNoticeB);
+
     expect($exerciseNamesB)->toBe($exerciseNamesA); // misma prescripción
-    expect(count($replyTextsB))->toBe(count($replyTextsA)); // mismo número de mensajes salientes
+    expect(count($replyTextsB))->toBe(count($replyTextsA)); // mismo número de mensajes, tras remover el aviso de Trial
     // Mismo CONTENIDO exacto en todos los mensajes, ignorando únicamente el
     // prefijo ordinal (ver transparencyNormalizeOrdinal) — nunca el
     // mecanismo de acceso decide ese orden.
     $normalizedA = collect($replyTextsA)->map('transparencyNormalizeOrdinal')->sort()->values()->all();
     $normalizedB = collect($replyTextsB)->map('transparencyNormalizeOrdinal')->sort()->values()->all();
     expect($normalizedB)->toBe($normalizedA);
+});
+
+it('never sends the Trial-granted notice again in a later turn where the Trial is already active — only in the turn of the actual grant', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $contact = transparencyReadyProfile($tenant, '573001170004');
+    // Trial YA otorgado antes de este turno — TrainingAccessGate ya
+    // autoriza directamente, AutomaticTrialProvisioner nunca se ejecuta.
+    app(TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+
+    transparencyFakeCoachContinueTraining();
+    transparencySendMessage($tenant, '573001170004', 'Dame mi entrenamiento de hoy');
+
+    $replyTexts = collect(Http::recorded())
+        ->filter(fn ($pair) => str_contains($pair[0]->url(), 'graph.facebook.com'))
+        ->map(fn ($pair) => data_get($pair[0]->data(), 'text.body'))
+        ->filter()
+        ->values();
+
+    expect($replyTexts->contains(fn ($t) => str_contains($t, 'período de prueba gratis')))->toBeFalse();
+});
+
+it('sends the Trial-granted notice exactly once, in the same turn it is granted, without any additional AI call', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'trial_duration_days' => 5]);
+    $contact = transparencyReadyProfile($tenant, '573001170005');
+    // Sin TrainingAccess previo -> se concede EN este turno (paso 3).
+
+    transparencyFakeCoachContinueTraining();
+    transparencySendMessage($tenant, '573001170005', 'Dame mi entrenamiento de hoy');
+
+    $aiCallsCount = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'))->count();
+    expect($aiCallsCount)->toBe(1); // única llamada de IA del turno (Coach) — el aviso es 100% determinista, sin IA
+
+    $replyTexts = collect(Http::recorded())
+        ->filter(fn ($pair) => str_contains($pair[0]->url(), 'graph.facebook.com'))
+        ->map(fn ($pair) => data_get($pair[0]->data(), 'text.body'))
+        ->filter()
+        ->values();
+
+    $trialNotices = $replyTexts->filter(fn ($t) => str_contains($t, 'período de prueba gratis'));
+    expect($trialNotices)->toHaveCount(1);
+    expect($replyTexts->first())->toContain('período de prueba gratis'); // primer mensaje del turno (paso 3)
 });
 
 it('regression guard: hasActiveAccessAwaitingFirstWorkout() NEVER fires for a Trial-status TrainingAccess (Trial automático nunca activa este mecanismo, solo Active lo hace, sin cambios)', function () {

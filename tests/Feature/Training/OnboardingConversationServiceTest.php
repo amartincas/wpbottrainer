@@ -388,6 +388,92 @@ it('the combined prompt instructs translating equipment to the closed Equipment 
     });
 });
 
+// ── Ronda 2 (piloto real), Cambio 1: acceso amplio a equipo de gimnasio,
+// y preferencia vs. disponibilidad real. ───────────────────────────────
+
+it('the combined prompt invites a full-access answer instead of enumerating gym equipment, when available_equipment is pending and the location is already known to be a gym', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'algo',
+        ['training_location' => 'gym'],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'available_equipment',
+    );
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'acceso a la mayoría del equipo de un gimnasio')
+            && str_contains($systemPrompt, 'equipment_fully_equipped');
+    });
+});
+
+it('never adds the gym-equipment hint when the pending field is not available_equipment, even with a known gym location', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'algo',
+        ['training_location' => 'gym'],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'goal',
+    );
+
+    Http::assertSent(fn ($request) => ! str_contains(
+        data_get($request->data(), 'messages.0.content', ''),
+        'acceso a la mayoría del equipo de un gimnasio'
+    ));
+});
+
+it('never adds the gym-equipment hint when the known location is not gym, even with available_equipment pending', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond(
+        'algo',
+        ['training_location' => 'home'],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'available_equipment',
+    );
+
+    Http::assertSent(fn ($request) => ! str_contains(
+        data_get($request->data(), 'messages.0.content', ''),
+        'acceso a la mayoría del equipo de un gimnasio'
+    ));
+});
+
+it('the combined prompt explicitly instructs that a mere equipment preference, without an explicit negation, never modifies available_equipment or equipment_fully_equipped', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'PREFIERE')
+            && str_contains($systemPrompt, 'NEGACIÓN explícita');
+    });
+});
+
+it('end-to-end: a preference statement ("prefiero mancuernas") without negation leaves available_equipment/equipment_fully_equipped untouched, per what the (simulated) LLM correctly returns', function () {
+    // Simula el comportamiento esperado de un LLM que sigue la nueva regla
+    // del prompt: una preferencia sin negación no se traduce a ninguno de
+    // los dos campos — ambos quedan null (todavía sin responder), nunca se
+    // fuerza "dumbbells" como si fuera disponibilidad exclusiva.
+    fakeCombinedResponse(combinedPayload([
+        'extracted' => emptyExtractedForTest(['available_equipment' => null, 'equipment_fully_equipped' => null]),
+    ]));
+
+    $result = (new OnboardingConversationService)->extractAndRespond(
+        'prefiero entrenar con mancuernas',
+        ['training_location' => 'gym', 'equipment_fully_equipped' => true],
+        Tenant::factory()->create(['ai_provider' => 'openai']),
+        'available_equipment',
+    );
+
+    expect($result['extracted']['available_equipment'])->toBeNull();
+    expect($result['extracted']['equipment_fully_equipped'])->toBeNull();
+});
+
 // ── Hito 8.4: objetivos específicos (primary_focus/secondary_focus) ────
 
 it('translates a simple muscle-focus phrase into the closed MuscleFocus vocabulary', function () {

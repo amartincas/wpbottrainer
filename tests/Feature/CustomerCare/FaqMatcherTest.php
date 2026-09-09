@@ -99,6 +99,70 @@ it('never depends on the total number of FAQs a tenant has — ranks by relevanc
     expect($candidates->first()->id)->toBe($mostRelevant->id); // la más relevante, primera
 });
 
+// ── Ronda 2 (piloto real), Cambio 6: vocabulario real de referidos ─────
+// FaqMatcher NO se modifica (sigue siendo el mismo LIKE sobre términos
+// significativos) — lo que cambia es el CONTENIDO de la FAQ, para que
+// comparta término literal con lo que un usuario real escribe. Solo dentro
+// de estos tests (factory) — el contenido real de staging queda fuera de
+// alcance de esta implementación.
+
+it('retrieves the referral FAQ for "puedo referir a alguien?" once its content explicitly includes the synonym "referir"', function () {
+    $tenant = Tenant::factory()->create();
+    $faq = Faq::factory()->create([
+        'tenant_id' => $tenant->id,
+        'question' => '¿Puedo recomendar o referir a mis amigos para que prueben la aplicación?',
+        'answer' => 'Sí, puedes invitar a tus amigos. Escríbeme mi código y te doy tu enlace de invitación personal para compartir por WhatsApp.',
+    ]);
+
+    $candidates = faqMatcher()->retrieveCandidates($tenant, 'Puedo referir a alguien?');
+
+    expect($candidates->pluck('id'))->toContain($faq->id);
+});
+
+it('retrieves the referral-benefit FAQ for "qué gano si refiero a alguien?" once its content explicitly includes the synonym "refiero"', function () {
+    $tenant = Tenant::factory()->create();
+    $faq = Faq::factory()->create([
+        'tenant_id' => $tenant->id,
+        'question' => '¿Qué beneficio obtengo si refiero a alguien y esa persona adquiere una suscripción?',
+        'answer' => 'Cuando la persona a la que refiero realiza su primera compra confirmada, yo recibo días adicionales de acceso.',
+    ]);
+
+    $candidates = faqMatcher()->retrieveCandidates($tenant, '¿Qué gano si refiero a alguien?');
+
+    expect($candidates->pluck('id'))->toContain($faq->id);
+});
+
+it('retrieves the referral FAQ for "dónde veo mi código de referido?" via the shared term "código"', function () {
+    $tenant = Tenant::factory()->create();
+    $faq = Faq::factory()->create([
+        'tenant_id' => $tenant->id,
+        'question' => '¿Puedo recomendar o referir a mis amigos para que prueben la aplicación?',
+        'answer' => 'Sí, puedes invitar a tus amigos. Escríbeme mi código y te doy tu enlace de invitación personal.',
+    ]);
+
+    $candidates = faqMatcher()->retrieveCandidates($tenant, '¿Dónde veo mi código de referido?');
+
+    expect($candidates->pluck('id'))->toContain($faq->id);
+});
+
+it('the referral FAQ is NOT retrieved for "quiero referir a alguien" with the ORIGINAL content (no synonym, no shared term at all) — proves the fix is the content, never FaqMatcher itself', function () {
+    // Nota: "Puedo referir a alguien?" YA comparte el término "puedo" con
+    // el contenido original ("¿Puedo recomendar..."), así que esa frase por
+    // sí sola no demuestra el problema real — se usa aquí una formulación
+    // sin NINGÚN término compartido con el contenido original, para aislar
+    // genuinamente el efecto del cambio de contenido.
+    $tenant = Tenant::factory()->create();
+    Faq::factory()->create([
+        'tenant_id' => $tenant->id,
+        'question' => '¿Puedo recomendar a mis amigos para que prueben la aplicación?', // contenido original, sin "referir"
+        'answer' => 'Sí, puedes invitar a tus amigos. Escríbeme mi código y te doy tu enlace de invitación personal para compartir por WhatsApp.',
+    ]);
+
+    $candidates = faqMatcher()->retrieveCandidates($tenant, 'quiero referir a alguien');
+
+    expect($candidates)->toBeEmpty();
+});
+
 // ── sanitize() ────────────────────────────────────────────────────────
 
 it('sanitize() leaves the result unchanged when faq_match_id is null', function () {

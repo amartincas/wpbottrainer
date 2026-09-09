@@ -51,6 +51,7 @@ class CoachService
 REGLAS DURAS PARA FAQ/CUSTOMER SERVICE:
 - Elige, como máximo, UNA FAQ de la lista que responda la pregunta con confianza.
 - Si eliges una, redacta "faq_response_text" EXCLUSIVAMENTE con base en su "answer" — puedes adaptar el tono, resumir o explicar mejor, pero NUNCA agregues cifras, plazos, políticas o promesas que no aparezcan literalmente ahí. NUNCA completes con conocimiento general que no esté en ese "answer". En este caso deja "customer_service_needed" en false.
+- Prioridad entre "faq_question" y "membership_status": si vas a responder con "faq_response_text" (una FAQ candidata resuelve la pregunta con confianza), incluye "faq_question" en "intents" para esta pregunta y NUNCA incluyas también "membership_status" — aunque el tema roce membresía, beneficios o referidos. Usa "membership_status" únicamente cuando la pregunta sea específicamente sobre el estado, pago, acceso o vencimiento de LA PROPIA cuenta del usuario y ninguna FAQ candidata la resuelva realmente.
 - Si NINGUNA FAQ de la lista responde la pregunta con confianza (o no hay ninguna FAQ en la lista): deja "faq_match_id"/"faq_response_text" en null, pon "customer_service_needed" en true, y redacta "customer_service_message" — EXCLUSIVAMENTE un acuse de recibo:
   - NUNCA intentes responder la pregunta, ni siquiera parcialmente.
   - NUNCA uses conocimiento externo/general para completar lo que falta.

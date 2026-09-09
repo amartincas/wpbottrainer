@@ -78,6 +78,54 @@ it('Training -> FAQ -> Customer Service, all during a real automatically-granted
     expect($workoutExercise->fresh()->exerciseLog)->not->toBeNull();
 });
 
+it('Ronda 2 (Cambio 6): a referral question answers with the FAQ, never the membership_status stub, when the AI correctly follows the new priority rule', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150003']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
+    app(TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+
+    // Mismo fixture que el primer test de este archivo: una sesión
+    // "en curso" (Scheduled, con su único ejercicio ya reportado) es lo
+    // que hace que el Router (TrainingIntentClassifier::hasPendingWorkoutSession())
+    // enrute ESTE mensaje a Training sin ninguna palabra clave — sin esto,
+    // una pregunta de referidos sin keyword de entrenamiento nunca llegaría
+    // a TrainingHandler/CoachService en absoluto.
+    $exercise = Exercise::factory()->create(['tracking_type' => TrackingType::RepsAndLoad]);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    $workoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(), 'prescribed_sets' => 3, 'prescribed_reps' => 10, 'prescribed_load' => 40,
+    ]);
+    $reportLog = \App\Models\ExerciseLog::factory()->create(['workout_exercise_id' => $workoutExercise->id]);
+    \App\Models\ExerciseSet::factory()->create(['exercise_log_id' => $reportLog->id]);
+
+    // Contenido corregido (Cambio 6) — solo dentro de este test, vía
+    // factory; la FAQ real de staging queda fuera de alcance de esta
+    // implementación.
+    $faq = Faq::factory()->create([
+        'tenant_id' => $tenant->id,
+        'question' => '¿Puedo recomendar o referir a mis amigos para que prueben la aplicación?',
+        'answer' => 'Sí, puedes invitar a tus amigos. Escríbeme mi código y te doy tu enlace de invitación personal.',
+    ]);
+
+    // Simula un LLM que ya sigue la nueva regla del prompt: responde con la
+    // FAQ y NUNCA incluye "membership_status" para la misma pregunta.
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+            'faq_match_id' => $faq->id, 'faq_response_text' => 'Sí, puedes invitar a tus amigos. Te doy tu enlace personal.',
+            'customer_service_needed' => false, 'customer_service_message' => null,
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    commercialInteractionMessage($tenant, '573001150003', '¿puedo referir a alguien?');
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Te doy tu enlace personal.'));
+    // El stub fijo de membership_status NUNCA debe acompañar la respuesta.
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Todavía no puedo resolver esto directamente'));
+});
+
 it('a reply after a fired Reminder can naturally continue into Training, without the Scheduler/Queue interfering with the commercial state', function () {
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150002']);

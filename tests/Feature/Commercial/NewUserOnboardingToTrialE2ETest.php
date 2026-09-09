@@ -102,6 +102,40 @@ it('a Contact acquired via a Referral is just as eligible for the automatic Tria
     expect(TrainingProfile::where('contact_id', $referred->id)->exists())->toBeTrue();
 });
 
+it('a new session delivery is ordered Trial notice -> header -> every exercise -> execution instructions, in that exact order', function () {
+    // Ronda 2 (piloto real), Cambios 2 y 4: el aviso de Trial (paso 3, tan
+    // pronto se concede) siempre antecede a la entrega; las instrucciones
+    // de ejecución (paso 6) siempre la cierran, después de TODOS los
+    // mensajes de ejercicio — nunca intercalada entre ellos.
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'trial_duration_days' => 5]);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001110004']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null, 'intents' => ['continue_training'], 'training_reply' => null,
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    commercialTrainingMessage($tenant, '573001110004', 'Dame mi entrenamiento de hoy');
+
+    $replyTexts = collect(Http::recorded())
+        ->filter(fn ($pair) => str_contains($pair[0]->url(), 'graph.facebook.com'))
+        ->map(fn ($pair) => data_get($pair[0]->data(), 'text.body'))
+        ->filter()
+        ->values();
+
+    $session = WorkoutSession::where('contact_id', $contact->id)->sole();
+    $exerciseCount = $session->workoutExercises->count();
+
+    expect($replyTexts->first())->toContain('período de prueba gratis');
+    expect($replyTexts->get(1))->toBe('🔥 Tu entrenamiento de hoy');
+    expect($replyTexts->last())->toContain('ya terminé');
+    // aviso de Trial + header + un mensaje por ejercicio + cierre.
+    expect($replyTexts)->toHaveCount(2 + $exerciseCount + 1);
+});
+
 it('a Contact who already had a confirmed Payment historically is never granted an automatic Trial, even if somehow their TrainingAccess row went missing', function () {
     // Caso defensivo (probado a fondo en AutomaticTrialProvisionerTest) —
     // aquí se confirma el mismo comportamiento a través del Job real.

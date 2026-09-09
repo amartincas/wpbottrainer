@@ -11,9 +11,9 @@ use App\Training\Support\ExerciseMessageFormatter;
  * en cada test, exactamente como lo produce `Exercise::toSnapshot()` en
  * producción, para probar el contrato real, no un atajo.
  */
-function makeWorkoutExerciseWithSnapshot(array $snapshotOverrides = [], array $prescriptionOverrides = []): WorkoutExercise
+function makeWorkoutExerciseWithSnapshot(array $snapshotOverrides = [], array $prescriptionOverrides = [], array $exerciseOverrides = []): WorkoutExercise
 {
-    $exercise = Exercise::factory()->create();
+    $exercise = Exercise::factory()->create($exerciseOverrides);
     $session = WorkoutSession::factory()->create();
 
     $snapshot = array_merge($exercise->toSnapshot(), $snapshotOverrides);
@@ -132,4 +132,63 @@ it('always mentions the video, regardless of how much technique content exists',
 
     expect($formatter->format($rich, 1))->toContain('🎥 Video a continuación');
     expect($formatter->format($bare, 1))->toContain('🎥 Video a continuación');
+});
+
+// ── Ronda 2 (piloto real), Cambio 3: orientación de peso cuando no hay
+// ninguna carga calculada todavía — nunca inventa un número. ───────────
+
+it('adds a plain-language weight-selection instruction when prescribed_load is null for an exercise that needs load-bearing equipment', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        prescriptionOverrides: ['prescribed_load' => null, 'prescribed_duration_seconds' => null],
+        exerciseOverrides: ['equipment_needed' => ['dumbbells']],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('Elige un peso');
+    expect($text)->toContain('Cuéntame qué peso usaste');
+    expect($text)->not->toContain('RPE'); // nunca jerga técnica de cara al usuario
+});
+
+it('never adds the weight-selection instruction for a bodyweight exercise (no equipment needed), even with prescribed_load null', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        prescriptionOverrides: ['prescribed_load' => null, 'prescribed_duration_seconds' => null],
+        exerciseOverrides: ['equipment_needed' => []],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('Elige un peso');
+});
+
+it('never adds the weight-selection instruction once a real load has been prescribed', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        prescriptionOverrides: ['prescribed_load' => 40, 'prescribed_duration_seconds' => null],
+        exerciseOverrides: ['equipment_needed' => ['dumbbells']],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('Elige un peso');
+});
+
+it('never adds the weight-selection instruction for a time-based exercise, regardless of equipment', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        prescriptionOverrides: ['prescribed_load' => null, 'prescribed_reps' => null, 'prescribed_duration_seconds' => 30],
+        exerciseOverrides: ['equipment_needed' => ['dumbbells']],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('Elige un peso');
+});
+
+it('never assumes an exercise needs load when its live Exercise relation cannot be resolved', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(prescriptionOverrides: ['prescribed_load' => null, 'prescribed_duration_seconds' => null]);
+    $workoutExercise->exercise()->delete();
+    $workoutExercise->refresh();
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('Elige un peso');
 });

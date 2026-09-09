@@ -45,6 +45,12 @@ class ExerciseMessageFormatter
         $lines[] = "{$order}. *{$snapshot['name']}* — {$this->formatPrescription($workoutExercise)}";
         $lines[] = '';
 
+        $weightGuidance = $this->weightGuidance($workoutExercise);
+        if ($weightGuidance !== null) {
+            $lines[] = $weightGuidance;
+            $lines[] = '';
+        }
+
         $technique = $this->techniqueBullets($snapshot);
         if ($technique !== []) {
             $lines[] = '📋 Técnica:';
@@ -71,6 +77,43 @@ class ExerciseMessageFormatter
         $lines[] = '🎥 Video a continuación';
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * Hito 15.1 (Ronda 2, Cambio 3) — SOLO cuando `TrainingEngine` todavía
+     * no calculó ninguna carga (decisión "insufficient_data" —
+     * ver `numericPrescriptionFor()` — nunca inventa un peso) Y el
+     * ejercicio realmente requiere equipo de carga externa — nunca para
+     * un ejercicio de peso corporal, donde "elige un peso" no tendría
+     * sentido.
+     *
+     * `equipment_needed` NO vive en `exercise_snapshot` (histórico,
+     * congelado — ver `Exercise::toSnapshot()`) — se lee de la relación
+     * `Exercise` EN VIVO, únicamente para decidir SI se muestra esta
+     * orientación, nunca para reconstruir ni alterar ningún dato
+     * histórico del snapshot (mismo criterio que ya usa `TrainingHandler`
+     * para resolver el video vía `MediaResolver`). Si la relación no
+     * resuelve (ejercicio borrado) o `equipment_needed` no puede
+     * determinarse, se omite la orientación — nunca se asume que el
+     * ejercicio requiere carga.
+     *
+     * Lenguaje natural, sin exponer "RPE" (jerga interna) al usuario —
+     * mismo criterio que el resto de mensajes del bot.
+     */
+    private function weightGuidance(WorkoutExercise $workoutExercise): ?string
+    {
+        if ($workoutExercise->prescribed_duration_seconds !== null || $workoutExercise->prescribed_load !== null) {
+            return null;
+        }
+
+        $equipmentNeeded = $workoutExercise->exercise?->equipment_needed;
+
+        if (! is_array($equipmentNeeded) || $equipmentNeeded === []) {
+            return null;
+        }
+
+        return 'Elige un peso con el que las últimas 2-3 repeticiones te cuesten de verdad, sin perder la técnica. '
+            .'Cuéntame qué peso usaste cuando reportes, así ajusto la próxima vez.';
     }
 
     private function formatPrescription(WorkoutExercise $workoutExercise): string
