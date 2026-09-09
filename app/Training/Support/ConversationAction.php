@@ -17,6 +17,7 @@ final readonly class ConversationAction
         public ?array $report = null,
         public ?string $safetyReason = null,
         public ?array $reminderData = null,
+        public bool $isFaqFallback = false,
     ) {}
 
     public static function escalateSafety(string $reason): self
@@ -82,5 +83,29 @@ final readonly class ConversationAction
     public static function offerProactiveReminder(array $data): self
     {
         return new self(ConversationActionType::OfferProactiveReminder, reminderData: $data);
+    }
+
+    /**
+     * Hito 14 — `$text` ya viene REDACTADO por la IA (grounded en el
+     * `answer` de la FAQ elegida, ver `App\Training\Support\CoachService`)
+     * — este resolver nunca conoce `App\CustomerCare\Models\Faq` ni hace
+     * ninguna consulta, solo transporta el texto ya final.
+     */
+    public static function answerFaq(string $text): self
+    {
+        return new self(ConversationActionType::AnswerFaq, text: $text);
+    }
+
+    /**
+     * Hito 14 — `$text` es el acuse de recibo ya redactado por la IA
+     * (FAQ sin candidato válido) o `null` (petición explícita de Customer
+     * Service, o salida de la IA descartada por `FaqMatcher::sanitize()`)
+     * — en ese caso `TrainingHandler` decide el texto fijo de respaldo
+     * correcto según `$isFaqFallback` (nunca esta clase ni el resolver,
+     * que siguen sin importar nada de `App\CustomerCare`).
+     */
+    public static function requestCustomerService(?string $text = null, bool $isFaqFallback = false): self
+    {
+        return new self(ConversationActionType::RequestCustomerService, text: $text, isFaqFallback: $isFaqFallback);
     }
 }

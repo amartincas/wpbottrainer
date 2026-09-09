@@ -26,4 +26,11 @@ enum ConversationActionType: string
      * App\Training\Support\ConversationAction::offerProactiveReminder().
      */
     case OfferProactiveReminder = 'offer_proactive_reminder';
+
+    /**
+     * Hito 14 — FAQ/Customer Service como interrupciones conversacionales,
+     * nunca un cambio de contexto: ver App\Training\Support\ConversationAction.
+     */
+    case AnswerFaq = 'answer_faq';
+    case RequestCustomerService = 'request_customer_service';
 }

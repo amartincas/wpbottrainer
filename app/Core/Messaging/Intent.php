@@ -29,6 +29,19 @@ namespace App\Core\Messaging;
  * (PreRoutingScreener, before this Intent is even classified) precisely
  * because it must run regardless of which Intent the message would
  * otherwise resolve to.
+ *
+ * `CustomerCare` was added in Hito 14 — FAQ + Customer Service for a
+ * message with NO Training/Payment/Referral signal (the "standalone"
+ * case). Two classifiers can produce it (App\CustomerCare\Support\
+ * CustomerServiceEscalationIntentClassifier, tried FIRST — an explicit
+ * escalation phrase must win over any accidental keyword collision with
+ * another domain; and FaqLikelyIntentClassifier, tried LAST, right before
+ * the FallbackChat default), one Handler (App\CustomerCare\Handlers\
+ * CustomerCareHandler). The equivalent capability DURING an active
+ * Training turn does not use this Intent at all — it is resolved inside
+ * Training's own multi-intent turn engine (DetectedIntentType::FaqQuestion/
+ * CustomerServiceRequest, ConversationTurnResolver) so the interruption
+ * never leaves/replaces the active Training context. See docs/DECISIONS.md.
  */
 enum Intent: string
 {
@@ -36,4 +49,5 @@ enum Intent: string
     case Training = 'training';
     case Payment = 'payment';
     case Referral = 'referral';
+    case CustomerCare = 'customer_care';
 }

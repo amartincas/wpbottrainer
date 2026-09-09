@@ -11,6 +11,9 @@ use App\Core\Messaging\Intent;
 use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Core\Reminders\ReminderDispatcher;
+use App\CustomerCare\Handlers\CustomerCareHandler;
+use App\CustomerCare\Support\CustomerServiceEscalationIntentClassifier;
+use App\CustomerCare\Support\FaqLikelyIntentClassifier;
 use App\Handlers\FallbackChatHandler;
 use App\Payments\Events\PaymentConfirmed;
 use App\Payments\Handlers\PaymentHandler;
@@ -58,10 +61,20 @@ class AppServiceProvider extends ServiceProvider
         // (not instances) tried in sequence — the first one that recognizes
         // the message wins, defaulting to Intent::FallbackChat if none do.
         // See App\Core\Messaging\Router and docs/DECISIONS.md (D019).
+        // Hito 14 — CustomerServiceEscalationIntentClassifier se prueba
+        // PRIMERO: una petición explícita de ayuda humana debe ganarle a
+        // cualquier colisión accidental de keyword con otro dominio (ej.
+        // "Tengo un problema con el pago" contiene "pago", keyword de
+        // PaymentIntentClassifier — ver docs/DECISIONS.md).
+        // FaqLikelyIntentClassifier se prueba ÚLTIMO, justo antes del
+        // default a FallbackChat — su heurística es deliberadamente amplia
+        // y nunca debe competir con Training/Payment/Referral.
         $this->app->singleton(Router::class, fn ($app) => new Router($app, [
+            CustomerServiceEscalationIntentClassifier::class,
             TrainingIntentClassifier::class,
             PaymentIntentClassifier::class,
             ReferralIntentClassifier::class,
+            FaqLikelyIntentClassifier::class,
         ]));
 
         // Core messaging PreRoutingScreener (Hito 7, extendido Hito 13):
@@ -99,6 +112,7 @@ class AppServiceProvider extends ServiceProvider
             Intent::Training->value => TrainingHandler::class,
             Intent::Payment->value => PaymentHandler::class,
             Intent::Referral->value => ReferralHandler::class,
+            Intent::CustomerCare->value => CustomerCareHandler::class,
         ]));
 
         // Core memory ContextBuilder: same Container-resolution pattern as

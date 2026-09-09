@@ -5,6 +5,7 @@ namespace App\Training\Support;
 use App\Factories\AIServiceFactory;
 use App\Models\Tenant;
 use App\Training\Context\CoachContext;
+use App\Training\Context\CoachFaqCandidate;
 use App\Training\Enums\DetectedIntentType;
 use Illuminate\Support\Facades\Log;
 
@@ -23,18 +24,44 @@ use Illuminate\Support\Facades\Log;
  * Puede detectar MÚLTIPLES `intents` en el mismo mensaje (Bloque 9,
  * corrección multi-intent) — nunca un enum singular. `training_reply` es
  * como máximo un texto por turno, grounded en `CoachContext` (via
- * `CoachFactsFormatter`), nunca inventado para `membership_status`/
- * `faq_question` (esos dominios no tienen hechos disponibles todavía).
+ * `CoachFactsFormatter`), nunca inventado para `membership_status`
+ * (Commercial no implementado, fuera de alcance).
+ *
+ * Hito 14 — `faq_match_id`/`faq_response_text`/`customer_service_needed`/
+ * `customer_service_message`: el bloque de evaluación de FAQ/Customer
+ * Service SOLO se incluye en el prompt cuando `CoachContext->activeFaqs`
+ * no es `null` (gate determinista ya decidido por `CoachContextProvider`,
+ * sin IA) — la gran mayoría de los turnos no lo incluye en absoluto. Esta
+ * clase nunca importa nada de `App\CustomerCare` — solo itera los
+ * escalares de `CoachFaqCandidate` que ya recibió. La IA redacta la
+ * respuesta final grounded exclusivamente en el `answer` del candidato
+ * elegido, o un acuse de recibo si ninguno aplica — nunca inventa, nunca
+ * responde parcialmente (ver docs/DECISIONS.md).
  */
 class CoachService
 {
     private const EMPTY_RESULT = [
         'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
         'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        'customer_service_needed' => false, 'customer_service_message' => null,
     ];
 
+    private const FAQ_RULES = <<<'RULES'
+REGLAS DURAS PARA FAQ/CUSTOMER SERVICE:
+- Elige, como máximo, UNA FAQ de la lista que responda la pregunta con confianza.
+- Si eliges una, redacta "faq_response_text" EXCLUSIVAMENTE con base en su "answer" — puedes adaptar el tono, resumir o explicar mejor, pero NUNCA agregues cifras, plazos, políticas o promesas que no aparezcan literalmente ahí. NUNCA completes con conocimiento general que no esté en ese "answer". En este caso deja "customer_service_needed" en false.
+- Si NINGUNA FAQ de la lista responde la pregunta con confianza (o no hay ninguna FAQ en la lista): deja "faq_match_id"/"faq_response_text" en null, pon "customer_service_needed" en true, y redacta "customer_service_message" — EXCLUSIVAMENTE un acuse de recibo:
+  - NUNCA intentes responder la pregunta, ni siquiera parcialmente.
+  - NUNCA uses conocimiento externo/general para completar lo que falta.
+  - NUNCA inventes plazos de respuesta ("en 24 horas", "pronto").
+  - NUNCA prometas una solución o resultado.
+  - NUNCA afirmes que alguien ya está atendiendo el caso.
+  - Solo indica que la consulta quedó registrada y que el equipo responderá por este mismo medio. Ejemplo de tono: "No tengo información suficiente para responderte con precisión. Ya estoy consultando esta pregunta con nuestro equipo para darte una respuesta correcta."
+RULES;
+
     /**
-     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool}
+     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool, faq_match_id: ?int, faq_response_text: ?string, customer_service_needed: bool, customer_service_message: ?string}
      */
     public function respond(string $messageBody, CoachContext $coachContext, Tenant $tenant): array
     {
@@ -58,6 +85,7 @@ class CoachService
     {
         $facts = (new CoachFactsFormatter)->format($coachContext);
         $intentValues = json_encode(array_map(fn (DetectedIntentType $type) => $type->value, DetectedIntentType::cases()));
+        $faqSection = $this->buildFaqSection($coachContext);
 
         return <<<PROMPT
 Eres el entrenador personal conversacional de WpbotTrainer, hablando por WhatsApp. Tono profesional, natural, directo — sin frases motivacionales vacías, sin inventar datos.
@@ -84,7 +112,8 @@ Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber
 - "reminder_modify": el usuario quiere cambiar un recordatorio ya configurado ("cámbialo para las 8").
 - "mentioned_forgetting": el usuario menciona una dificultad genérica para entrenar por su cuenta, SIN pedir un recordatorio ni dar día/hora ("siempre se me olvida entrenar", "no tengo constancia", "se me pasa por alto entrenar"). Es una señal, no una petición — NUNCA extraigas "reminder_day"/"reminder_time"/"reminder_recurrence" para este caso; el sistema decide si ofrece algo.
 - "asked_when_to_train": el usuario pregunta genéricamente cuándo debería entrenar, sin pedir un recordatorio explícitamente ("¿cuándo debería entrenar?", "¿qué días me conviene entrenar?"). Puede combinarse con "general_conversation" si además esperas que respondas la pregunta en "training_reply".
-
+- "customer_service_request": el usuario pide EXPLÍCITAMENTE hablar con una persona/atención humana, o describe un problema que necesita que un humano lo resuelva ("necesito hablar con alguien", "tengo un problema con el pago", "el video no carga y necesito ayuda"). Distinto de "faq_question" — no es una pregunta que una FAQ pueda responder, es una petición directa de ayuda humana.
+{$faqSection}
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 {
   "safety_signal_text": "<frase textual del usuario si menciona dolor de pecho, dificultad para respirar, desmayo, cirugía reciente, entumecimiento severo, lesión grave repentina o embarazo de riesgo>" | null,
@@ -93,11 +122,65 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" (SOLO si el usuario mencionó un día, para crear/modificar/confirmar-con-cambio un recordatorio) | null,
   "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
   "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
-  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.
+  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.{$this->faqJsonFields($coachContext)}
 }
+{$this->faqRulesFooter($coachContext)}
 
-Para "membership_status"/"faq_question" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta. El código, nunca tú, calcula la fecha/hora real y crea/modifica cualquier recordatorio — solo extraes lo que el usuario dijo, en el vocabulario cerrado de arriba.
+Para "membership_status" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde ese dominio por su cuenta. El código, nunca tú, calcula la fecha/hora real y crea/modifica cualquier recordatorio — solo extraes lo que el usuario dijo, en el vocabulario cerrado de arriba.
 PROMPT;
+    }
+
+    /**
+     * Hito 14 — solo se construye (y por tanto solo agrega texto/costo al
+     * prompt) cuando `CoachContextProvider` ya determinó, de forma
+     * determinista, que este turno podría necesitar FAQ/Customer Service
+     * (`activeFaqs !== null`). La ausencia de candidatos (`[]`) NUNCA
+     * equivale a la ausencia de este bloque — ver docs/DECISIONS.md.
+     */
+    private function buildFaqSection(CoachContext $coachContext): string
+    {
+        if ($coachContext->activeFaqs === null) {
+            return '';
+        }
+
+        if ($coachContext->activeFaqs === []) {
+            return <<<'TXT'
+
+No existen FAQs candidatas para esta consulta. No intentes responder la
+pregunta bajo ninguna circunstancia — no tienes ningún contexto autorizado
+del que partir.
+
+TXT;
+        }
+
+        $candidatesJson = json_encode(
+            array_map(fn (CoachFaqCandidate $c) => ['id' => $c->id, 'question' => $c->question, 'answer' => $c->answer], $coachContext->activeFaqs),
+            JSON_UNESCAPED_UNICODE
+        );
+
+        return <<<TXT
+
+Dispones de esta lista de FAQs activas relevantes a la pregunta actual:
+{$candidatesJson}
+
+TXT;
+    }
+
+    private function faqJsonFields(CoachContext $coachContext): string
+    {
+        if ($coachContext->activeFaqs === null) {
+            return '';
+        }
+
+        return "\n  \"faq_match_id\": <id numérico de la lista de arriba> | null,"
+            ."\n  \"faq_response_text\": \"<redacción grounded en el answer elegido>\" | null,"
+            ."\n  \"customer_service_needed\": true | false,"
+            ."\n  \"customer_service_message\": \"<acuse de recibo, SOLO si customer_service_needed es true>\" | null,";
+    }
+
+    private function faqRulesFooter(CoachContext $coachContext): string
+    {
+        return $coachContext->activeFaqs === null ? '' : self::FAQ_RULES."\n";
     }
 
     private function parseJson(string $raw): array
@@ -121,6 +204,14 @@ PROMPT;
                 ? $decoded['training_reply']
                 : null,
             ...ReminderExtractionFields::validate($decoded),
+            'faq_match_id' => is_int($decoded['faq_match_id'] ?? null) ? $decoded['faq_match_id'] : null,
+            'faq_response_text' => is_string($decoded['faq_response_text'] ?? null) && trim($decoded['faq_response_text']) !== ''
+                ? $decoded['faq_response_text']
+                : null,
+            'customer_service_needed' => ($decoded['customer_service_needed'] ?? false) === true,
+            'customer_service_message' => is_string($decoded['customer_service_message'] ?? null) && trim($decoded['customer_service_message']) !== ''
+                ? $decoded['customer_service_message']
+                : null,
         ];
     }
 }

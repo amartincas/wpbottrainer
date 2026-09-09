@@ -1,9 +1,13 @@
 <?php
 
+use App\CustomerCare\Models\CustomerServiceRequest;
+use App\CustomerCare\Models\Faq;
 use App\Jobs\ProcessWhatsAppMessage;
+use App\Models\AlertLog;
 use App\Models\Contact;
 use App\Models\Exercise;
 use App\Models\ExerciseLog;
+use App\Models\ExerciseSet;
 use App\Models\Tenant;
 use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
@@ -405,4 +409,141 @@ it('a malicious message in recent WhatsApp history never alters prescribed_* nor
     expect((float) $workoutExercise->fresh()->prescribed_load)->toBe(40.0); // sin cambios
     $profile = TrainingProfile::where('contact_id', $contact->id)->first();
     expect($profile->isFlaggedForSafetyReview())->toBeFalse();
+});
+
+// ── Hito 14: alternancia Training <-> FAQ/Customer Service ──
+
+/**
+ * Sesión `Scheduled` con TODOS sus ejercicios ya reportados (ExerciseLog +
+ * ExerciseSet creados directamente, sin pasar por el flujo de reporte) —
+ * `unreported_exercises` queda vacío, así que el paso 4 (ExecutionReportService,
+ * que documentadamente NO recibe candidatos de FAQ) nunca se activa y todo
+ * turno posterior pasa por el paso 5 (Coach), que SÍ evalúa FAQ/Customer
+ * Service — el escenario correcto para probar la interrupción dentro de
+ * Training sin chocar con la limitación de alcance ya documentada.
+ *
+ * @return array{0: WorkoutSession, 1: WorkoutExercise}
+ */
+function interruptionFullyReportedSession(Contact $contact): array
+{
+    $exercise = Exercise::factory()->create(['name' => 'Sentadilla', 'tracking_type' => TrackingType::RepsAndLoad]);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    $workoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id,
+        'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(),
+        'prescribed_sets' => 3,
+        'prescribed_reps' => 10,
+        'prescribed_load' => 40,
+    ]);
+    $log = ExerciseLog::factory()->create(['workout_exercise_id' => $workoutExercise->id]);
+    ExerciseSet::factory()->create(['exercise_log_id' => $log->id]);
+
+    return [$session, $workoutExercise];
+}
+
+it('Hito 14: Training -> FAQ -> Training -> Customer Service -> Training preserves the active session across both interruptions', function () {
+    $contact = interruptionReadyContact();
+    [$session, $workoutExercise] = interruptionFullyReportedSession($contact);
+    $faq = Faq::factory()->create([
+        'tenant_id' => $contact->tenant_id,
+        'question' => '¿Cuál es el horario de atención?',
+        'answer' => 'Abrimos de lunes a sábado, de 6am a 9pm.',
+    ]);
+
+    // Las 4 respuestas de IA, una por turno — en una única secuencia (varias
+    // llamadas a Http::fake() dentro del mismo test NO reemplazan un stub ya
+    // registrado para el mismo patrón de URL, se acumulan y gana el primero
+    // — de ahí una sola llamada con Http::sequence(), como ya hace el resto
+    // de esta suite para más de un turno por test).
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::sequence()
+            ->push(interruptionChatBody([ // Turno 1: FAQ con candidato real
+                'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+                'faq_match_id' => $faq->id,
+                'faq_response_text' => 'Atendemos de lunes a sábado entre las 6am y las 9pm.',
+                'customer_service_needed' => false, 'customer_service_message' => null,
+            ]))
+            ->push(interruptionChatBody([ // Turno 2: pregunta de entrenamiento normal
+                'safety_signal_text' => null, 'intents' => ['exercise_question'],
+                'training_reply' => 'Trabajamos sentadilla porque tu perfil prioriza piernas.',
+            ]))
+            ->push(interruptionChatBody([ // Turno 3: Customer Service explícito
+                'safety_signal_text' => null, 'intents' => ['customer_service_request'], 'training_reply' => null,
+                'faq_match_id' => null, 'faq_response_text' => null,
+                'customer_service_needed' => false, 'customer_service_message' => null,
+            ]))
+            ->push(interruptionChatBody([ // Turno 4: Training continúa con normalidad
+                'safety_signal_text' => null, 'intents' => ['exercise_question'],
+                'training_reply' => 'Vas muy bien, seguimos con el mismo plan.',
+            ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    // Turno 1: interrupción FAQ, con un candidato real -> la IA redacta la
+    // respuesta grounded en el "answer" del catálogo, nunca lo copia literal.
+    sendInterruptionMessage($contact, '¿cuál es el horario de atención?');
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Atendemos de lunes a sábado entre las 6am y las 9pm.'));
+    expect(CustomerServiceRequest::count())->toBe(0);
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    expect($workoutExercise->fresh()->exerciseLog)->not->toBeNull();
+
+    // Turno 2: vuelve a Training con una pregunta normal — el contexto de la
+    // sesión activa sigue disponible, sin haberse perdido por la interrupción.
+    sendInterruptionMessage($contact, '¿por qué hago sentadilla?');
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Trabajamos sentadilla'));
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+
+    // Turno 3: interrupción de Customer Service, detectada por la IA como
+    // intent DENTRO del mismo turno de Coach (el mensaje deliberadamente NO
+    // contiene ninguna de las frases del vocabulario cerrado de
+    // `CustomerServiceEscalationDetector` — si las contuviera, el Router la
+    // interceptaría ANTES de Training, vía el camino INDEPENDIENTE de
+    // CustomerCareHandler, no el de interrupción que este test cubre).
+    sendInterruptionMessage($contact, 'Tengo un tema que no logro resolver, ¿me puede orientar un asesor?');
+
+    $csRequest = CustomerServiceRequest::where('contact_id', $contact->id)->sole();
+    expect($csRequest->message)->toBe('Tengo un tema que no logro resolver, ¿me puede orientar un asesor?');
+    expect(AlertLog::where('category', 'customer_service')->count())->toBe(1);
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), \App\CustomerCare\Support\CustomerServiceRequestRecorder::EXPLICIT_REQUEST_TEXT));
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    expect($workoutExercise->fresh()->exerciseLog)->not->toBeNull();
+
+    // Turno 4: Training continúa con normalidad tras ambas interrupciones.
+    sendInterruptionMessage($contact, '¿cómo voy con mi plan?');
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Vas muy bien, seguimos con el mismo plan.'));
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    expect(CustomerServiceRequest::count())->toBe(1); // no se duplicó en el turno 4
+});
+
+it('Hito 14 (v6): Training activo -> pregunta FAQ SIN candidatos escala igual con exactamente 1 llamada IA, usando el acuse de recibo redactado por la IA, y la sesión queda intacta', function () {
+    $contact = interruptionReadyContact();
+    [$session, $workoutExercise] = interruptionFullyReportedSession($contact);
+    // Deliberadamente CERO Faq creadas para este tenant.
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(interruptionChatBody([
+            'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+            'faq_match_id' => null, 'faq_response_text' => null,
+            'customer_service_needed' => true,
+            'customer_service_message' => 'No tengo esa información todavía, ya la estoy consultando con el equipo.',
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendInterruptionMessage($contact, '¿tienen parqueadero disponible?');
+
+    $openAiCalls = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'));
+    expect($openAiCalls)->toHaveCount(1); // una sola llamada, incluso con 0 candidatos
+
+    $request = CustomerServiceRequest::where('contact_id', $contact->id)->sole();
+    expect($request->message)->toBe('¿tienen parqueadero disponible?');
+    expect(AlertLog::where('category', 'customer_service')->count())->toBe(1);
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'No tengo esa información todavía, ya la estoy consultando con el equipo.'));
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    expect($workoutExercise->fresh()->exerciseLog)->not->toBeNull();
 });

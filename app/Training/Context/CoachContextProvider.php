@@ -5,9 +5,14 @@ namespace App\Training\Context;
 use App\Core\Memory\ContextFragment;
 use App\Core\Memory\ContextProviderInterface;
 use App\Core\Messaging\ExecutionContext;
+use App\CustomerCare\Models\Faq;
+use App\CustomerCare\Support\CustomerServiceEscalationDetector;
+use App\CustomerCare\Support\FaqMatcher;
+use App\CustomerCare\Support\FaqRelevanceDetector;
 use App\Models\Contact;
 use App\Models\ExerciseSet;
 use App\Models\ReminderSuggestion;
+use App\Models\Tenant;
 use App\Models\WhatsAppMessage;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
@@ -44,6 +49,9 @@ class CoachContextProvider implements ContextProviderInterface
     public function __construct(
         private readonly TrainingHistoryContextProvider $historyProvider,
         private readonly ProgressionEvaluator $progressionEvaluator,
+        private readonly FaqRelevanceDetector $faqRelevance,
+        private readonly CustomerServiceEscalationDetector $csEscalation,
+        private readonly FaqMatcher $faqMatcher,
     ) {}
 
     public function provide(ExecutionContext $context): ContextFragment
@@ -66,6 +74,7 @@ class CoachContextProvider implements ContextProviderInterface
         $progressionEvaluations = $this->evaluateProgressionsFor($currentSession, $historyContext);
         $recentMessages = $this->recentMessagesFor($context);
         $pendingReminderSuggestion = $this->pendingReminderSuggestionFor($contact);
+        $activeFaqs = $this->relevantFaqsFor($context->tenant, $context->message->messageBody ?? '');
 
         $coachContext = new CoachContext(
             profileSnapshot: $historyContext->currentProfileSnapshot,
@@ -74,6 +83,7 @@ class CoachContextProvider implements ContextProviderInterface
             progressionEvaluations: $progressionEvaluations,
             recentMessages: $recentMessages,
             pendingReminderSuggestion: $pendingReminderSuggestion,
+            activeFaqs: $activeFaqs,
         );
 
         return new ContextFragment(
@@ -243,5 +253,32 @@ class CoachContextProvider implements ContextProviderInterface
             time: $params['time'] ?? null,
             recurring: (bool) ($params['recurring'] ?? false),
         );
+    }
+
+    /**
+     * Hito 14 — gate determinista (sin IA) que decide si este turno debe
+     * incluir el bloque de evaluación FAQ/Customer Service en el prompt de
+     * `CoachService`. `App\CustomerCare\Models\Faq` solo se consulta AQUÍ
+     * — ningún otro archivo de `App\Training` conoce ese modelo (ver
+     * docs/DECISIONS.md).
+     *
+     * `null` = el gate no se activó, `CoachService` ni construye el bloque.
+     * `[]` = el gate SÍ se activó pero no hubo candidatos — el bloque SÍ se
+     * incluye, con la variante de "sin candidatos" (la ausencia de
+     * candidatos nunca equivale a ausencia del bloque de evaluación).
+     *
+     * @return ?array<int, CoachFaqCandidate>
+     */
+    private function relevantFaqsFor(Tenant $tenant, string $body): ?array
+    {
+        $mightNeedFaq = $this->faqRelevance->looksLikeFaqQuestion($body) || $this->csEscalation->detect($body);
+
+        if (! $mightNeedFaq) {
+            return null;
+        }
+
+        return $this->faqMatcher->retrieveCandidates($tenant, $body)
+            ->map(fn (Faq $faq) => new CoachFaqCandidate($faq->id, $faq->question, $faq->answer))
+            ->all();
     }
 }

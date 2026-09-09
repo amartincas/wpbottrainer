@@ -37,6 +37,7 @@ function minimalCoachContext(array $overrides = []): CoachContext
         historyContext: $overrides['historyContext'] ?? $historyContext,
         progressionEvaluations: $overrides['progressionEvaluations'] ?? [],
         recentMessages: $overrides['recentMessages'] ?? [],
+        activeFaqs: $overrides['activeFaqs'] ?? null,
     );
 }
 
@@ -50,7 +51,7 @@ it('returns an empty result for an empty message, without calling the AI provide
 
     $result = (new CoachService)->respond('', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
     Http::assertNothingSent();
 });
 
@@ -111,7 +112,7 @@ it('degrades to an empty result when the AI provider fails, without throwing', f
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
 });
 
 it('degrades to an empty result when the AI response is not valid JSON', function () {
@@ -119,7 +120,7 @@ it('degrades to an empty result when the AI response is not valid JSON', functio
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
 });
 
 it('treats an empty/blank training_reply as null, never an empty string action', function () {
@@ -169,4 +170,82 @@ it('never references any TrainingRestriction/DeclaredHealthCondition/SafetyRestr
     expect($source)->not->toContain('prescribed_');
     expect($source)->not->toContain('::query(');
     expect($source)->not->toContain('DB::');
+});
+
+// ── Hito 14 — FAQ/Customer Service ──────────────────────────────────────
+
+it('never imports App\CustomerCare — only iterates scalars already received on CoachContext', function () {
+    $source = file_get_contents(app_path('Training/Support/CoachService.php'));
+
+    expect($source)->not->toContain('use App\CustomerCare');
+});
+
+it('does NOT include the FAQ block in the prompt when activeFaqs is null (gate not activated)', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+    ]))]);
+
+    (new CoachService)->respond('cuánto pesa la barra', minimalCoachContext(['activeFaqs' => null]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return ! str_contains($systemMessage['content'], 'faq_match_id')
+            && ! str_contains($systemMessage['content'], 'REGLAS DURAS PARA FAQ');
+    });
+});
+
+it('includes the "no candidates" instruction when activeFaqs is an empty array (gate activated, zero candidates)', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        'customer_service_needed' => true, 'customer_service_message' => 'Ya estoy consultando esto con el equipo.',
+    ]))]);
+
+    $result = (new CoachService)->respond('¿puedo congelar mi membresía?', minimalCoachContext(['activeFaqs' => []]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], 'No existen FAQs candidatas para esta consulta')
+            && str_contains($systemMessage['content'], 'faq_match_id');
+    });
+    expect($result['customer_service_needed'])->toBeTrue();
+    expect($result['customer_service_message'])->toBe('Ya estoy consultando esto con el equipo.');
+});
+
+it('includes the real candidate list (question AND answer) when activeFaqs has candidates', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => 7, 'faq_response_text' => 'Redacción de la IA.',
+        'customer_service_needed' => false, 'customer_service_message' => null,
+    ]))]);
+
+    $candidate = new \App\Training\Context\CoachFaqCandidate(7, '¿Cuál es el horario?', 'Abrimos de 8am a 6pm.');
+    $result = (new CoachService)->respond('¿a qué hora abren?', minimalCoachContext(['activeFaqs' => [$candidate]]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], '¿Cuál es el horario?')
+            && str_contains($systemMessage['content'], 'Abrimos de 8am a 6pm.');
+    });
+    expect($result['faq_match_id'])->toBe(7);
+    expect($result['faq_response_text'])->toBe('Redacción de la IA.');
+});
+
+it('parses faq_match_id/faq_response_text/customer_service_needed/customer_service_message defensively', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+        'faq_match_id' => 'not-an-int', 'faq_response_text' => '   ',
+        'customer_service_needed' => 'yes', 'customer_service_message' => 123,
+    ]))]);
+
+    $candidate = new \App\Training\Context\CoachFaqCandidate(1, 'q', 'a');
+    $result = (new CoachService)->respond('mensaje', minimalCoachContext(['activeFaqs' => [$candidate]]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['faq_match_id'])->toBeNull(); // no era un int real
+    expect($result['faq_response_text'])->toBeNull(); // blanco -> null
+    expect($result['customer_service_needed'])->toBeFalse(); // no era exactamente true
+    expect($result['customer_service_message'])->toBeNull(); // no era string
 });

@@ -35,6 +35,9 @@ function coachContextProvider(): CoachContextProvider
     return new CoachContextProvider(
         new TrainingHistoryContextProvider($safetyResolver),
         new ProgressionEvaluator,
+        new \App\CustomerCare\Support\FaqRelevanceDetector,
+        new \App\CustomerCare\Support\CustomerServiceEscalationDetector,
+        new \App\CustomerCare\Support\FaqMatcher,
     );
 }
 

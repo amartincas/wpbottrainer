@@ -42,6 +42,13 @@ final readonly class CoachContext
      * @param  array<string, mixed>  $profileSnapshot  igual forma que TrainingHistoryContext->currentProfileSnapshot
      * @param  array<int, ProgressionEvaluation>  $progressionEvaluations  keyed por exerciseId, solo de los ejercicios de currentSession
      * @param  array<int, array{role: string, content: string}>  $recentMessages
+     * @param  ?array<int, CoachFaqCandidate>  $activeFaqs  Hito 14 — `null` si el gate
+     *         determinista (`FaqRelevanceDetector`/`CustomerServiceEscalationDetector`)
+     *         NO se activó este turno (CoachService ni construye el bloque de FAQ del
+     *         prompt); `[]` si el gate SÍ se activó pero `FaqMatcher::retrieveCandidates()`
+     *         no encontró ningún candidato (el bloque SÍ se incluye, con la variante de
+     *         "sin candidatos" — la ausencia de candidatos nunca equivale a ausencia del
+     *         bloque de evaluación); no vacío si hay candidatos reales. Ver docs/DECISIONS.md.
      */
     public function __construct(
         public array $profileSnapshot,
@@ -50,5 +57,6 @@ final readonly class CoachContext
         public array $progressionEvaluations,
         public array $recentMessages,
         public ?PendingReminderSuggestion $pendingReminderSuggestion = null,
+        public ?array $activeFaqs = null,
     ) {}
 }

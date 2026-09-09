@@ -66,6 +66,17 @@ enum DetectedIntentType: string
     case AskedWhenToTrain = 'asked_when_to_train';
 
     /**
+     * Hito 14 — petición EXPLÍCITA de atención humana ("necesito hablar con
+     * alguien", "tengo un problema con el pago") detectada dentro del MISMO
+     * turno de Coach — distinto y complementario de `customer_service_needed`
+     * (campo aparte del contrato JSON, ver `CoachService`), que representa
+     * específicamente "ninguna FAQ candidata responde esta pregunta". Ambas
+     * señales convergen en la misma acción (`ConversationTurnResolver`),
+     * nunca producen dos solicitudes para el mismo mensaje.
+     */
+    case CustomerServiceRequest = 'customer_service_request';
+
+    /**
      * Valida una lista cruda (ej. del JSON de la IA) contra este vocabulario
      * cerrado — cualquier valor que no sea uno de estos casos se descarta
      * silenciosamente (nunca un error, nunca una segunda autoridad de

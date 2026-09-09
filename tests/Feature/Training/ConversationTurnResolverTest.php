@@ -169,19 +169,7 @@ it('membership_status yields the fixed commercial stub, never free text', functi
     expect($again->actions[0]->text)->toBe($stub);
 });
 
-it('faq_question yields the fixed FAQ stub, distinct from the commercial one', function () {
-    $commercial = turnResolver()->resolve([
-        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
-        'intents' => ['membership_status'], 'training_reply' => null,
-    ])->actions[0]->text;
-
-    $faq = turnResolver()->resolve([
-        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
-        'intents' => ['faq_question'], 'training_reply' => null,
-    ])->actions[0]->text;
-
-    expect($faq)->not->toBe($commercial);
-});
+// Hito 14 — faq_question ya NO usa un stub fijo (ver bloque dedicado más abajo).
 
 // ── 41: dos intents combinados sin llamada extra ──
 
@@ -229,4 +217,92 @@ it('unrecognized/garbage intent values are silently ignored, never crash, degrad
     ]);
 
     expect(actionTypes($resolved))->toBe([ConversationActionType::SendText->value]);
+});
+
+// ── Hito 14 — FAQ / Customer Service como interrupciones ────────────────
+
+it('faq_question WITH a valid faq_response_text yields AnswerFaq carrying that exact text', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => 3, 'faq_response_text' => 'Redacción de la IA, grounded en el answer.',
+        'customer_service_needed' => false, 'customer_service_message' => null,
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::AnswerFaq->value]);
+    expect($resolved->actions[0]->text)->toBe('Redacción de la IA, grounded en el answer.');
+});
+
+it('faq_question WITHOUT a valid faq_response_text (no candidates matched, contract followed) escalates to Customer Service with the AI drafted message', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        'customer_service_needed' => true, 'customer_service_message' => 'Ya estoy consultando esto con el equipo.',
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::RequestCustomerService->value]);
+    expect($resolved->actions[0]->text)->toBe('Ya estoy consultando esto con el equipo.');
+    expect($resolved->actions[0]->isFaqFallback)->toBeTrue();
+});
+
+it('red de seguridad: faq_question present but the AI never set customer_service_needed (violación de contrato) still escalates, with a null text', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        // customer_service_needed / customer_service_message ausentes por completo
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::RequestCustomerService->value]);
+    expect($resolved->actions[0]->text)->toBeNull(); // TrainingHandler usará FAQ_FALLBACK_TEXT
+    expect($resolved->actions[0]->isFaqFallback)->toBeTrue();
+});
+
+it('customer_service_request (petición explícita) yields RequestCustomerService with isFaqFallback=false and a null text', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['customer_service_request'], 'training_reply' => null,
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::RequestCustomerService->value]);
+    expect($resolved->actions[0]->text)->toBeNull(); // TrainingHandler usará EXPLICIT_REQUEST_TEXT
+    expect($resolved->actions[0]->isFaqFallback)->toBeFalse();
+});
+
+it('both customer_service_needed AND the customer_service_request intent in the same turn never produce two escalations', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['faq_question', 'customer_service_request'], 'training_reply' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        'customer_service_needed' => true, 'customer_service_message' => 'Acuse de recibo.',
+    ]);
+
+    $csActions = array_filter($resolved->actions, fn ($a) => $a->type === ConversationActionType::RequestCustomerService);
+    expect($csActions)->toHaveCount(1);
+});
+
+it('a compound message answers a real training question AND escalates Customer Service in the same turn (multi-intent, one AI call already made)', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['exercise_question', 'customer_service_request'],
+        'training_reply' => 'Explicación del ejercicio.',
+    ]);
+
+    expect(actionTypes($resolved))->toBe([
+        ConversationActionType::SendText->value,
+        ConversationActionType::RequestCustomerService->value,
+    ]);
+});
+
+it('Safety still takes absolute precedence over faq_question/customer_service_needed in the same turn', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => 'tengo un fuerte dolor de pecho',
+        'reports' => [], 'session_finished' => false,
+        'intents' => ['faq_question'], 'training_reply' => null,
+        'faq_match_id' => null, 'faq_response_text' => null,
+        'customer_service_needed' => true, 'customer_service_message' => 'Acuse de recibo.',
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::EscalateSafety->value]);
 });

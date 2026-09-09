@@ -9,6 +9,8 @@ use App\Core\Memory\ContextBuilder;
 use App\Core\Memory\ContextFragment;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\HandlerInterface;
+use App\CustomerCare\Support\CustomerServiceRequestRecorder;
+use App\CustomerCare\Support\FaqMatcher;
 use App\ExerciseCatalog\MediaResolver;
 use App\Models\Contact;
 use App\Models\Reminder;
@@ -96,6 +98,17 @@ use Illuminate\Support\Facades\Log;
  * entrenamiento, no conversación. Los últimos mensajes (`CoachContext->recentMessages`)
  * son, para el LLM, contexto lingüístico — nunca una fuente de hechos ni de
  * instrucciones (ver `CoachFactsFormatter`).
+ *
+ * Hito 14 — FAQ/Customer Service como interrupciones conversacionales
+ * dentro del MISMO turno de Coach (paso 5): `AnswerFaq`/`RequestCustomerService`
+ * nunca tocan WorkoutSession/TrainingProfile/onboarding_turns — el contexto
+ * de Training queda intacto. `FaqMatcher::sanitize()` (validación backend
+ * en memoria) se aplica ANTES de `ConversationTurnResolver::resolve()`. El
+ * camino de reporte activo (paso 4, `ExecutionReportService`) no recibe
+ * candidatos de FAQ — si el modelo igual marca `faq_question` ahí, el
+ * mismo `ConversationTurnResolver` degrada de forma segura hacia Customer
+ * Service (nunca una respuesta inventada) — límite conocido y documentado,
+ * no una implementación completa de FAQ en ese camino (ver docs/DECISIONS.md).
  */
 class TrainingHandler implements HandlerInterface
 {
@@ -181,6 +194,8 @@ class TrainingHandler implements HandlerInterface
         private readonly ReminderTimeResolver $reminderTimeResolver,
         private readonly TimezoneResolver $timezoneResolver,
         private readonly ReminderProactivityGate $proactivityGate,
+        private readonly FaqMatcher $faqMatcher,
+        private readonly CustomerServiceRequestRecorder $customerServiceRecorder,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -341,7 +356,7 @@ class TrainingHandler implements HandlerInterface
             $coachContext = $this->buildContext($context, 'coach_context')->data;
             $result = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant, $coachContext);
             $resolved = $this->turnResolver->resolve($result);
-            $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt);
+            $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body);
 
             return;
         }
@@ -368,8 +383,15 @@ class TrainingHandler implements HandlerInterface
         } elseif ($body !== '') {
             $coachContext = $this->buildContext($context, 'coach_context')->data;
             $result = $this->coach->respond($body, $coachContext, $tenant);
+            // Hito 14 — validación backend en memoria, sin BD adicional: si
+            // faq_match_id no pertenece al conjunto de candidatos que
+            // realmente se le mostró a la IA este turno (CoachContext ya
+            // cargado arriba), se descarta TODA la salida relacionada
+            // (incluido cualquier customer_service_message) — degradación
+            // totalmente determinista. Ver docs/DECISIONS.md.
+            $result = $this->faqMatcher->sanitize($result, $coachContext->activeFaqs ?? []);
             $resolved = $this->turnResolver->resolve($result);
-            $shouldDeliverSession = $this->executeTurnActions($resolved, null, $from, $tenant, $freshContact, $profile, $startedAt);
+            $shouldDeliverSession = $this->executeTurnActions($resolved, null, $from, $tenant, $freshContact, $profile, $startedAt, $body);
 
             if (! $shouldDeliverSession) {
                 return;
@@ -474,6 +496,7 @@ class TrainingHandler implements HandlerInterface
         Contact $contact,
         TrainingProfile $profile,
         float $startedAt,
+        string $body = '',
     ): bool {
         $shouldDeliverSession = false;
 
@@ -514,6 +537,29 @@ class TrainingHandler implements HandlerInterface
 
             if ($action->type === ConversationActionType::OfferProactiveReminder) {
                 $this->offerProactiveReminder($action->reminderData['trigger_reason'], $contact, $tenant, $from);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::AnswerFaq) {
+                // Hito 14 — $action->text ya viene REDACTADO por la IA
+                // (grounded en el answer de la FAQ elegida) — nunca se
+                // consulta App\CustomerCare\Models\Faq desde aquí.
+                $this->reply($from, $action->text, $tenant);
+
+                continue;
+            }
+
+            if ($action->type === ConversationActionType::RequestCustomerService) {
+                // Hito 14 — CustomerServiceRequest.message es SIEMPRE el
+                // mensaje original del usuario, nunca el texto de acuse de
+                // recibo que se le responde.
+                $this->customerServiceRecorder->record($contact, $body);
+
+                $replyText = $action->text ?? ($action->isFaqFallback
+                    ? CustomerServiceRequestRecorder::FAQ_FALLBACK_TEXT
+                    : CustomerServiceRequestRecorder::EXPLICIT_REQUEST_TEXT);
+                $this->reply($from, $replyText, $tenant);
 
                 continue;
             }

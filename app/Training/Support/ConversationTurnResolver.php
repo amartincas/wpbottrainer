@@ -26,9 +26,15 @@ use App\Training\Enums\DetectedIntentType;
  * `DeliverSession`, que `TrainingHandler` traduce en la llamada ya existente
  * a `TrainingEngine::decideNextSession()` (sin cambios ahí).
  *
- * `membership_status`/`faq_question` SIEMPRE usan el stub fijo — nunca un
- * texto libre generado por la IA para esos dominios (Commercial/FAQ no
- * implementados en este bloque).
+ * `membership_status` SIEMPRE usa el stub fijo — Commercial no implementado
+ * todavía (fuera de alcance de Hito 14).
+ *
+ * Hito 14 — `faq_question`/`customer_service_needed`/`customer_service_request`
+ * YA NO usan un stub fijo: `faq_response_text`/`customer_service_message`
+ * llegan REDACTADOS por la IA en la MISMA llamada ya resuelta más arriba
+ * (`CoachService`) — este resolver sigue sin conocer `App\CustomerCare`, sin
+ * BD, solo decide QUÉ acción crear con el texto que ya recibió. Ver
+ * docs/DECISIONS.md.
  */
 class ConversationTurnResolver
 {
@@ -38,13 +44,6 @@ class ConversationTurnResolver
      */
     private const COMMERCIAL_STUB = 'Todavía no puedo resolver esto directamente por aquí, pero un miembro de '
         .'nuestro equipo puede ayudarte con tu membresía. 💬';
-
-    /**
-     * // REQUIERE REVISIÓN DE NEGOCIO ANTES DE PRODUCCIÓN — texto stub
-     * temporal mientras no exista un FaqHandler real.
-     */
-    private const FAQ_STUB = 'Todavía no puedo resolver ese tipo de preguntas directamente por aquí, pero un '
-        .'miembro de nuestro equipo puede ayudarte. 💬';
 
     private const AMBIGUOUS_TURN_FALLBACK = 'No estoy segura de haber entendido — ¿me cuentas cómo te fue con tu '
         .'entrenamiento, o en qué más te ayudo?';
@@ -63,7 +62,7 @@ class ConversationTurnResolver
     public function __construct(private readonly SafetySignalDetector $safetyDetector) {}
 
     /**
-     * @param  array{safety_signal_text: ?string, reports?: array, session_finished?: bool, intents: array<int, string>, training_reply: ?string}  $result
+     * @param  array{safety_signal_text: ?string, reports?: array, session_finished?: bool, intents: array<int, string>, training_reply: ?string, faq_match_id?: ?int, faq_response_text?: ?string, customer_service_needed?: bool, customer_service_message?: ?string}  $result
      *         Mismo formato plano que ya devuelve `ExecutionReportService::extractReport()`
      *         (`reports`/`session_finished` como claves de primer nivel, no
      *         anidadas) — el resultado de `CoachService::respond()` simplemente
@@ -161,8 +160,43 @@ class ConversationTurnResolver
             $actions[] = ConversationAction::sendText(self::COMMERCIAL_STUB);
         }
 
-        if (in_array(DetectedIntentType::FaqQuestion->value, $intents, true)) {
-            $actions[] = ConversationAction::sendText(self::FAQ_STUB);
+        // Hito 14 — FAQ/Customer Service como interrupciones conversacionales
+        // (ver docs/DECISIONS.md). `faq_response_text`/`customer_service_message`
+        // ya vienen REDACTADOS por la IA (la única llamada del turno, ya
+        // hecha) — este resolver sigue sin conocer `App\CustomerCare`, solo
+        // transporta los textos ya finales.
+        $faqResponseText = $result['faq_response_text'] ?? null;
+
+        if (is_string($faqResponseText) && trim($faqResponseText) !== '') {
+            $actions[] = ConversationAction::answerFaq($faqResponseText);
+        }
+
+        $needsCustomerService = false;
+        $isFaqFallback = false;
+        $customerServiceMessage = null;
+
+        if (($result['customer_service_needed'] ?? false) === true) {
+            $needsCustomerService = true;
+            $isFaqFallback = true;
+            $rawMessage = $result['customer_service_message'] ?? null;
+            $customerServiceMessage = is_string($rawMessage) && trim($rawMessage) !== '' ? $rawMessage : null;
+        } elseif (in_array(DetectedIntentType::CustomerServiceRequest->value, $intents, true)) {
+            $needsCustomerService = true; // petición explícita, isFaqFallback queda false
+        }
+
+        // Red de seguridad: faq_question detectado sin respuesta válida y
+        // sin escalación ya marcada (violación de contrato de la IA) -> se
+        // fuerza igual, nunca se queda en silencio.
+        $faqUnresolved = in_array(DetectedIntentType::FaqQuestion->value, $intents, true)
+            && ! (is_string($faqResponseText) && trim($faqResponseText) !== '');
+
+        if ($faqUnresolved && ! $needsCustomerService) {
+            $needsCustomerService = true;
+            $isFaqFallback = true;
+        }
+
+        if ($needsCustomerService) {
+            $actions[] = ConversationAction::requestCustomerService($customerServiceMessage, $isFaqFallback);
         }
 
         if ($actions === []) {
