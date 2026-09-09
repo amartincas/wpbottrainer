@@ -31,6 +31,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'expires_at',
     'granted_by',
     'notes',
+    'trial_granted_at',
 ])]
 class TrainingAccess extends Model
 {
@@ -42,6 +43,12 @@ class TrainingAccess extends Model
             'status' => TrainingAccessStatus::class,
             'granted_at' => 'datetime',
             'expires_at' => 'datetime',
+            // Hito 15 — marca histórica INMUTABLE (manual O automático, una
+            // sola fuente de verdad): se fija una única vez, nunca se
+            // sobreescribe. Ver TrainingAccessAdministrationService::
+            // markTrialGrantedIfFirstTime() y App\Training\Support\
+            // AutomaticTrialProvisioner.
+            'trial_granted_at' => 'datetime',
         ];
     }
 

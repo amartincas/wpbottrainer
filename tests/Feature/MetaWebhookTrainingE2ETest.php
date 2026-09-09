@@ -177,8 +177,14 @@ it('persists the outbound message and logs the failure when Meta rejects the sen
     $tenant = Tenant::factory()->create(['wa_phone_number_id' => '100000000000004']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
     TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
-    // Sin TrainingAccess -> respuesta determinista de "activa el servicio",
-    // sin necesitar IA, para aislar el caso de "Meta responde error".
+    // Hito 15 — sin TrainingAccess, pero YA tuvo un Trial antes (ahora
+    // revocado) -> NO es elegible para Trial automático -> respuesta
+    // determinista de "activa el servicio", sin necesitar IA, para aislar
+    // el caso de "Meta responde error" (un Contact recién llegado, en
+    // cambio, recibiría un Trial automático y SÍ requeriría una llamada de
+    // IA para decidir qué responder — fuera del propósito de este test).
+    app(\App\Training\Support\TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+    app(\App\Training\Support\TrainingAccessAdministrationService::class)->revoke($contact->fresh(), \App\Models\User::factory()->create(['is_super_admin' => true]), 'motivo de prueba');
 
     Http::fake(['graph.facebook.com/*' => Http::response(['error' => ['message' => 'Invalid token']], 401)]);
 

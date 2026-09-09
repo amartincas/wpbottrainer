@@ -22,10 +22,16 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  *
  * Hito 13 — `performed_by` es nullable exclusivamente cuando el origen es
  * una recompensa de Referidos (`referral_reward_id` no nulo) — nunca un
- * usuario "sistema" ficticio. `TrainingAccessAdministrationService::
- * recordAudit()` impone en código, no solo por convención, que
- * `performed_by IS NULL` si y solo si `referral_reward_id IS NOT NULL`
- * (nunca ambos, nunca ninguno). Ver docs/DECISIONS.md.
+ * usuario "sistema" ficticio.
+ *
+ * Hito 15 — tercer origen posible: `auto_provisioned = true` identifica un
+ * Trial concedido automáticamente por `App\Training\Support\
+ * AutomaticTrialProvisioner`, sin actor humano ni recompensa de por medio.
+ * `TrainingAccessAdministrationService::recordAudit()` impone en código, no
+ * solo por convención, que exactamente UNO de los tres orígenes esté
+ * presente (`performed_by` no nulo XOR `referral_reward_id` no nulo XOR
+ * `auto_provisioned = true`) — nunca dos a la vez, nunca ninguno. Ver
+ * docs/DECISIONS.md.
  */
 #[Fillable([
     'contact_id',
@@ -33,6 +39,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'action',
     'performed_by',
     'referral_reward_id',
+    'auto_provisioned',
     'previous_status',
     'new_status',
     'previous_expires_at',
@@ -54,6 +61,7 @@ class TrainingAccessAudit extends Model
             'previous_expires_at' => 'datetime',
             'new_expires_at' => 'datetime',
             'created_at' => 'datetime',
+            'auto_provisioned' => 'boolean',
         ];
     }
 

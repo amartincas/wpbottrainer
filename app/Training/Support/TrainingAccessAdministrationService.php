@@ -38,6 +38,14 @@ use Illuminate\Support\Facades\Log;
  * `App\Referrals` (nunca `extend()`, que trabaja en meses, no en días) —
  * ver docs/DECISIONS.md. `App\Referrals` no depende de ningún otro método
  * de esta clase.
+ *
+ * Hito 15 — `grantAutomaticTrial()` es el único punto de entrada usado por
+ * `App\Training\Support\AutomaticTrialProvisioner` (que decide elegibilidad
+ * y concurrencia; este servicio solo persiste, confiando en su llamador —
+ * mismo criterio que `extendByDays()`/Referrals). `trial_granted_at` es una
+ * marca histórica INMUTABLE, única para Trial manual y automático
+ * (`markTrialGrantedIfFirstTime()`) — nunca dos fuentes de verdad
+ * distintas para "¿este Contact ya tuvo un Trial?".
  */
 class TrainingAccessAdministrationService
 {
@@ -62,7 +70,9 @@ class TrainingAccessAdministrationService
             'expires_at' => now()->addDays($durationDays),
             'granted_by' => 'admin_trial',
             'notes' => $reason,
-        ])->save();
+        ]);
+        $this->markTrialGrantedIfFirstTime($access);
+        $access->save();
 
         $this->recordAudit($access, $admin, TrainingAccessAuditAction::TrialGranted, $previousStatus, $access->status, $previousExpiresAt, $access->expires_at, $reason);
 
@@ -202,11 +212,21 @@ class TrainingAccessAdministrationService
         $previousStatus = $access->status;
         $previousExpiresAt = $access->expires_at;
 
-        $access->update([
+        $access->fill([
             'status' => $targetStatus,
             'granted_at' => now(),
             'expires_at' => $until,
         ]);
+
+        // Hito 15 — si esta reactivación es a Trial y el Contact nunca tuvo
+        // uno (caso raro: por ejemplo, tenía Free y se reactiva a Trial por
+        // primera vez), cuenta como su primera concesión — misma regla
+        // histórica única que grantTrial()/grantAutomaticTrial().
+        if ($targetStatus === TrainingAccessStatus::Trial) {
+            $this->markTrialGrantedIfFirstTime($access);
+        }
+
+        $access->save();
 
         $this->recordAudit($access, $admin, TrainingAccessAuditAction::Reactivated, $previousStatus, $access->status, $previousExpiresAt, $access->expires_at, $reason);
 
@@ -275,15 +295,72 @@ class TrainingAccessAdministrationService
     }
 
     /**
-     * Hito 13 — `$admin` y `$referralRewardId` son mutuamente excluyentes,
-     * y exactamente uno de los dos es obligatorio: toda fila de
-     * `TrainingAccessAudit` tiene un origen identificable — un
+     * Hito 15 — la ÚNICA puerta de escritura para el Trial automático
+     * (disparado por `App\Training\Support\AutomaticTrialProvisioner`,
+     * nunca desde aquí se decide elegibilidad — este método CONFÍA en su
+     * llamador, mismo criterio que `extendByDays()` confía en
+     * `ApplyReferralRewardOnPaymentConfirmed`). Sin `$admin`
+     * (`granted_by = 'system_auto_trial'`), audita con `auto_provisioned =
+     * true`. `$durationDays` SIEMPRE viene de `Tenant.trial_duration_days`
+     * — nunca un valor hardcodeado aquí ni en el llamador.
+     */
+    public function grantAutomaticTrial(Contact $contact, int $durationDays): TrainingAccess
+    {
+        $access = TrainingAccess::firstOrNew(['contact_id' => $contact->id]);
+        $previousStatus = $access->exists ? $access->status : null;
+        $previousExpiresAt = $access->expires_at;
+
+        $access->fill([
+            'status' => TrainingAccessStatus::Trial,
+            'granted_at' => now(),
+            'expires_at' => now()->addDays($durationDays),
+            'granted_by' => 'system_auto_trial',
+        ]);
+        $this->markTrialGrantedIfFirstTime($access);
+        $access->save();
+
+        $this->recordAudit(
+            $access,
+            admin: null,
+            action: TrainingAccessAuditAction::TrialGranted,
+            previousStatus: $previousStatus,
+            newStatus: $access->status,
+            previousExpiresAt: $previousExpiresAt,
+            newExpiresAt: $access->expires_at,
+            reason: null,
+            referralRewardId: null,
+            autoProvisioned: true,
+        );
+
+        return $access;
+    }
+
+    /**
+     * Hito 15 — `trial_granted_at` representa CUALQUIER Trial concedido
+     * alguna vez (manual O automático) — una sola regla histórica, nunca
+     * dos. Se fija SOLO en la primera concesión; una llamada posterior
+     * (otro Trial manual, una reactivación a Trial) nunca la sobreescribe.
+     */
+    private function markTrialGrantedIfFirstTime(TrainingAccess $access): void
+    {
+        if ($access->trial_granted_at === null) {
+            $access->trial_granted_at = now();
+        }
+    }
+
+    /**
+     * Hito 13 — `$admin` y `$referralRewardId` son mutuamente excluyentes:
+     * toda fila de `TrainingAccessAudit` tiene un origen identificable — un
      * administrador humano (`performed_by`) O una recompensa de Referidos
-     * (`referral_reward_id`), nunca ambos, nunca ninguno. Esto se impone
-     * aquí en CÓDIGO — no queda como un supuesto que solo los tests
-     * verifican — precisamente porque este es el único método que escribe
-     * en la tabla; si la invariante se rompe, se rompe aquí, de forma
-     * explícita y ruidosa, nunca en silencio.
+     * (`referral_reward_id`).
+     *
+     * Hito 15 — se amplía a un tercer origen posible: `$autoProvisioned`
+     * (Trial concedido automáticamente, sin actor humano ni recompensa).
+     * EXACTAMENTE uno de los tres debe estar presente — nunca dos a la vez,
+     * nunca ninguno. Esto se impone aquí en CÓDIGO — no queda como un
+     * supuesto que solo los tests verifican — precisamente porque este es
+     * el único método que escribe en la tabla; si la invariante se rompe,
+     * se rompe aquí, de forma explícita y ruidosa, nunca en silencio.
      */
     private function recordAudit(
         TrainingAccess $access,
@@ -295,10 +372,15 @@ class TrainingAccessAdministrationService
         ?CarbonInterface $newExpiresAt,
         ?string $reason,
         ?int $referralRewardId = null,
+        bool $autoProvisioned = false,
     ): void {
-        if (($admin === null) === ($referralRewardId === null)) {
+        $sourcesProvided = (int) ($admin !== null)
+            + (int) ($referralRewardId !== null)
+            + (int) ($autoProvisioned === true);
+
+        if ($sourcesProvided !== 1) {
             throw new TrainingAccessAdministrationException(
-                'recordAudit() requiere EXACTAMENTE uno de $admin o $referralRewardId — nunca ambos, nunca ninguno.'
+                'recordAudit() requiere EXACTAMENTE uno de $admin, $referralRewardId o $autoProvisioned=true — nunca dos a la vez, nunca ninguno.'
             );
         }
 
@@ -308,6 +390,7 @@ class TrainingAccessAdministrationService
             'action' => $action,
             'performed_by' => $admin?->id,
             'referral_reward_id' => $referralRewardId,
+            'auto_provisioned' => $autoProvisioned,
             'previous_status' => $previousStatus?->value,
             'new_status' => $newStatus->value,
             'previous_expires_at' => $previousExpiresAt,

@@ -131,13 +131,17 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
     expect($profile->sessions_per_week)->toBeNull(); // nunca se preguntó — oportunista, nunca bloqueó
     expect($profile->primary_focus)->toBeNull(); // ídem
 
-    // Sin acceso todavía -> se le informa que debe activar el servicio, con
-    // instrucción explícita de cómo hacerlo (Hito 8.1 — el mensaje anterior
-    // ("Contáctanos") no invitaba a decir "quiero pagar"). Esto ocurre
-    // dentro del MISMO segundo turno, sin AI adicional.
+    // Hito 15 — sin acceso todavía, pero el Contact es elegible para Trial
+    // automático (nunca tuvo Trial, nunca tuvo un Payment confirmado): se
+    // concede automáticamente y la primera rutina se entrega dentro del
+    // MISMO segundo turno, sin AI adicional — ya NO se le pide pagar.
+    $access = TrainingAccess::where('contact_id', $contact->id)->first();
+    expect($access->status)->toBe(\App\Training\Enums\TrainingAccessStatus::Trial);
+    expect($access->trial_granted_at)->not->toBeNull();
+    expect($access->granted_by)->toBe('system_auto_trial');
+
     Http::assertSent(fn ($request) => $request->url() === 'https://graph.facebook.com/v20.0/'.$tenant->wa_phone_number_id.'/messages'
-        && str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso')
-        && str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
+        && str_contains(data_get($request->data(), 'text.body', ''), '🔥 Tu entrenamiento de hoy'));
 
     $aiCalls = 0;
     foreach (Http::recorded() as [$request, $response]) {
@@ -219,25 +223,53 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
     expect($aiCalls)->toBe(6);
 });
 
-it('informs the user they need to activate the service when access is denied, with an explicit instruction (Hito 8.1)', function () {
-    $tenant = Tenant::factory()->create();
+it('Hito 15: grants an automatic Trial and delivers the first WorkoutSession when a Trial-eligible profile-complete Contact has no TrainingAccess at all', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'trial_duration_days' => 5]);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
     // health_screening_asked: true — Bloque 5 (D048): sin esto, la factory
     // dejaría el screening sin responder y el perfil ya NO se consideraría
     // completo bajo el nuevo Registry.
     TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]); // complete, no TrainingAccess row
 
+    Http::fake([
+        // Onboarding ya está completo (perfil pre-sembrado), así que la
+        // única llamada de IA de este turno es la de Coach (paso 5,
+        // Bloque 9) — clasifica "Dame mi entrenamiento de hoy" como
+        // continue_training, que dispara DeliverSession de forma
+        // determinista en ConversationTurnResolver.
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null, 'intents' => ['continue_training'], 'training_reply' => null,
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendTrainingMessage($tenant, '573001112233', 'Dame mi entrenamiento de hoy');
+
+    $access = TrainingAccess::where('contact_id', $contact->id)->sole();
+    expect($access->status)->toBe(\App\Training\Enums\TrainingAccessStatus::Trial);
+    expect($access->expires_at->diffInDays(now(), true))->toBeGreaterThan(4)->toBeLessThan(6);
+    expect($access->trial_granted_at)->not->toBeNull();
+    expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(1);
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), '🔥 Tu entrenamiento de hoy'));
+});
+
+it('Hito 15: a Contact who already had a Trial before is NOT re-granted one — still gets the activation message', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
+    // El Contact ya tuvo un Trial antes (marca trial_granted_at), ahora
+    // revocado — ya no elegible.
+    app(\App\Training\Support\TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+    app(\App\Training\Support\TrainingAccessAdministrationService::class)->revoke($contact->fresh(), \App\Models\User::factory()->create(['is_super_admin' => true]), 'motivo de prueba');
+
     Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200)]);
 
     sendTrainingMessage($tenant, '573001112233', 'Dame mi entrenamiento de hoy');
 
     expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(0);
-    // Hito 8.1 — hallazgo real del E2E comercial: el mensaje anterior
-    // ("Contáctanos para activarlo") era vago; ahora instruye explícitamente
-    // qué escribir para activar el acceso.
+    expect(TrainingAccess::where('contact_id', $contact->id)->count())->toBe(1); // nunca un segundo Trial
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso')
         && str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
-    Http::assertSentCount(1); // no AI call at all — profile already complete
 });
 
 it('generates and delivers a WorkoutSession with videos when access is granted, without asking onboarding questions again', function () {

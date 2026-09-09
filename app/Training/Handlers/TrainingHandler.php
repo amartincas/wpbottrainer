@@ -29,6 +29,7 @@ use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SplitType;
 use App\Training\Onboarding\OnboardingConversationComposer;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
+use App\Training\Support\AutomaticTrialProvisioner;
 use App\Training\Support\CoachService;
 use App\Training\Support\ConversationTurnResolved;
 use App\Training\Support\ConversationTurnResolver;
@@ -50,7 +51,12 @@ use Illuminate\Support\Facades\Log;
  *
  *   ¿señal de seguridad?         -> escalar y detener
  *   ¿perfil incompleto?          -> onboarding conversacional (Extract -> Decide -> Narrate)
- *   ¿sin acceso?                 -> informar que debe activarse el servicio
+ *   ¿sin acceso ('no_access')?   -> Hito 15: AutomaticTrialProvisioner intenta un Trial
+ *                                    automático (elegible = nunca tuvo Trial Y nunca tuvo
+ *                                    un Payment confirmado); si no es elegible, o el motivo
+ *                                    de denegación es otro (acceso histórico vencido/
+ *                                    revocado, 'access_invalid'), se informa que debe
+ *                                    activarse el servicio, sin cambios
  *   ¿contexto activo (sesión pendiente con ejercicios sin reportar)?
  *        -> ExecutionReportService (evolucionado, Bloque 9/D052): ÚNICA
  *           llamada de IA del turno — clasifica reporte + interrupciones
@@ -196,6 +202,7 @@ class TrainingHandler implements HandlerInterface
         private readonly ReminderProactivityGate $proactivityGate,
         private readonly FaqMatcher $faqMatcher,
         private readonly CustomerServiceRequestRecorder $customerServiceRecorder,
+        private readonly AutomaticTrialProvisioner $trialProvisioner,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -335,6 +342,23 @@ class TrainingHandler implements HandlerInterface
         // 3. Acceso — frontera única hacia el sistema comercial (Hito 4).
         $freshContact = $contact->fresh();
         $gateResult = $this->accessGate->authorize($freshContact);
+
+        // Hito 15 — Trial automático: se intenta ÚNICAMENTE cuando el
+        // motivo de denegación es 'no_access' (ausencia total de fila
+        // TrainingAccess) — un acceso histórico vencido/revocado cae en
+        // 'access_invalid', nunca dispara este mecanismo (ver docblock de
+        // AutomaticTrialProvisioner). Si el Contact no es elegible
+        // (ya tuvo Trial, o ya tuvo un Payment confirmado alguna vez),
+        // provisionIfEligible() devuelve null y el turno sigue exactamente
+        // igual que antes de este hito.
+        if (! $gateResult->allowed && $gateResult->reason === 'no_access') {
+            $grantedTrial = $this->trialProvisioner->provisionIfEligible($freshContact);
+
+            if ($grantedTrial !== null) {
+                $freshContact = $freshContact->fresh();
+                $gateResult = $this->accessGate->authorize($freshContact);
+            }
+        }
 
         if (! $gateResult->allowed) {
             $this->respondToDenial($gateResult->reason, $from, $tenant);

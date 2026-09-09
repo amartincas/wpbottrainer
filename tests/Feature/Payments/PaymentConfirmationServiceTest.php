@@ -510,3 +510,74 @@ it('the seam is consumable from outside App\Payments: contact_id/amount/membersh
             && $event->payment->membership_months === 3;
     });
 });
+
+// ── Hito 15 (bugfix) — idempotencyKey en los 3 call-sites de CustomerNotifier ──
+
+it('the payment_confirmed, training_invite and payment_rejected notifications each use a stable, deterministic idempotencyKey', function () {
+    $contactConfirmed = Contact::factory()->create();
+    Conversation::create(['tenant_id' => $contactConfirmed->tenant_id, 'customer_phone' => $contactConfirmed->customer_phone, 'last_session_at' => now()->subMinutes(5)]);
+    $paymentConfirmed = Payment::factory()->create(['contact_id' => $contactConfirmed->id, 'status' => PaymentStatus::UnderReview]);
+
+    $contactRejected = Contact::factory()->create();
+    Conversation::create(['tenant_id' => $contactRejected->tenant_id, 'customer_phone' => $contactRejected->customer_phone, 'last_session_at' => now()->subMinutes(5)]);
+    $paymentRejected = Payment::factory()->create(['contact_id' => $contactRejected->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    app(PaymentConfirmationService::class)->confirm($paymentConfirmed, User::factory()->create());
+    app(PaymentConfirmationService::class)->reject($paymentRejected, User::factory()->create(), 'motivo');
+
+    expect(WhatsAppMessage::where('idempotency_key', "payment_confirmed:{$paymentConfirmed->id}")->exists())->toBeTrue();
+    expect(WhatsAppMessage::where('idempotency_key', "training_invite:{$paymentConfirmed->id}")->exists())->toBeTrue();
+    expect(WhatsAppMessage::where('idempotency_key', "payment_rejected:{$paymentRejected->id}")->exists())->toBeTrue();
+});
+
+it('a repeated confirmation never produces a second CONFIRMED WhatsAppMessage for the same idempotencyKey (CustomerNotifier-level protection, not only the outer Payment lock)', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create(['tenant_id' => $contact->tenant_id, 'customer_phone' => $contact->customer_phone, 'last_session_at' => now()->subMinutes(5)]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    // Invoca el mecanismo de CustomerNotifier directamente con la MISMA
+    // clave que confirm() usaría — sin pasar por el candado externo de
+    // PaymentConfirmationService — para probar que el propio CustomerNotifier
+    // también protege este idempotencyKey, no solo el lockForUpdate() de
+    // confirm()/reject().
+    $key = "payment_confirmed:{$payment->id}";
+    app(\App\Core\Notifications\CustomerNotifier::class)->notify(
+        tenant: $contact->tenant,
+        to: $contact->customer_phone,
+        eventKey: 'payment_confirmed',
+        variables: [],
+        freeFormText: 'Primer envío.',
+        idempotencyKey: $key,
+    );
+    app(\App\Core\Notifications\CustomerNotifier::class)->notify(
+        tenant: $contact->tenant,
+        to: $contact->customer_phone,
+        eventKey: 'payment_confirmed',
+        variables: [],
+        freeFormText: 'Segundo intento, misma clave.',
+        idempotencyKey: $key,
+    );
+
+    expect(WhatsAppMessage::where('idempotency_key', $key)->count())->toBe(1);
+    Http::assertSentCount(1); // nunca un segundo envío real a Meta
+});
+
+it('never modifies any other observable behavior of confirm()/reject() — full regression: same messages, same TrainingAccess, same events', function () {
+    $contact = Contact::factory()->create();
+    Conversation::create(['tenant_id' => $contact->tenant_id, 'customer_phone' => $contact->customer_phone, 'last_session_at' => now()->subMinutes(5)]);
+    $payment = Payment::factory()->create(['contact_id' => $contact->id, 'status' => PaymentStatus::UnderReview, 'amount' => 50000]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+    Event::fake([PaymentConfirmed::class]);
+
+    app(PaymentConfirmationService::class)->confirm($payment, User::factory()->create());
+
+    expect(TrainingAccess::where('contact_id', $contact->id)->sole()->status)->toBe(TrainingAccessStatus::Active);
+    Event::assertDispatchedTimes(PaymentConfirmed::class, 1);
+    Http::assertSent(fn ($request) => str_contains($request['text']['body'] ?? '', 'confirmado'));
+    Http::assertSent(fn ($request) => str_contains($request['text']['body'] ?? '', '¿Quieres que te prepare tu entrenamiento?'));
+});

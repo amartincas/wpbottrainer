@@ -30,8 +30,11 @@ it('does not carry any billing/subscription concept', function () {
     // Hito 8: 'payment_id' se agregó como trazabilidad de QUÉ Payment
     // originó/extendió el acceso — sigue sin ser un concepto de
     // facturación/suscripción en sí (no hay monto, moneda, ciclo de
-    // facturación, ni plan aquí; eso vive en Payment). Ver docs/DECISIONS.md.
+    // facturación, ni plan aquí; eso vive en Payment). Hito 15:
+    // 'trial_granted_at' es una marca histórica INMUTABLE (manual O
+    // automático), tampoco un concepto de facturación — nunca un monto, ni
+    // un ciclo, ni un plan. Ver docs/DECISIONS.md.
     expect($columns)->toEqualCanonicalizing([
-        'id', 'contact_id', 'payment_id', 'status', 'granted_at', 'expires_at', 'granted_by', 'notes', 'created_at', 'updated_at',
+        'id', 'contact_id', 'payment_id', 'status', 'granted_at', 'expires_at', 'granted_by', 'notes', 'trial_granted_at', 'created_at', 'updated_at',
     ]);
 });

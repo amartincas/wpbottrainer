@@ -80,6 +80,9 @@ class TenantFactory extends Factory
             'wa_display_phone_number' => null,
             'referral_reward_days' => 3,
             'referral_program_enabled' => true,
+            // Hito 15 — mismo criterio: explícito aquí, nunca confiando en
+            // el DEFAULT de la columna (5).
+            'trial_duration_days' => 5,
         ];
     }
 }

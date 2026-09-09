@@ -54,6 +54,17 @@ use Illuminate\Support\Facades\Log;
  * Payments, sin ninguna lógica de Referidos ni de ningún otro dominio
  * futuro. `App\Payments` no importa ni depende de `App\Referrals` en
  * ningún punto de este archivo.
+ *
+ * Hito 15 (bugfix) — los 3 mensajes que este servicio envía vía
+ * `CustomerNotifier` (`payment_confirmed`, `training_invite`,
+ * `payment_rejected`) ahora pasan un `idempotencyKey` determinista
+ * (`"{eventKey}:{payment->id}"`, mismo patrón textual que ya usa el
+ * listener de Referidos con `"referral_reward:{id}"`) — antes no lo
+ * hacían, inconsistencia inofensiva hoy (el `lockForUpdate()` de
+ * confirm()/reject() ya impide una segunda ejecución de estas llamadas)
+ * pero corregida para que el propio mecanismo de `CustomerNotifier` también
+ * proteja estos 3 call-sites por sí mismo, sin depender únicamente del
+ * candado externo. Sin cambio de comportamiento observable.
  */
 class PaymentConfirmationService
 {
@@ -185,6 +196,7 @@ class PaymentConfirmationService
                 'expires_at' => $expiresAt,
             ],
             freeFormText: "✅ Tu pago de {$amount} ({$payment->method_label}) fue confirmado. Tu acceso está activo hasta el {$expiresAt}. 💪",
+            idempotencyKey: "payment_confirmed:{$payment->id}",
         );
     }
 
@@ -211,6 +223,7 @@ class PaymentConfirmationService
             eventKey: 'training_invite',
             variables: [],
             freeFormText: '🎉 ¡Listo! Tu pago fue confirmado y tu acceso ya está activo. ¿Quieres que te prepare tu entrenamiento?',
+            idempotencyKey: "training_invite:{$payment->id}",
         );
     }
 
@@ -226,6 +239,7 @@ class PaymentConfirmationService
                 'reason' => $reason,
             ],
             freeFormText: "❌ Tu pago no pudo confirmarse. Motivo: {$reason}. Escríbenos si quieres intentarlo de nuevo.",
+            idempotencyKey: "payment_rejected:{$payment->id}",
         );
     }
 }

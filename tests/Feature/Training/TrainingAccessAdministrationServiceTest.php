@@ -61,6 +61,34 @@ it('grantTrial records exactly one TrainingAccessAudit row with the correct snap
     expect(TrainingAccessAudit::where('contact_id', $contact->id)->count())->toBe(1);
 });
 
+// ── Hito 15 — trial_granted_at: marca histórica única, manual + automático ──
+
+it('grantTrial sets trial_granted_at on the FIRST grant ever', function () {
+    $contact = Contact::factory()->create();
+    $admin = User::factory()->create(['is_super_admin' => true]);
+
+    $access = taAdmin()->grantTrial($contact, $admin, 7);
+
+    expect($access->trial_granted_at)->not->toBeNull();
+});
+
+it('grantTrial NEVER overwrites trial_granted_at on a second manual grant', function () {
+    $contact = Contact::factory()->create();
+    $admin = User::factory()->create(['is_super_admin' => true]);
+
+    $first = taAdmin()->grantTrial($contact, $admin, 7);
+    $originalTimestamp = $first->trial_granted_at->copy();
+
+    // Un segundo Trial manual (p. ej. tras revocar y re-otorgar) NUNCA debe
+    // mover la marca histórica — sigue siendo "la primera vez", no "la más
+    // reciente".
+    \Illuminate\Support\Carbon::setTestNow(now()->addDays(2));
+    $second = taAdmin()->grantTrial($contact, $admin, 7);
+    \Illuminate\Support\Carbon::setTestNow();
+
+    expect($second->trial_granted_at->toDateTimeString())->toBe($originalTimestamp->toDateTimeString());
+});
+
 it('grantTrial never creates a Payment', function () {
     $contact = Contact::factory()->create();
     $before = Payment::count();
@@ -268,6 +296,29 @@ it('reactivate() on an access that is NOT revoked is a safe no-op — no audit r
     expect(TrainingAccessAudit::where('contact_id', $contact->id)->count())->toBe(0);
 });
 
+it('reactivate() to Trial sets trial_granted_at if the Contact never had one before (e.g. was Free, revoked, reactivated to Trial for the first time)', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->revoked()->create(['contact_id' => $contact->id]); // nunca tuvo Trial
+
+    $access = taAdmin()->reactivate($contact, User::factory()->create(['is_super_admin' => true]), TrainingAccessStatus::Trial, now()->addDays(5));
+
+    expect($access->fresh()->trial_granted_at)->not->toBeNull();
+});
+
+it('reactivate() to Trial does NOT overwrite an already-set trial_granted_at', function () {
+    $contact = Contact::factory()->create();
+    $admin = User::factory()->create(['is_super_admin' => true]);
+    $firstTrial = taAdmin()->grantTrial($contact, $admin, 5);
+    $originalTimestamp = $firstTrial->trial_granted_at->copy();
+    taAdmin()->revoke($contact->fresh(), $admin, 'motivo');
+
+    \Illuminate\Support\Carbon::setTestNow(now()->addDays(3));
+    $reactivated = taAdmin()->reactivate($contact->fresh(), $admin, TrainingAccessStatus::Trial, now()->addDays(5));
+    \Illuminate\Support\Carbon::setTestNow();
+
+    expect($reactivated->trial_granted_at->toDateTimeString())->toBe($originalTimestamp->toDateTimeString());
+});
+
 it('reactivate() never creates a Payment', function () {
     $contact = Contact::factory()->create();
     TrainingAccess::factory()->revoked()->create(['contact_id' => $contact->id]);
@@ -449,3 +500,104 @@ it('recordAudit() throws if NEITHER admin nor referralRewardId is provided', fun
         null, // ...ni referralRewardId — inválido
     );
 })->throws(TrainingAccessAdministrationException::class);
+
+// ── Hito 15 — recordAudit() amplía el guard a "exactamente uno de TRES" ──
+
+it('recordAudit() throws if admin AND autoProvisioned=true are BOTH provided', function () {
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+    $admin = User::factory()->create(['is_super_admin' => true]);
+
+    $method->invoke(
+        taAdmin(), $access, $admin, TrainingAccessAuditAction::Extended,
+        $access->status, $access->status, $access->expires_at, $access->expires_at,
+        null, null, true, // admin no-null Y autoProvisioned=true — inválido
+    );
+})->throws(TrainingAccessAdministrationException::class);
+
+it('recordAudit() throws if referralRewardId AND autoProvisioned=true are BOTH provided', function () {
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+
+    $method->invoke(
+        taAdmin(), $access, null, TrainingAccessAuditAction::Extended,
+        $access->status, $access->status, $access->expires_at, $access->expires_at,
+        null, 123, true, // referralRewardId no-null Y autoProvisioned=true — inválido
+    );
+})->throws(TrainingAccessAdministrationException::class);
+
+it('recordAudit() throws if ALL THREE sources (admin, referralRewardId, autoProvisioned) are provided at once', function () {
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+    $admin = User::factory()->create(['is_super_admin' => true]);
+
+    $method->invoke(
+        taAdmin(), $access, $admin, TrainingAccessAuditAction::Extended,
+        $access->status, $access->status, $access->expires_at, $access->expires_at,
+        null, 123, true,
+    );
+})->throws(TrainingAccessAdministrationException::class);
+
+it('recordAudit() accepts autoProvisioned=true alone as the single valid source', function () {
+    $method = new ReflectionMethod(TrainingAccessAdministrationService::class, 'recordAudit');
+    $method->setAccessible(true);
+
+    $contact = Contact::factory()->create();
+    $access = TrainingAccess::factory()->for($contact)->create(['status' => TrainingAccessStatus::Active]);
+
+    $method->invoke(
+        taAdmin(), $access, null, TrainingAccessAuditAction::TrialGranted,
+        null, $access->status, null, $access->expires_at,
+        null, null, true,
+    );
+
+    $audit = TrainingAccessAudit::where('training_access_id', $access->id)->sole();
+    expect($audit->performed_by)->toBeNull();
+    expect($audit->referral_reward_id)->toBeNull();
+    expect($audit->auto_provisioned)->toBeTrue();
+});
+
+// ── grantAutomaticTrial() — persistencia (elegibilidad se prueba en AutomaticTrialProvisionerTest) ──
+
+it('grantAutomaticTrial grants a Trial for exactly the given duration, marks trial_granted_at, and audits with auto_provisioned=true', function () {
+    $contact = Contact::factory()->create();
+
+    $access = taAdmin()->grantAutomaticTrial($contact, 5);
+
+    expect($access->status)->toBe(TrainingAccessStatus::Trial);
+    expect($access->expires_at->diffInDays(now(), true))->toBeGreaterThan(4)->toBeLessThan(6);
+    expect($access->trial_granted_at)->not->toBeNull();
+    expect($access->granted_by)->toBe('system_auto_trial');
+
+    $audit = TrainingAccessAudit::where('training_access_id', $access->id)->sole();
+    expect($audit->action)->toBe(TrainingAccessAuditAction::TrialGranted);
+    expect($audit->performed_by)->toBeNull();
+    expect($audit->referral_reward_id)->toBeNull();
+    expect($audit->auto_provisioned)->toBeTrue();
+});
+
+it('grantAutomaticTrial never creates a Payment', function () {
+    $contact = Contact::factory()->create();
+    $before = Payment::count();
+
+    taAdmin()->grantAutomaticTrial($contact, 5);
+
+    expect(Payment::count())->toBe($before);
+});
+
+it('grantAutomaticTrial uses whatever duration it is given — the per-Tenant duration itself is AutomaticTrialProvisioner\'s responsibility, not this service\'s', function () {
+    $contact = Contact::factory()->create();
+
+    $access = taAdmin()->grantAutomaticTrial($contact, 12);
+
+    expect($access->expires_at->diffInDays(now(), true))->toBeGreaterThan(11)->toBeLessThan(13);
+});

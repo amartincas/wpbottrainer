@@ -29,6 +29,10 @@ class TrainingAccessAuditFactory extends Factory
             },
             'action' => TrainingAccessAuditAction::TrialGranted,
             'performed_by' => User::factory(),
+            // Hito 15 — explícito en memoria, nunca confiando en el DEFAULT
+            // de la columna en BD (Eloquent no re-lee la fila tras el
+            // INSERT si el atributo no se pasó explícitamente).
+            'auto_provisioned' => false,
             'previous_status' => null,
             'new_status' => TrainingAccessStatus::Trial,
             'previous_expires_at' => null,
