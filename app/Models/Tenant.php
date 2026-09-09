@@ -22,6 +22,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'wa_display_phone_number',
     'referral_reward_days',
     'referral_program_enabled',
+    'trial_duration_days',
     'currency',
     'country',
     'timezone',
@@ -54,6 +55,8 @@ class Tenant extends Model
             // (mismo criterio que monthly_price/nequi_number para Payments).
             'referral_reward_days' => 'integer',
             'referral_program_enabled' => 'boolean',
+            // Hito 15 — mismo criterio que referral_reward_days.
+            'trial_duration_days' => 'integer',
         ];
     }
 
