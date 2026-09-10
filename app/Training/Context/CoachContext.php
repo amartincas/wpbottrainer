@@ -29,6 +29,12 @@ use App\Training\Support\TrainingHistoryContext;
  * `ReminderSuggestion` pendiente (puede seguir `pending` hasta 24h, mucho
  * más que la ventana de 10 mensajes). Reutiliza literalmente
  * `ReminderSuggestion::activePendingFor()` — ver `CoachContextProvider`.
+ *
+ * `needsConversationReinforcement` (H16.1, Cambio 3) — HECHO estructurado
+ * más, mismo criterio: `CoachContextProvider` ya determinó, sin IA, leyendo
+ * `TrainingProfile.coach_conversation_reinforced`, si corresponde pedirle a
+ * la IA que incluya el refuerzo de conversación libre dentro de
+ * `training_reply` — la IA nunca decide esto por su cuenta.
  */
 final readonly class CoachContext
 {
@@ -58,5 +64,6 @@ final readonly class CoachContext
         public array $recentMessages,
         public ?PendingReminderSuggestion $pendingReminderSuggestion = null,
         public ?array $activeFaqs = null,
+        public bool $needsConversationReinforcement = false,
     ) {}
 }

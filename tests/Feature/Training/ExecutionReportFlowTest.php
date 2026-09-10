@@ -458,8 +458,12 @@ it('blocks a report attempt when access is not granted, without touching Exercis
     sendMessageAsContact($contact->fresh(), 'Sentadilla 10x40');
 
     expect(ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->exists())->toBeFalse();
-    // Mensaje actualizado en Hito 8.1 — instrucción explícita ("quiero pagar").
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso'));
+    // H16.1 (Cambio 4) — un TrainingAccess con status Expired ya no usa el
+    // mensaje genérico de "activar tu acceso"/"quiero pagar": cae en la
+    // rama "paid_expired" de resolveAccessDeniedMessage() (mismo trato que
+    // Active/Free vencidos), redactado por TrialEndedMessageComposer — sin
+    // IA fakeada aquí, degrada de forma determinista a su fallback fijo.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'nada de tu progreso se perdió'));
 });
 
 // 21. Bloqueado por seguridad.

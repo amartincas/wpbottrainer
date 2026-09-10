@@ -83,6 +83,7 @@ class CoachFactsFormatter
         $lines[] = $this->formatProgressions($context);
         $lines[] = $this->formatHistoryAggregates($context);
         $lines[] = $this->formatPendingReminderSuggestion($context->pendingReminderSuggestion);
+        $lines[] = $this->formatConversationReinforcementHint($context->needsConversationReinforcement);
 
         $safetyRegions = $context->historyContext->activeSafetyBodyRegions;
         if ($safetyRegions !== []) {
@@ -199,6 +200,22 @@ class CoachFactsFormatter
         }
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * H16.1 (Cambio 3) — HECHO estructurado, no una instrucción de redacción
+     * (esa vive en el prompt de `CoachService`, junto al campo JSON
+     * correspondiente). Ausente por completo (no una línea vacía) cuando no
+     * corresponde reforzar — mismo criterio que `formatPendingReminderSuggestion()`.
+     */
+    private function formatConversationReinforcementHint(bool $needsConversationReinforcement): string
+    {
+        if (! $needsConversationReinforcement) {
+            return '';
+        }
+
+        return 'REFUERZO PENDIENTE: el usuario todavía no sabe que puede conversar libremente con el Coach '
+            .'(preguntar sobre un ejercicio, pedir una explicación, etc.) — este HECHO habilita "conversation_reinforcement_included" abajo.';
     }
 
     private function translateReasonCode(string $code): string

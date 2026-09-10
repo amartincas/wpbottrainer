@@ -45,7 +45,21 @@ class CoachService
         'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
         'faq_match_id' => null, 'faq_response_text' => null,
         'customer_service_needed' => false, 'customer_service_message' => null,
+        'conversation_reinforcement_included' => false,
     ];
+
+    /**
+     * H16.1 (Cambio 3) — solo se agrega al prompt (y por tanto solo cuenta
+     * como candidato válido) cuando `CoachContext->needsConversationReinforcement`
+     * es `true` — mismo criterio que `FAQ_RULES`/`buildFaqSection()`: la
+     * ausencia de la instrucción es, en sí misma, la señal de "no corresponde".
+     */
+    private const CONVERSATION_REINFORCEMENT_RULE = <<<'RULE'
+REGLA DURA PARA EL REFUERZO DE CONVERSACIÓN:
+- Si vas a producir "training_reply" en este turno, agrega al final, en una frase breve y natural, que el usuario puede seguir preguntándote lo que quiera sobre su entrenamiento — y marca "conversation_reinforcement_included" en true.
+- Si NO vas a producir "training_reply" en este turno, ignora esta regla por completo y deja "conversation_reinforcement_included" en false.
+- NUNCA marques "conversation_reinforcement_included" en true si no incluiste realmente esa frase en "training_reply".
+RULE;
 
     private const FAQ_RULES = <<<'RULES'
 REGLAS DURAS PARA FAQ/CUSTOMER SERVICE:
@@ -62,7 +76,7 @@ REGLAS DURAS PARA FAQ/CUSTOMER SERVICE:
 RULES;
 
     /**
-     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool, faq_match_id: ?int, faq_response_text: ?string, customer_service_needed: bool, customer_service_message: ?string}
+     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool, faq_match_id: ?int, faq_response_text: ?string, customer_service_needed: bool, customer_service_message: ?string, conversation_reinforcement_included: bool}
      */
     public function respond(string $messageBody, CoachContext $coachContext, Tenant $tenant): array
     {
@@ -87,6 +101,7 @@ RULES;
         $facts = (new CoachFactsFormatter)->format($coachContext);
         $intentValues = json_encode(array_map(fn (DetectedIntentType $type) => $type->value, DetectedIntentType::cases()));
         $faqSection = $this->buildFaqSection($coachContext);
+        $conversationReinforcementRule = $coachContext->needsConversationReinforcement ? "\n".self::CONVERSATION_REINFORCEMENT_RULE."\n" : '';
 
         return <<<PROMPT
 Eres el entrenador personal conversacional de WpbotTrainer, hablando por WhatsApp. Tono profesional, natural, directo — sin frases motivacionales vacías, sin inventar datos.
@@ -123,9 +138,9 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" (SOLO si el usuario mencionó un día, para crear/modificar/confirmar-con-cambio un recordatorio) | null,
   "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
   "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
-  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.{$this->faqJsonFields($coachContext)}
+  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.{$this->faqJsonFields($coachContext)}{$this->conversationReinforcementJsonField($coachContext)}
 }
-{$this->faqRulesFooter($coachContext)}
+{$this->faqRulesFooter($coachContext)}{$conversationReinforcementRule}
 
 Para "membership_status" NUNCA generes contenido factual — solo detecta que el intent está presente; el sistema responde ese dominio por su cuenta. El código, nunca tú, calcula la fecha/hora real y crea/modifica cualquier recordatorio — solo extraes lo que el usuario dijo, en el vocabulario cerrado de arriba.
 PROMPT;
@@ -184,6 +199,21 @@ TXT;
         return $coachContext->activeFaqs === null ? '' : self::FAQ_RULES."\n";
     }
 
+    /**
+     * H16.1 (Cambio 3) — mismo criterio que `faqJsonFields()`: el campo solo
+     * aparece en el contrato JSON cuando el HECHO (`needsConversationReinforcement`)
+     * está presente — la ausencia del campo en el esquema es, en sí misma,
+     * una señal adicional de que no corresponde.
+     */
+    private function conversationReinforcementJsonField(CoachContext $coachContext): string
+    {
+        if (! $coachContext->needsConversationReinforcement) {
+            return '';
+        }
+
+        return "\n  \"conversation_reinforcement_included\": true | false,";
+    }
+
     private function parseJson(string $raw): array
     {
         $cleaned = trim($raw);
@@ -213,6 +243,7 @@ TXT;
             'customer_service_message' => is_string($decoded['customer_service_message'] ?? null) && trim($decoded['customer_service_message']) !== ''
                 ? $decoded['customer_service_message']
                 : null,
+            'conversation_reinforcement_included' => ($decoded['conversation_reinforcement_included'] ?? false) === true,
         ];
     }
 }

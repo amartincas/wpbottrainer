@@ -204,6 +204,28 @@ class OnboardingConversationService
     }
 
     /**
+     * H16.1 (Cambio 1) — reutiliza la MISMA llamada de `extractAndRespond()`
+     * que ya completó el onboarding: cuando la IA marcó `next_action` como
+     * "complete_onboarding" (su propia señal de que ya no falta nada), su
+     * `response` puede llevar el reconocimiento de "perfil listo" — mismo
+     * criterio de validación que `resolveQuestion()` (nunca se confía en la
+     * IA a ciegas). Este método NO decide si el onboarding realmente
+     * terminó — esa verificación sigue siendo exclusiva de
+     * `OnboardingRequirementRegistry::isOnboardingComplete()`, ya evaluada
+     * de forma independiente por `TrainingHandler` antes de llamar aquí.
+     * `null` significa "usa el fallback determinista" — nunca "no hay perfil
+     * listo".
+     */
+    public function resolveProfileReadyMessage(?string $aiNextAction, ?string $aiResponse): ?string
+    {
+        if ($aiNextAction !== 'complete_onboarding' || ! $this->isUsableResponse($aiResponse)) {
+            return null;
+        }
+
+        return trim($aiResponse);
+    }
+
+    /**
      * Hito 9.3 (fix post-E2E). Sin esta línea, la IA extraía el mensaje del
      * usuario sin saber a qué pregunta respondía — un "piernas" o un "no"
      * sueltos, sin ese contexto, a veces no se lograban clasificar en
@@ -397,7 +419,7 @@ Reglas de "extracted":
 
 Reglas de "next_action": indica cuál de estos campos pendientes sigue sin responderse, en este orden de prioridad: name, goal, experience_level, training_location, available_equipment, health_screening, y luego (opcionales, no bloqueantes) sessions_per_week, primary_focus, datos físicos. Usa "complete_onboarding" solo si ya no falta nada de lo anterior. Este valor es solo orientativo — el sistema siempre verifica el estado real antes de usarlo.
 
-Reglas de "response": redacta en tono natural y cercano, como un entrenador personal real — NUNCA como un formulario. Si ya conoces el nombre del usuario, puedes usarlo con naturalidad. Si el onboarding sigue incompleto, reconoce brevemente lo que el usuario acaba de decir y luego haz la siguiente pregunta de forma conversacional. Máximo 2-3 frases. Nunca uses los términos técnicos "primary_focus"/"secondary_focus" — habla de "zona a priorizar" o similar, en lenguaje natural.
+Reglas de "response": redacta en tono natural y cercano, como un entrenador personal real — NUNCA como un formulario. Si ya conoces el nombre del usuario, puedes usarlo con naturalidad. Si el onboarding sigue incompleto, reconoce brevemente lo que el usuario acaba de decir y luego haz la siguiente pregunta de forma conversacional. Máximo 2-3 frases. Nunca uses los términos técnicos "primary_focus"/"secondary_focus" — habla de "zona a priorizar" o similar, en lenguaje natural. Si "next_action" es "complete_onboarding" (ya no falta nada), tu "response" debe reconocer en 1 frase breve que ya tienes lo necesario para armar su plan — NUNCA prometas que la rutina llega de inmediato (puede no ser el caso), y NUNCA menciones Trial, membresía ni acceso.
 PROMPT;
     }
 

@@ -75,6 +75,7 @@ class CoachContextProvider implements ContextProviderInterface
         $recentMessages = $this->recentMessagesFor($context);
         $pendingReminderSuggestion = $this->pendingReminderSuggestionFor($contact);
         $activeFaqs = $this->relevantFaqsFor($context->tenant, $context->message->messageBody ?? '');
+        $needsConversationReinforcement = $contact->trainingProfile?->coach_conversation_reinforced === false;
 
         $coachContext = new CoachContext(
             profileSnapshot: $historyContext->currentProfileSnapshot,
@@ -84,6 +85,7 @@ class CoachContextProvider implements ContextProviderInterface
             recentMessages: $recentMessages,
             pendingReminderSuggestion: $pendingReminderSuggestion,
             activeFaqs: $activeFaqs,
+            needsConversationReinforcement: $needsConversationReinforcement,
         );
 
         return new ContextFragment(

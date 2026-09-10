@@ -38,6 +38,7 @@ function minimalCoachContext(array $overrides = []): CoachContext
         progressionEvaluations: $overrides['progressionEvaluations'] ?? [],
         recentMessages: $overrides['recentMessages'] ?? [],
         activeFaqs: $overrides['activeFaqs'] ?? null,
+        needsConversationReinforcement: $overrides['needsConversationReinforcement'] ?? false,
     );
 }
 
@@ -51,7 +52,7 @@ it('returns an empty result for an empty message, without calling the AI provide
 
     $result = (new CoachService)->respond('', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
     Http::assertNothingSent();
 });
 
@@ -112,7 +113,7 @@ it('degrades to an empty result when the AI provider fails, without throwing', f
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
 });
 
 it('degrades to an empty result when the AI response is not valid JSON', function () {
@@ -120,7 +121,7 @@ it('degrades to an empty result when the AI response is not valid JSON', functio
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
 });
 
 it('treats an empty/blank training_reply as null, never an empty string action', function () {
@@ -266,6 +267,51 @@ it('never adds the FAQ-vs-membership_status priority rule when the FAQ gate is n
 
         return ! str_contains($systemMessage['content'], 'NUNCA incluyas también "membership_status"');
     });
+});
+
+// ── H16.1 (Cambio 3) — refuerzo de conversación libre ──────────────────
+
+it('does NOT include the conversation-reinforcement instruction/field when needsConversationReinforcement is false', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['exercise_question'], 'training_reply' => 'Explicación.',
+    ]))]);
+
+    (new CoachService)->respond('¿por qué este ejercicio?', minimalCoachContext(['needsConversationReinforcement' => false]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return ! str_contains($systemMessage['content'], 'conversation_reinforcement_included')
+            && ! str_contains($systemMessage['content'], 'REFUERZO PENDIENTE');
+    });
+});
+
+it('includes the conversation-reinforcement instruction/field when needsConversationReinforcement is true', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['exercise_question'], 'training_reply' => 'Explicación. Por cierto, puedes preguntarme lo que quieras.',
+        'conversation_reinforcement_included' => true,
+    ]))]);
+
+    $result = (new CoachService)->respond('¿por qué este ejercicio?', minimalCoachContext(['needsConversationReinforcement' => true]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], 'conversation_reinforcement_included')
+            && str_contains($systemMessage['content'], 'REFUERZO PENDIENTE');
+    });
+    expect($result['conversation_reinforcement_included'])->toBeTrue();
+});
+
+it('parses conversation_reinforcement_included defensively, defaulting to false for anything but a literal true', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+        'conversation_reinforcement_included' => 'yes',
+    ]))]);
+
+    $result = (new CoachService)->respond('mensaje', minimalCoachContext(['needsConversationReinforcement' => true]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['conversation_reinforcement_included'])->toBeFalse();
 });
 
 it('parses faq_match_id/faq_response_text/customer_service_needed/customer_service_message defensively', function () {

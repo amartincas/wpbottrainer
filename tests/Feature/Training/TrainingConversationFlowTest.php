@@ -143,6 +143,13 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
     Http::assertSent(fn ($request) => $request->url() === 'https://graph.facebook.com/v20.0/'.$tenant->wa_phone_number_id.'/messages'
         && str_contains(data_get($request->data(), 'text.body', ''), '🔥 Tu entrenamiento de hoy'));
 
+    // H16.1 (Cambio 1) — el Trial se concedió en el MISMO turno que completó
+    // el onboarding: el aviso de Trial ya cumple la función de "perfil
+    // listo", así que el texto de cierre que la IA redactó para ese turno
+    // ("¡Perfecto, ya tengo todo!") nunca debe salir como mensaje propio.
+    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com')
+        && data_get($request->data(), 'text.body', '') === '¡Perfecto, ya tengo todo!');
+
     $aiCalls = 0;
     foreach (Http::recorded() as [$request, $response]) {
         if (str_contains($request->url(), 'api.openai.com')) {
@@ -150,6 +157,46 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
         }
     }
     expect($aiCalls)->toBe(2); // exactamente 1 por turno, 2 turnos — no un tercero
+});
+
+it('H16.1 (Cambio 1): sends the AI-redacted "profile ready" message, reusing the same onboarding call, when completion happens WITHOUT granting a Trial in the same turn', function () {
+    // Un contacto que ya tenía acceso vigente (ej. pagó antes) y vuelve a
+    // completar su perfil — TrainingAccessGate ya permite, así que
+    // AutomaticTrialProvisioner nunca se ejecuta: no hay aviso de Trial que
+    // pueda "cubrir" el mensaje de perfil listo, así que debe enviarse.
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112299', 'customer_name' => 'Laura']);
+    \App\Models\TrainingAccess::factory()->create([
+        'contact_id' => $contact->id,
+        'status' => \App\Training\Enums\TrainingAccessStatus::Active,
+        'expires_at' => now()->addDays(10),
+        'trial_granted_at' => now()->subDays(20),
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(
+            fakeOnboardingTurn(
+                emptyExtraction(['goal' => 'build_muscle', 'experience_level' => 'beginner', 'training_location' => 'home', 'available_equipment' => [], 'health_condition_text' => '']),
+                'complete_onboarding',
+                'Con esto ya tengo lo que necesito para armar tu plan actualizado.'
+            ),
+            200
+        ),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendTrainingMessage($tenant, '573001112299', 'Quiero ganar músculo en casa, principiante, sin equipo, sin lesiones');
+
+    Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com')
+        && data_get($request->data(), 'text.body', '') === 'Con esto ya tengo lo que necesito para armar tu plan actualizado.');
+
+    // Nunca se concedió un Trial (ya tenía acceso) — sin aviso de Trial que
+    // pudiera confundirse con el mensaje de perfil listo.
+    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'período de prueba gratis'));
+
+    $aiCalls = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'))->count();
+    expect($aiCalls)->toBe(1); // única llamada del turno, reutilizada — nunca una segunda
 });
 
 // 11 y 12 (Hito 5.1, ajustado en Bloque 4/D047, luego en Bloque 5/D048):
@@ -211,8 +258,21 @@ it('completes the full onboarding conversation turn by turn with exactly ONE AI 
 
     // 6 llamadas de IA (una por turno bloqueante incompleto) + 8 respuestas
     // de WhatsApp (una por cada turno enviado, incluidos los 2 finales que
-    // ya no llaman a la IA porque el onboarding bloqueante ya terminó).
-    Http::assertSentCount(6 + count($turns));
+    // ya no llaman a la IA porque el onboarding bloqueante ya terminó) + 1
+    // adicional: H16.1 (Cambio 1) — el turno 6 completa el onboarding CON un
+    // health_condition_text presente, lo que deja `TrainingAccessGate` en
+    // 'health_screening_pending' (revisión humana pendiente antes de la
+    // primera rutina) — el aviso de "perfil listo" (que describe el PERFIL,
+    // no el acceso) se envía IGUAL, seguido del aviso de revisión pendiente
+    // en ese mismo turno y de nuevo en los turnos 7 y 8 (el gate lo sigue
+    // denegando mientras la revisión no se resuelva).
+    Http::assertSentCount(6 + count($turns) + 1);
+
+    // El "perfil listo" (H16.1, Cambio 1) se envía exactamente una vez, en
+    // el turno 6, redactado por la IA a partir de la MISMA llamada de
+    // onboarding — nunca una segunda llamada.
+    Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com')
+        && data_get($request->data(), 'text.body', '') === '¡Listo, ya tengo tu perfil completo!');
 
     $aiCalls = 0;
     foreach (Http::recorded() as [$request, $response]) {
@@ -268,8 +328,14 @@ it('Hito 15: a Contact who already had a Trial before is NOT re-granted one — 
 
     expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(0);
     expect(TrainingAccess::where('contact_id', $contact->id)->count())->toBe(1); // nunca un segundo Trial
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'activar tu acceso')
-        && str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
+    // H16.1 (Cambio 4) — un acceso Revoked ya NO usa el mensaje genérico de
+    // "activar tu acceso"/"quiero pagar": TrainingAccessGate lo sigue
+    // denegando exactamente igual (reason='access_invalid'), pero
+    // resolveAccessDeniedMessage() ahora lee el TrainingAccess.status real
+    // (Revoked) y produce el mensaje neutral orientado a revisión humana,
+    // que nunca invita a pagar por sí mismo (ver TrialEndedMessageComposer).
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'pausado en este momento'));
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'quiero pagar'));
 });
 
 it('generates and delivers a WorkoutSession with videos when access is granted, without asking onboarding questions again', function () {

@@ -126,6 +126,66 @@ it('Ronda 2 (Cambio 6): a referral question answers with the FAQ, never the memb
     Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Todavía no puedo resolver esto directamente'));
 });
 
+it('H16.1 (Cambio 3): marks coach_conversation_reinforced=true only after the AI confirms the reinforcement was actually included in training_reply', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150004']);
+    $profile = TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true, 'coach_conversation_reinforced' => false]);
+    app(TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+
+    // Sesión "en curso" (mismo fixture ya usado en este archivo) para que el
+    // Router enrute a Training sin necesitar ninguna keyword.
+    $exercise = Exercise::factory()->create(['tracking_type' => TrackingType::RepsAndLoad]);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    $workoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(), 'prescribed_sets' => 3, 'prescribed_reps' => 10, 'prescribed_load' => 40,
+    ]);
+    $log = \App\Models\ExerciseLog::factory()->create(['workout_exercise_id' => $workoutExercise->id]);
+    \App\Models\ExerciseSet::factory()->create(['exercise_log_id' => $log->id]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null, 'intents' => ['exercise_question'], 'training_reply' => 'Porque tu evaluación reciente lo permitió. Por cierto, puedes preguntarme lo que quieras.',
+            'conversation_reinforcement_included' => true,
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    commercialInteractionMessage($tenant, '573001150004', '¿por qué ese peso?');
+
+    expect($profile->fresh()->coach_conversation_reinforced)->toBeTrue();
+});
+
+it('H16.1 (Cambio 3): never marks coach_conversation_reinforced when the AI does not confirm inclusion, even though the reinforcement was requested that turn', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150005']);
+    $profile = TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true, 'coach_conversation_reinforced' => false]);
+    app(TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
+
+    $exercise = Exercise::factory()->create(['tracking_type' => TrackingType::RepsAndLoad]);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    $workoutExercise = WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exercise->id,
+        'exercise_snapshot' => $exercise->toSnapshot(), 'prescribed_sets' => 3, 'prescribed_reps' => 10, 'prescribed_load' => 40,
+    ]);
+    $log = \App\Models\ExerciseLog::factory()->create(['workout_exercise_id' => $workoutExercise->id]);
+    \App\Models\ExerciseSet::factory()->create(['exercise_log_id' => $log->id]);
+
+    // La IA responde training_reply pero NUNCA confirma haber incluido el
+    // refuerzo (campo ausente -> false por defecto) — el booleano no debe
+    // marcarse, sin importar que sí se le pidió este turno.
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
+            'safety_signal_text' => null, 'intents' => ['exercise_question'], 'training_reply' => 'Porque tu evaluación reciente lo permitió.',
+        ])]]]], 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    commercialInteractionMessage($tenant, '573001150005', '¿por qué ese peso?');
+
+    expect($profile->fresh()->coach_conversation_reinforced)->toBeFalse();
+});
+
 it('a reply after a fired Reminder can naturally continue into Training, without the Scheduler/Queue interfering with the commercial state', function () {
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150002']);

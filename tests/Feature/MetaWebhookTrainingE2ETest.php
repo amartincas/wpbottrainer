@@ -199,8 +199,14 @@ it('persists the outbound message and logs the failure when Meta rejects the sen
 
     $botMessage = WhatsAppMessage::where('tenant_id', $tenant->id)->where('role', 'assistant')->first();
     expect($botMessage)->not->toBeNull();
-    // Mensaje actualizado en Hito 8.1 — instrucción explícita ("quiero pagar").
-    expect($botMessage->content)->toContain('activar tu acceso');
+    // H16.1 (Cambio 4) — este Contact tiene acceso Revoked (no simplemente
+    // "nunca tuvo acceso"), así que resolveAccessDeniedMessage() ya no usa
+    // el mensaje genérico de "activar tu acceso"/"quiero pagar" — produce el
+    // mensaje neutral orientado a revisión humana (determinista, sin IA, ver
+    // TrialEndedMessageComposer::fallbackFor()). Lo relevante para este test
+    // sigue intacto: el mensaje se persiste igual aunque Meta rechace el envío.
+    expect($botMessage->content)->toContain('pausado en este momento');
+    expect($botMessage->content)->not->toContain('quiero pagar');
 });
 
 it('degrades gracefully through the real webhook route when the AI provider fails during onboarding', function () {

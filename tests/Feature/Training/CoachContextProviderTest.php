@@ -306,3 +306,36 @@ it('CoachFactsFormatter never mentions a pending reminder when there is none', f
 
     expect($facts)->not->toContain('RECORDATORIO PROPUESTO PENDIENTE');
 });
+
+// ── needsConversationReinforcement (H16.1, Cambio 3) ────────────────────
+
+it('needsConversationReinforcement is true when the profile has never had the reinforcement shown', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000013']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'coach_conversation_reinforced' => false]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000013'))->data;
+
+    expect($context->needsConversationReinforcement)->toBeTrue();
+});
+
+it('needsConversationReinforcement is false once the profile already has the reinforcement marked', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000014']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'coach_conversation_reinforced' => true]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000014'))->data;
+
+    expect($context->needsConversationReinforcement)->toBeFalse();
+});
+
+it('CoachFactsFormatter includes the REFUERZO PENDIENTE fact only when needsConversationReinforcement is true', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000015']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'coach_conversation_reinforced' => false]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000015'))->data;
+    $facts = (new CoachFactsFormatter)->format($context);
+
+    expect($facts)->toContain('REFUERZO PENDIENTE');
+});

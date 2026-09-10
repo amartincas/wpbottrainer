@@ -28,6 +28,8 @@ use App\Training\Enums\ReminderSuggestionOrigin;
 use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SplitType;
+use App\Training\Enums\TrainingAccessStatus;
+use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Onboarding\OnboardingConversationComposer;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
 use App\Training\Support\AutomaticTrialProvisioner;
@@ -45,6 +47,7 @@ use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrialEndedMessageComposer;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -156,6 +159,16 @@ class TrainingHandler implements HandlerInterface
         .'seguir, puedes escribirme para conocer la membresía.';
 
     /**
+     * H16.1 (Cambio 1) — fallback determinista, usado cuando la IA de
+     * onboarding no produjo una redacción válida para el turno de
+     * finalización (ver `OnboardingConversationService::resolveProfileReadyMessage()`).
+     * Deliberadamente NO promete que la rutina llega de inmediato — un
+     * intento de Trial automático inelegible en el mismo turno puede
+     * terminar en un mensaje de acceso requerido en vez de una rutina.
+     */
+    private const PROFILE_READY_FALLBACK_MESSAGE = 'Con esto ya tengo lo que necesito para armar tu plan.';
+
+    /**
      * Hito 15.1 (Ronda 2, Cambio 4) — se envía UNA sola vez, siempre después
      * de todos los mensajes de la entrega (header + cada ejercicio + video),
      * únicamente cuando el paso 6 genera una sesión genuinamente nueva en
@@ -234,6 +247,7 @@ class TrainingHandler implements HandlerInterface
         private readonly FaqMatcher $faqMatcher,
         private readonly CustomerServiceRequestRecorder $customerServiceRecorder,
         private readonly AutomaticTrialProvisioner $trialProvisioner,
+        private readonly TrialEndedMessageComposer $trialEndedComposer,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -295,6 +309,11 @@ class TrainingHandler implements HandlerInterface
         // turno, la llamada de IA de onboarding ya fue la única permitida —
         // el paso 5 (Coach) no debe hacer una segunda. Ver más abajo.
         $onboardingJustCompletedThisTurn = false;
+        // H16.1 (Cambio 1) — calculado AQUÍ (si aplica) pero enviado más
+        // abajo, después de resolver el paso 3: si en este mismo turno se
+        // concede un Trial automático, ese aviso ya cumple la función de
+        // "perfil listo" (ver más abajo) — se decide recién entonces.
+        $profileReadyMessage = null;
 
         if (! $this->requirementRegistry->isOnboardingComplete($profile, $contact)) {
             // "onboarding_turns": una interacción procesada mientras el
@@ -368,6 +387,13 @@ class TrainingHandler implements HandlerInterface
             // completó en este mismo turno, con la única llamada de IA ya
             // consumida por `extractAndRespond()`.
             $onboardingJustCompletedThisTurn = true;
+
+            // H16.1 (Cambio 1) — reutiliza la MISMA llamada de arriba, sin
+            // ninguna llamada de IA adicional. El fallback determinista se
+            // resuelve aquí mismo para que, más abajo, un simple `!== null`
+            // baste para decidir si corresponde enviarlo.
+            $profileReadyMessage = $this->onboarding->resolveProfileReadyMessage($result['next_action'], $result['response'])
+                ?? self::PROFILE_READY_FALLBACK_MESSAGE;
         }
 
         // 3. Acceso — frontera única hacia el sistema comercial (Hito 4).
@@ -393,13 +419,27 @@ class TrainingHandler implements HandlerInterface
                 // que garantiza el aviso exactamente una vez, en el turno
                 // real de la concesión.
                 $this->sendTrialGrantedNotice($from, $tenant, $grantedTrial);
+                // H16.1 (Cambio 1, orden de mensajes) — el aviso de Trial ya
+                // cumple la función de "perfil listo" (confirma que el
+                // perfil está completo y que hay acceso) — enviar ambos
+                // sería redundante. Se omite únicamente en este caso.
+                $profileReadyMessage = null;
                 $freshContact = $freshContact->fresh();
                 $gateResult = $this->accessGate->authorize($freshContact);
             }
         }
 
+        // H16.1 (Cambio 1) — se envía aquí, después de resolver el intento
+        // de Trial, sin importar si el acceso terminó permitido o denegado:
+        // "perfil listo" describe la completitud del PERFIL, no el acceso —
+        // sigue siendo cierto incluso si el turno termina en un mensaje de
+        // acceso requerido a continuación.
+        if ($profileReadyMessage !== null) {
+            $this->reply($from, $profileReadyMessage, $tenant);
+        }
+
         if (! $gateResult->allowed) {
-            $this->respondToDenial($gateResult->reason, $from, $tenant);
+            $this->respondToDenial($gateResult->reason, $freshContact, $from, $tenant);
 
             return;
         }
@@ -453,6 +493,19 @@ class TrainingHandler implements HandlerInterface
             // totalmente determinista. Ver docs/DECISIONS.md.
             $result = $this->faqMatcher->sanitize($result, $coachContext->activeFaqs ?? []);
             $resolved = $this->turnResolver->resolve($result);
+
+            // H16.1 (Cambio 3) — se marca ÚNICAMENTE cuando el contrato JSON
+            // confirma explícitamente que el refuerzo se incorporó Y ese
+            // texto realmente se va a enviar (una acción SendText resuelta
+            // para él) — nunca por el solo hecho de haber invocado a
+            // CoachService, ni por que el campo llegara en true sin que se
+            // hubiera pedido este turno (needsConversationReinforcement).
+            if ($coachContext->needsConversationReinforcement
+                && $result['conversation_reinforcement_included']
+                && collect($resolved->actions)->contains(fn ($action) => $action->type === ConversationActionType::SendText)) {
+                $profile->update(['coach_conversation_reinforced' => true]);
+            }
+
             $shouldDeliverSession = $this->executeTurnActions($resolved, null, $from, $tenant, $freshContact, $profile, $startedAt, $body);
 
             if (! $shouldDeliverSession) {
@@ -468,7 +521,7 @@ class TrainingHandler implements HandlerInterface
         try {
             $session = $this->engine->decideNextSession($freshContact);
         } catch (TrainingAccessDeniedException $e) {
-            $this->respondToDenial($e->reason, $from, $tenant);
+            $this->respondToDenial($e->reason, $freshContact, $from, $tenant);
 
             return;
         }
@@ -984,7 +1037,7 @@ class TrainingHandler implements HandlerInterface
         $this->reply($from, $message, $tenant);
     }
 
-    private function respondToDenial(?string $reason, string $from, Tenant $tenant): void
+    private function respondToDenial(?string $reason, Contact $contact, string $from, Tenant $tenant): void
     {
         $message = match ($reason) {
             'safety_flagged' => SafetySignalDetector::ESCALATION_MESSAGE,
@@ -993,10 +1046,58 @@ class TrainingHandler implements HandlerInterface
             // informa que hay una revisión humana en curso. Ver
             // TrainingAccessGate::authorize() y docs/DECISIONS.md D048.
             'health_screening_pending' => self::HEALTH_SCREENING_PENDING_MESSAGE,
-            default => self::ACCESS_REQUIRED_MESSAGE,
+            default => $this->resolveAccessDeniedMessage($contact, $tenant),
         };
 
         $this->reply($from, $message, $tenant);
+    }
+
+    /**
+     * H16.1 (Cambio 4) — diferencia el mensaje según el estado REAL del
+     * acceso ('no_access'/'access_invalid', los dos motivos que caen aquí),
+     * en vez del mensaje genérico único de antes. `TrainingAccessGate` sigue
+     * siendo la única autoridad de SI se deniega, sin cambios — este método
+     * solo decide QUÉ texto corresponde, leyendo datos ya persistidos.
+     */
+    private function resolveAccessDeniedMessage(Contact $contact, Tenant $tenant): string
+    {
+        $access = $contact->trainingAccess;
+
+        if ($access === null) {
+            return self::ACCESS_REQUIRED_MESSAGE;
+        }
+
+        if ($access->status === TrainingAccessStatus::Revoked) {
+            return $this->trialEndedComposer->compose(
+                ['access_state' => 'revoked', 'completed_sessions_count' => null],
+                $tenant,
+            );
+        }
+
+        if ($access->status === TrainingAccessStatus::Trial) {
+            $completedSessions = WorkoutSession::where('contact_id', $contact->id)
+                ->where('status', WorkoutSessionStatus::Completed)
+                ->count();
+
+            if ($completedSessions === 0) {
+                // Mismo mensaje que "nunca tuvo acceso" — un Trial vencido
+                // sin ninguna sesión completada no tiene ningún hecho real
+                // que citar, sería contraproducente inventar una variante.
+                return self::ACCESS_REQUIRED_MESSAGE;
+            }
+
+            return $this->trialEndedComposer->compose(
+                ['access_state' => 'trial_expired', 'completed_sessions_count' => $completedSessions],
+                $tenant,
+            );
+        }
+
+        // Active/Free vencidos — únicos estados restantes que
+        // TrainingAccessGate deniega con 'access_invalid'.
+        return $this->trialEndedComposer->compose(
+            ['access_state' => 'paid_expired', 'completed_sessions_count' => null],
+            $tenant,
+        );
     }
 
     private function stripAudioPrefix(string $body): string

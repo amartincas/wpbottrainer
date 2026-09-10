@@ -683,3 +683,46 @@ it('end-to-end: common negative-response phrasings for restrictions are all acce
 })->with([
     'no', 'No', 'ninguna', 'ninguno', 'no tengo', 'nada', 'no, ninguna',
 ]);
+
+// ── H16.1 (Cambio 1): "perfil listo" reutiliza la MISMA llamada ────────
+
+it('the combined prompt instructs a brief, honest closing response for the completion turn (next_action=complete_onboarding), without promising immediate delivery or mentioning Trial/access', function () {
+    fakeCombinedResponse(combinedPayload());
+
+    (new OnboardingConversationService)->extractAndRespond('algo', [], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'complete_onboarding')
+            && str_contains($systemPrompt, 'NUNCA prometas que la rutina llega de inmediato')
+            && str_contains($systemPrompt, 'NUNCA menciones Trial, membresía ni acceso');
+    });
+});
+
+it('resolveProfileReadyMessage() returns the AI response when next_action is complete_onboarding and the response is usable', function () {
+    $service = new OnboardingConversationService;
+
+    $message = $service->resolveProfileReadyMessage('complete_onboarding', '¡Perfecto, ya tengo todo lo que necesito!');
+
+    expect($message)->toBe('¡Perfecto, ya tengo todo lo que necesito!');
+});
+
+it('resolveProfileReadyMessage() returns null (use the deterministic fallback) when next_action is not complete_onboarding', function () {
+    $service = new OnboardingConversationService;
+
+    // La IA todavía cree que falta algo — nunca se usa su `response` como
+    // "perfil listo", aunque el código YA determinó independientemente que
+    // el onboarding sí terminó (ver TrainingHandler).
+    expect($service->resolveProfileReadyMessage('ask_health_screening', 'Cuéntame si tienes alguna lesión.'))->toBeNull();
+    expect($service->resolveProfileReadyMessage(null, 'algo'))->toBeNull();
+});
+
+it('resolveProfileReadyMessage() returns null when the response is empty, blank, or too long, even if next_action matches', function () {
+    $service = new OnboardingConversationService;
+
+    expect($service->resolveProfileReadyMessage('complete_onboarding', ''))->toBeNull();
+    expect($service->resolveProfileReadyMessage('complete_onboarding', '   '))->toBeNull();
+    expect($service->resolveProfileReadyMessage('complete_onboarding', null))->toBeNull();
+    expect($service->resolveProfileReadyMessage('complete_onboarding', str_repeat('a', 301)))->toBeNull();
+});
