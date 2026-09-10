@@ -597,3 +597,151 @@ it('records skip_reason as null when not_performed is true but no reason was giv
     expect($log)->not->toBeNull();
     expect($log->skip_reason)->toBeNull();
 });
+
+// ── H16.2 Fase 1 — cierre de sesión: nunca "pendientes" + "completada" ────
+
+it('"ya terminé" with real pendientes never completes the session and never claims completion', function () {
+    $contact = readyTrainingContact();
+    [$session, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Caminata de monstruo con banda'],
+        ['name' => 'Sentadilla con banda'],
+        ['name' => 'Fondos en banco'],
+    ]);
+
+    Http::fake([
+        // Confirmación breve sin detalle: un elemento en "reports" con
+        // exercise_name=null (mismo contrato ya validado en producción,
+        // ver ExecutionReportService::buildPrompt()), + session_finished=true.
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => null, 'not_performed' => false,
+                'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => true,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Ya terminé');
+
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    foreach ($workoutExercises as $we) {
+        expect(ExerciseLog::where('workout_exercise_id', $we->id)->exists())->toBeFalse();
+    }
+
+    // Nunca afirma que la sesión terminó — el fake de IA responde JSON
+    // (validate() lo rechaza), así que se usa el fallback determinista de
+    // BlockedStillPending, que nombra los 3 pendientes reales.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Caminata de monstruo con banda')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla con banda')
+        && str_contains(data_get($request->data(), 'text.body', ''), 'Fondos en banco'));
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'completad')
+        || str_contains(data_get($request->data(), 'text.body', ''), '🏁'));
+});
+
+it('"ya terminé" with everything reported in the same message closes the session with a SuccessFull message', function () {
+    $contact = readyTrainingContact();
+    [$session, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Sentadilla', 'not_performed' => false,
+                'sets' => [['reps' => 10, 'load' => 40, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => true,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Ya terminé, hice 10 con 40 en sentadilla');
+
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Completed);
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Entrenamiento completado'));
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'pendiente'));
+});
+
+it('two consecutive "ya terminé" attempts with pendientes never produce a "pendientes"+"completada" contradiction in either turn', function () {
+    $contact = readyTrainingContact();
+    [$session, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Sentadilla'],
+        ['name' => 'Fondos en banco'],
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::sequence()
+            ->push(reportExtractionBody([
+                'reports' => [['exercise_name' => null, 'not_performed' => false, 'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false]],
+                'session_finished' => true,
+            ]))
+            ->push(reportExtractionBody([
+                'reports' => [['exercise_name' => null, 'not_performed' => false, 'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false]],
+                'session_finished' => true,
+            ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Ya terminé');
+    sendMessageAsContact($contact, 'Ya terminé');
+
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+
+    // Ninguno de los 2 mensajes salientes mezcla "pendiente(s)" con
+    // "completada"/"🏁" — la contradicción original nunca puede reaparecer.
+    foreach (Http::recorded() as [$request, $response]) {
+        if (! str_contains($request->url(), 'graph.facebook.com')) {
+            continue;
+        }
+
+        $body = data_get($request->data(), 'text.body', '');
+        $mentionsPending = str_contains($body, 'faltan') || str_contains($body, 'pendiente');
+        $claimsCompleted = str_contains($body, 'completad') || str_contains($body, '🏁');
+
+        expect($mentionsPending && $claimsCompleted)->toBeFalse();
+    }
+});
+
+it('the session-close flow produces the same BlockedStillPending fallback for a Trial contact as for any other', function () {
+    $contact = readyTrainingContact();
+    TrainingAccess::where('contact_id', $contact->id)->update(['status' => TrainingAccessStatus::Trial]);
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla'], ['name' => 'Fondos en banco']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [['exercise_name' => null, 'not_performed' => false, 'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false]],
+            'session_finished' => true,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Ya terminé');
+
+    // Mismo fallback determinista que produce cualquier otro estado de
+    // acceso (Active/Free) — ver el siguiente test — nunca una rama por
+    // TrainingAccessStatus dentro de determineSessionCloseIntent()/
+    // SessionCloseMessageComposer.
+    Http::assertSent(fn ($request) => data_get($request->data(), 'text.body') ===
+        '¡Casi! 💪 Todavía te faltan estos ejercicios: Sentadilla, Fondos en banco. Cuando los tengas, cuéntame y cerramos el entrenamiento.');
+});
+
+it('the session-close flow produces the same BlockedStillPending fallback for an active paid membership contact', function () {
+    $contact = readyTrainingContact();
+    // readyTrainingContact() ya deja TrainingAccessStatus::Active por
+    // defecto (ver factory) — sin overrides, a propósito, para que este
+    // test y el anterior sean textualmente comparables.
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla'], ['name' => 'Fondos en banco']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [['exercise_name' => null, 'not_performed' => false, 'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false]],
+            'session_finished' => true,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Ya terminé');
+
+    Http::assertSent(fn ($request) => data_get($request->data(), 'text.body') ===
+        '¡Casi! 💪 Todavía te faltan estos ejercicios: Sentadilla, Fondos en banco. Cuando los tengas, cuéntame y cerramos el entrenamiento.');
+});

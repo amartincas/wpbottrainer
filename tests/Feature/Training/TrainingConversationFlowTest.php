@@ -371,22 +371,28 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
 
     $session = WorkoutSession::where('contact_id', $contact->id)->first();
     expect($session)->not->toBeNull();
+    // TrainingEngine sigue decidiendo los 3 de una sola vez (dato/prescripción,
+    // sin cambios) — H16.2 Fase 1 solo cambia CUÁNDO se ENTREGAN por WhatsApp.
     expect($session->workoutExercises)->toHaveCount(3);
 
     // La cabecera mínima de sesión se envió.
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'entrenamiento de hoy'));
 
-    // El texto de técnica de cada ejercicio se envió, con sus instrucciones
+    // El texto de técnica del PRIMER ejercicio se envió, con sus instrucciones
     // reales tomadas del snapshot — nunca hardcodeadas en TrainingHandler.
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Flexiones')
         && str_contains(data_get($request->data(), 'text.body', ''), 'Manos a la anchura de los hombros')
         && str_contains(data_get($request->data(), 'text.body', ''), 'Inhala al bajar, exhala al subir'));
 
-    // Un video por cada ejercicio con exercise_snapshot.video_url.
-    foreach ([$chest, $legs, $back] as $exercise) {
-        Http::assertSent(fn ($request) => data_get($request->data(), 'type') === 'video'
+    // H16.2 Fase 1 — entrega progresiva: SOLO el video del primer ejercicio
+    // se envía este turno, nunca los 3 de una sola vez.
+    Http::assertSent(fn ($request) => data_get($request->data(), 'type') === 'video'
+        && data_get($request->data(), 'video.link') === $chest->video_url);
+    foreach ([$legs, $back] as $exercise) {
+        Http::assertNotSent(fn ($request) => data_get($request->data(), 'type') === 'video'
             && data_get($request->data(), 'video.link') === $exercise->video_url);
     }
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla'));
 
     // Exactamente 1 llamada de IA en todo el turno (D026/D052).
     $openAiCalls = collect(Http::recorded())->filter(fn ($pair) => str_contains($pair[0]->url(), 'api.openai.com'));

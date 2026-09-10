@@ -19,6 +19,7 @@ use App\Models\Tenant;
 use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
 use App\Models\WhatsAppMessage;
+use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
@@ -27,6 +28,7 @@ use App\Training\Enums\ConversationActionType;
 use App\Training\Enums\ReminderSuggestionOrigin;
 use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\SafetyStatus;
+use App\Training\Enums\SessionCloseIntent;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingAccessStatus;
 use App\Training\Enums\WorkoutSessionStatus;
@@ -44,10 +46,12 @@ use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\SafetySignalDetector;
+use App\Training\Support\SessionCloseMessageComposer;
 use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrialEndedMessageComposer;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -185,6 +189,28 @@ class TrainingHandler implements HandlerInterface
         .'Cuando termines todos, escríbeme "ya terminé" para cerrar la sesión. 💪';
 
     /**
+     * H16.2 Fase 1 — entrega progresiva: transición determinista (sin IA,
+     * ver docblock de `recordExecutionReport()`) enviada antes del siguiente
+     * ejercicio, únicamente tras un reporte real ya persistido de uno
+     * anterior. Rotación simple por `WorkoutExercise.order` — evita repetir
+     * literalmente la misma frase entre el ejercicio 2 y el 3 de una misma
+     * sesión, sin necesitar IA para algo tan acotado.
+     */
+    private const EXERCISE_ADVANCE_MESSAGES = [
+        '¡Bien! 💪 Vamos con el siguiente.',
+        'Perfecto, sigamos.',
+        '¡Anotado! Vamos con el que sigue.',
+    ];
+
+    /**
+     * H16.2 Fase 1 — cierre implícito (el usuario completó el último
+     * ejercicio pendiente SIN decir "ya terminé"/equivalente): determinista,
+     * sin IA (ver regla "nunca una segunda llamada por un reporte normal").
+     * Mismo copy que la constante que reemplaza (Hito 9.2).
+     */
+    private const SESSION_COMPLETED_IMPLICIT_MESSAGE = '🏁 Sesión completada. ¡Buen trabajo! Escríbeme cuando quieras tu próximo entrenamiento.';
+
+    /**
      * Hito 10 — atajo determinista (cero IA) para una afirmación corta
      * dentro de la ventana de continuidad de un Reminder ya disparado (ver
      * `Reminder.awaiting_response_until`, D053). Vocabulario cerrado y
@@ -248,6 +274,7 @@ class TrainingHandler implements HandlerInterface
         private readonly CustomerServiceRequestRecorder $customerServiceRecorder,
         private readonly AutomaticTrialProvisioner $trialProvisioner,
         private readonly TrialEndedMessageComposer $trialEndedComposer,
+        private readonly SessionCloseMessageComposer $sessionCloseComposer,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -538,40 +565,69 @@ class TrainingHandler implements HandlerInterface
         // así que repetirlas aquí sería fragmentación redundante, no menos.
         $this->reply($from, '🔥 Tu entrenamiento de hoy', $tenant);
 
-        foreach ($session->workoutExercises as $index => $workoutExercise) {
-            $this->reply($from, $this->messageFormatter->format($workoutExercise, $index + 1), $tenant);
+        // H16.2 Fase 1 — entrega progresiva: se entrega ÚNICAMENTE el primer
+        // ejercicio (order más bajo — ya garantizado por
+        // WorkoutSession::workoutExercises(), ver Modelo) — nunca los N de
+        // una sola vez. El resto se entrega uno a la vez, solo tras un
+        // reporte real del anterior (ver recordExecutionReport()) — sin
+        // ningún estado nuevo persistido: "el siguiente" siempre se deriva
+        // de los WorkoutExercise sin ExerciseLog, ya ordenados por columna.
+        // Guard defensivo (ya existía implícitamente en el bucle anterior,
+        // que simplemente no iteraba nada): una sesión sin ningún ejercicio
+        // elegible (catálogo vacío/sin match) no debe romper el turno.
+        $firstExercise = $session->workoutExercises->first();
 
-            // Hito 9.1: la URL de video NUNCA viene del snapshot histórico
-            // (que puede describir un ejercicio de proveedor sin video_url
-            // propio, por diseño) — se resuelve fresca en este mismo
-            // instante, vía MediaResolver. Un fallo de resolución (ejercicio
-            // borrado, proveedor caído, etc.) omite SOLO el video de este
-            // ejercicio — nunca bloquea el resto del mensaje ya enviado.
-            $exercise = $workoutExercise->exercise;
-            $resolvedMedia = $exercise !== null ? $this->mediaResolver->resolve($exercise) : null;
-
-            if ($resolvedMedia !== null) {
-                $videoStartedAt = microtime(true);
-                $sent = WhatsAppService::sendWhatsAppVideo(
-                    $from,
-                    $resolvedMedia->url,
-                    $tenant,
-                    $workoutExercise->exercise_snapshot['name'] ?? null,
-                );
-
-                Log::info($sent ? 'TRAINING_VIDEO_SENT' : 'TRAINING_VIDEO_SEND_FAILED', [
-                    'workout_exercise_id' => $workoutExercise->id,
-                    'provider' => $exercise->provider,
-                    'elapsed_ms' => (int) round((microtime(true) - $videoStartedAt) * 1000),
-                ]);
-            }
+        if ($firstExercise !== null) {
+            $this->deliverExercise($firstExercise, $from, $tenant);
         }
 
-        // Hito 15.1 (Cambio 4) — siempre al final, después de header +
-        // todos los ejercicios + sus videos: nunca antes, para no
-        // fragmentar la entrega ni competir con el contenido del
-        // entrenamiento mismo.
+        // Hito 15.1 (Cambio 4) — siempre al final, después del primer
+        // ejercicio entregado: nunca antes, para no fragmentar la entrega ni
+        // competir con el contenido del entrenamiento mismo.
         $this->reply($from, self::EXECUTION_INSTRUCTIONS_MESSAGE, $tenant);
+    }
+
+    /**
+     * H16.2 Fase 1 — entrega UN ejercicio (técnica + video) como unidad,
+     * reutilizada tanto para el primero de una sesión (paso 6) como para
+     * cada avance tras un reporte real (`recordExecutionReport()`).
+     * Extraído sin cambios de comportamiento respecto al bucle que
+     * reemplaza — mismos mecanismos (`ExerciseMessageFormatter`/
+     * `MediaResolver`), ahora aplicados a un solo `WorkoutExercise` por
+     * llamada. Numera con `WorkoutExercise->order` (columna real, ya
+     * ordenada) en vez de un índice de bucle — el número mostrado es
+     * siempre correcto sin importar si se entrega el primero o se avanza.
+     */
+    private function deliverExercise(WorkoutExercise $workoutExercise, string $from, Tenant $tenant): void
+    {
+        $this->reply($from, $this->messageFormatter->format($workoutExercise, $workoutExercise->order), $tenant);
+
+        // Hito 9.1: la URL de video NUNCA viene del snapshot histórico
+        // (que puede describir un ejercicio de proveedor sin video_url
+        // propio, por diseño) — se resuelve fresca en este mismo
+        // instante, vía MediaResolver. Un fallo de resolución (ejercicio
+        // borrado, proveedor caído, etc.) omite SOLO el video de este
+        // ejercicio — nunca bloquea el resto del mensaje ya enviado.
+        $exercise = $workoutExercise->exercise;
+        $resolvedMedia = $exercise !== null ? $this->mediaResolver->resolve($exercise) : null;
+
+        if ($resolvedMedia === null) {
+            return;
+        }
+
+        $videoStartedAt = microtime(true);
+        $sent = WhatsAppService::sendWhatsAppVideo(
+            $from,
+            $resolvedMedia->url,
+            $tenant,
+            $workoutExercise->exercise_snapshot['name'] ?? null,
+        );
+
+        Log::info($sent ? 'TRAINING_VIDEO_SENT' : 'TRAINING_VIDEO_SEND_FAILED', [
+            'workout_exercise_id' => $workoutExercise->id,
+            'provider' => $exercise->provider,
+            'elapsed_ms' => (int) round((microtime(true) - $videoStartedAt) * 1000),
+        ]);
     }
 
     /**
@@ -703,6 +759,21 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
+     * H16.2 Fase 1 — regla "código decide, IA redacta" aplicada al cierre de
+     * sesión: la SEGUNDA llamada de IA de este turno (`SessionCloseMessageComposer`)
+     * ocurre ÚNICA Y EXCLUSIVAMENTE cuando `$report['session_finished']` es
+     * `true` — un intento EXPLÍCITO de cierre ("ya terminé"/equivalente),
+     * ya calculado por la extracción de `ExecutionReportService` (la única
+     * llamada de IA de este turno hasta este punto). Un reporte normal
+     * (`session_finished=false`) NUNCA dispara esta segunda llamada, ni
+     * siquiera cuando ese mismo reporte completa la sesión de forma
+     * implícita (ese caso usa `SESSION_COMPLETED_IMPLICIT_MESSAGE`, sin IA).
+     *
+     * `SessionCloseIntent` se calcula AQUÍ, en código, DESPUÉS de que
+     * `ExecutionReportRecorder::record()` ya decidió el estado real — el
+     * composer solo recibe la intención y los hechos ya resueltos, nunca
+     * decide si la sesión está completa ni qué falta.
+     *
      * @param  array{reports: array, session_finished: bool}  $report
      * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
      */
@@ -722,7 +793,40 @@ class TrainingHandler implements HandlerInterface
             'elapsed_ms' => $elapsedMs,
         ]);
 
-        $this->reply($from, $this->buildReportResponseMessage($outcome), $tenant);
+        // Estado fresco, necesario tanto para decidir el próximo ejercicio
+        // como para calcular SessionCloseIntent — exerciseSets se necesita
+        // para distinguir Performed de Skipped (mismo criterio ya usado en
+        // CoachContextProvider/TrainingHistoryContextProvider).
+        $session->load(['workoutExercises.exerciseLog.exerciseSets']);
+        $stillUnreported = $session->workoutExercises->filter(fn (WorkoutExercise $we) => $we->exerciseLog === null)->values();
+
+        $explicitCloseAttempt = ($report['session_finished'] ?? false) === true;
+
+        if ($explicitCloseAttempt) {
+            $intent = $this->determineSessionCloseIntent($outcome, $session);
+            $facts = $this->buildSessionCloseFacts($intent, $outcome, $stillUnreported, $session, $contact);
+            $this->reply($from, $this->sessionCloseComposer->compose($intent, $facts, $tenant), $tenant);
+        } else {
+            $this->reply($from, $this->buildDeterministicReportMessage($outcome), $tenant);
+
+            // H16.2 Fase 1 — avanzar al siguiente ejercicio: ÚNICAMENTE tras
+            // un reporte REAL ya persistido este turno (`logged !== []`) —
+            // una pregunta sola, o un intento que no logró resolverse a
+            // ningún ejercicio (solo `clarifications`), NUNCA avanza ni
+            // reenvía el ejercicio actual.
+            if ($outcome->logged !== [] && ! $outcome->sessionCompleted && $stillUnreported->isNotEmpty()) {
+                $next = $stillUnreported->first();
+
+                Log::info('TRAINING_EXERCISE_ADVANCED', [
+                    'workout_session_id' => $session->id,
+                    'workout_exercise_id' => $next->id,
+                    'order' => $next->order,
+                ]);
+
+                $this->reply($from, $this->exerciseAdvanceTransition($next), $tenant);
+                $this->deliverExercise($next, $from, $tenant);
+            }
+        }
 
         // Hito 10, Trigger 2 de proactividad — determinista, sin IA: la
         // decisión de ofrecer (o no) la toma ReminderProactivityGate, nunca
@@ -732,7 +836,14 @@ class TrainingHandler implements HandlerInterface
         }
     }
 
-    private function buildReportResponseMessage(ExecutionReportOutcome $outcome): string
+    /**
+     * H16.2 Fase 1 — mensaje determinista para el camino SIN intento
+     * explícito de cierre (reporte normal). Nunca puede coexistir un cierre
+     * afirmado con pendientes reales: `sessionCompleted` ya no puede ser
+     * `true` mientras exista un ejercicio sin `ExerciseLog` (fix de
+     * `ExecutionReportRecorder::maybeCompleteSession()`).
+     */
+    private function buildDeterministicReportMessage(ExecutionReportOutcome $outcome): string
     {
         $lines = [];
 
@@ -750,10 +861,67 @@ class TrainingHandler implements HandlerInterface
 
         if ($outcome->sessionCompleted) {
             $lines[] = '';
-            $lines[] = '🏁 Sesión completada. ¡Buen trabajo! Escríbeme cuando quieras tu próximo entrenamiento.';
+            $lines[] = self::SESSION_COMPLETED_IMPLICIT_MESSAGE;
         }
 
         return $lines !== [] ? implode("\n", $lines) : 'Listo.';
+    }
+
+    /**
+     * H16.2 Fase 1 — código, nunca la IA: calcula la intención de cierre
+     * DESPUÉS de que `ExecutionReportRecorder::record()` ya decidió el
+     * estado real. Mismo criterio de 3 vías ya usado en
+     * `CoachContextProvider`/`TrainingHistoryContextProvider` para
+     * distinguir Performed de Skipped — ningún estado nuevo persistido.
+     */
+    private function determineSessionCloseIntent(ExecutionReportOutcome $outcome, WorkoutSession $session): SessionCloseIntent
+    {
+        if (! $outcome->sessionCompleted) {
+            // Con el fix de maybeCompleteSession(), sessionCompleted=false
+            // en un intento explícito de cierre implica, por construcción,
+            // que $stillUnreported no está vacío.
+            return SessionCloseIntent::BlockedStillPending;
+        }
+
+        $hasSkipped = $session->workoutExercises->contains(
+            fn (WorkoutExercise $we) => $we->exerciseLog !== null && $we->exerciseLog->exerciseSets->isEmpty()
+        );
+
+        return $hasSkipped ? SessionCloseIntent::SuccessPartial : SessionCloseIntent::SuccessFull;
+    }
+
+    /**
+     * @param  Collection<int, WorkoutExercise>  $stillUnreported
+     * @return array{intent: string, contact_name: ?string, pending_exercise_names: string[], logged_summaries: string[], skipped_exercise_names: string[]}
+     */
+    private function buildSessionCloseFacts(SessionCloseIntent $intent, ExecutionReportOutcome $outcome, Collection $stillUnreported, WorkoutSession $session, Contact $contact): array
+    {
+        $skippedNames = $session->workoutExercises
+            ->filter(fn (WorkoutExercise $we) => $we->exerciseLog !== null && $we->exerciseLog->exerciseSets->isEmpty())
+            ->map(fn (WorkoutExercise $we) => $we->exercise_snapshot['name'] ?? 'ese ejercicio')
+            ->values()
+            ->all();
+
+        return [
+            'intent' => $intent->value,
+            'contact_name' => $contact->customer_name,
+            'pending_exercise_names' => $stillUnreported->map(fn (WorkoutExercise $we) => $we->exercise_snapshot['name'] ?? 'ese ejercicio')->values()->all(),
+            'logged_summaries' => $outcome->logged,
+            'skipped_exercise_names' => $skippedNames,
+        ];
+    }
+
+    /**
+     * H16.2 Fase 1 — determinista, sin IA (regla explícita: nunca una
+     * segunda llamada por un reporte normal). Rotación simple para no
+     * repetir literalmente la misma frase entre ejercicios consecutivos de
+     * una misma sesión.
+     */
+    private function exerciseAdvanceTransition(WorkoutExercise $next): string
+    {
+        $index = ($next->order - 1) % count(self::EXERCISE_ADVANCE_MESSAGES);
+
+        return self::EXERCISE_ADVANCE_MESSAGES[$index];
     }
 
     // ── Hito 10 — Reminders ──────────────────────────────────────────────

@@ -377,7 +377,12 @@ it('54: a report that completes the session, combined with a commercial question
     sendInterruptionMessage($contact, 'Ya terminé, hice 10 con 40. Por cierto, ¿cuánto me queda de membresía?');
 
     expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Completed);
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), '🏁 Sesión completada'));
+    // H16.2 Fase 1 — "ya terminé" es un intento EXPLÍCITO de cierre: el
+    // texto ahora lo redacta SessionCloseMessageComposer (aquí, fallback
+    // determinista de SuccessFull — el único fake de IA de este test
+    // devuelve JSON, que validate() rechaza correctamente), no el antiguo
+    // string fijo de cierre implícito.
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Entrenamiento completado'));
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'membresía'));
 });
 

@@ -66,7 +66,7 @@ class ExecutionReportRecorder
             $logged[] = $this->summaryOf($resolved, $report);
         }
 
-        $sessionCompleted = $this->maybeCompleteSession($session, $extraction['session_finished']);
+        $sessionCompleted = $this->maybeCompleteSession($session);
 
         return new ExecutionReportOutcome($logged, $clarifications, $sessionCompleted);
     }
@@ -118,7 +118,7 @@ class ExecutionReportRecorder
         }
     }
 
-    private function maybeCompleteSession(WorkoutSession $session, bool $explicitlyFinished): bool
+    private function maybeCompleteSession(WorkoutSession $session): bool
     {
         $session->load(['workoutExercises.exerciseLog']);
 
@@ -126,7 +126,18 @@ class ExecutionReportRecorder
             fn (WorkoutExercise $we) => $we->exerciseLog === null
         );
 
-        if (! $explicitlyFinished && $stillUnreported) {
+        // H16.2 Fase 1 (fix de la contradicción "pendientes"+"completada"):
+        // una sesión NUNCA se cierra mientras exista un ejercicio realmente
+        // sin ningún ExerciseLog — sin importar que el usuario haya dicho
+        // "ya terminé"/equivalente. Antes de este fix, `session_finished`
+        // (el antiguo parámetro $explicitlyFinished) forzaba el cierre
+        // incluso con ejercicios genuinamente sin tocar; el único cierre
+        // "explícito" válido ahora es el de TrainingHandler::determineSessionCloseIntent()
+        // vía SessionCloseIntent::SuccessPartial, que exige que cada
+        // ejercicio restante YA tenga un ExerciseLog (aunque sea "no
+        // realizado") — nunca uno genuinamente Unreported. Ver
+        // docs/DECISIONS.md H16.2.
+        if ($stillUnreported) {
             return false;
         }
 
