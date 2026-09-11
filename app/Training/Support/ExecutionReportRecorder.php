@@ -77,14 +77,27 @@ class ExecutionReportRecorder
     private function resolveExercise(?string $name, Collection $unreported): ?WorkoutExercise
     {
         if ($name !== null) {
+            // Nombre explícito que no matchea ningún pendiente real (posible
+            // alucinación/typo de la IA) — nunca se adivina, cae al mismo
+            // clarificationMessage($name, ...) que ya existía.
             return $unreported->first(
                 fn (WorkoutExercise $we) => mb_strtolower($we->exercise_snapshot['name'] ?? '') === mb_strtolower($name)
             );
         }
 
-        // Sin nombre explícito: solo se asume si hay exactamente un
-        // ejercicio pendiente — nunca se adivina entre varios.
-        return $unreported->count() === 1 ? $unreported->first() : null;
+        // H16.2 Fase 1.1 — sin nombre explícito: se asume el ejercicio
+        // ACTUALMENTE PRESENTADO — el primero de $unreported, garantizado
+        // por construcción (WorkoutSession::workoutExercises() está
+        // ordenado por `order`; la entrega progresiva de H16.2 Fase 1 nunca
+        // muestra al usuario un ejercicio que no sea ese) — nunca una
+        // suposición arbitraria entre varios. Antes de la entrega
+        // progresiva esto solo era seguro si quedaba exactamente 1
+        // pendiente; ahora es seguro siempre, porque el usuario nunca ha
+        // visto más de uno a la vez. `first()` sobre una colección vacía ya
+        // devuelve `null` de forma nativa (caso defensivo: un reporte
+        // adicional sin nombre en el mismo mensaje, después de que los
+        // demás pendientes ya se resolvieron en este mismo turno).
+        return $unreported->first();
     }
 
     private function persist(WorkoutExercise $workoutExercise, array $report): void
@@ -155,29 +168,92 @@ class ExecutionReportRecorder
         return $we->exercise_snapshot['name'] ?? 'ese ejercicio';
     }
 
+    /**
+     * H16.2 Fase 1.2 — lenguaje natural ("3 series de 10 repeticiones con
+     * 8kg en Elevaciones de gemelos con mancuernas") en vez de notación
+     * técnica ("Elevaciones de gemelos con mancuernas: 10rep@8kg"). Nunca
+     * inventa un dato — solo reformula exactamente lo ya persistido.
+     * Devuelve una cláusula neutra (sin verbo de apertura ni signo de
+     * puntuación final) para que `TrainingHandler` la envuelva con "Registré
+     * {esto}." de forma uniforme, sin importar si fue realizado, no
+     * realizado, o reportado sin datos cuantificables — nunca celebra
+     * automáticamente un "no realizado" (H16.2 Fase 1.2, punto 11).
+     */
     private function summaryOf(WorkoutExercise $we, array $report): string
     {
         $name = $this->nameOf($we);
 
         if ($report['not_performed']) {
-            return "{$name}: no realizado";
+            return "que no realizaste {$name}";
         }
 
         if ($report['sets'] === []) {
-            return $name;
+            return "tu reporte de {$name}";
         }
 
-        $setsText = collect($report['sets'])->map(function (array $set) {
-            if ($set['duration_seconds'] !== null) {
-                return "{$set['duration_seconds']}s";
+        return "{$this->naturalSetsPhrase($report['sets'])} en {$name}";
+    }
+
+    /**
+     * @param  array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>  $sets
+     */
+    private function naturalSetsPhrase(array $sets): string
+    {
+        $count = count($sets);
+        $durations = array_values(array_filter(array_column($sets, 'duration_seconds'), fn ($d) => $d !== null));
+
+        if ($durations !== []) {
+            $uniqueDurations = array_unique($durations);
+
+            if (count($uniqueDurations) === 1) {
+                $duration = reset($uniqueDurations);
+
+                return $count === 1 ? "1 serie de {$duration} segundos" : "{$count} series de {$duration} segundos";
             }
 
-            $load = $set['load'] !== null ? '@'.$this->formatLoad($set['load']).'kg' : '';
+            return $this->naturalJoin(array_map(fn ($d) => "{$d} segundos", $durations));
+        }
 
-            return trim("{$set['reps']}rep{$load}");
-        })->implode(', ');
+        $reps = array_column($sets, 'reps');
+        $loads = array_column($sets, 'load');
+        $uniqueReps = array_unique(array_filter($reps, fn ($r) => $r !== null));
+        $uniqueLoads = array_unique(array_filter($loads, fn ($l) => $l !== null));
 
-        return "{$name}: {$setsText}";
+        if (count($uniqueReps) === 1) {
+            $repsValue = reset($uniqueReps);
+            $repsWord = $repsValue === 1 ? 'repetición' : 'repeticiones';
+            $repsPhrase = $count === 1
+                ? "1 serie de {$repsValue} {$repsWord}"
+                : "{$count} series de {$repsValue} {$repsWord}";
+        } else {
+            $repsPhrase = $this->naturalJoin($reps).' repeticiones';
+        }
+
+        if ($uniqueLoads === []) {
+            return $repsPhrase;
+        }
+
+        $loadPhrase = count($uniqueLoads) === 1
+            ? ' con '.$this->formatLoad((float) reset($uniqueLoads)).'kg'
+            : ' con '.$this->naturalJoin(array_map(fn ($l) => $this->formatLoad((float) $l).'kg', $loads));
+
+        return $repsPhrase.$loadPhrase;
+    }
+
+    /**
+     * @param  array<int, string|int|float>  $items
+     */
+    private function naturalJoin(array $items): string
+    {
+        $items = array_values($items);
+
+        if (count($items) <= 1) {
+            return (string) ($items[0] ?? '');
+        }
+
+        $last = array_pop($items);
+
+        return implode(', ', $items).' y '.$last;
     }
 
     /**

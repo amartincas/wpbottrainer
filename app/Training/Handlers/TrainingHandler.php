@@ -173,22 +173,6 @@ class TrainingHandler implements HandlerInterface
     private const PROFILE_READY_FALLBACK_MESSAGE = 'Con esto ya tengo lo que necesito para armar tu plan.';
 
     /**
-     * Hito 15.1 (Ronda 2, Cambio 4) — se envía UNA sola vez, siempre después
-     * de todos los mensajes de la entrega (header + cada ejercicio + video),
-     * únicamente cuando el paso 6 genera una sesión genuinamente nueva en
-     * este turno (los guards existentes del paso 4 garantizan que este punto
-     * nunca se alcanza mientras haya una sesión pendiente sin reportar).
-     * Describe ÚNICAMENTE capacidades que ya existen en
-     * `ExecutionReportService`/`ExecutionReportRecorder` — nunca afirma
-     * sustitución de ejercicios ni envío secuencial, ninguno de los dos
-     * implementado.
-     */
-    private const EXECUTION_INSTRUCTIONS_MESSAGE = 'Puedes reportar los ejercicios en el orden que quieras. '
-        .'Dime "listo" o cuéntame las series, repeticiones y peso que hiciste (ej. "10, 10, 8 con 20kg"). '
-        .'Si no puedes hacer alguno, dímelo y lo registro así. Pregúntame cuántos te faltan cuando quieras. '
-        .'Cuando termines todos, escríbeme "ya terminé" para cerrar la sesión. 💪';
-
-    /**
      * H16.2 Fase 1 — entrega progresiva: transición determinista (sin IA,
      * ver docblock de `recordExecutionReport()`) enviada antes del siguiente
      * ejercicio, únicamente tras un reporte real ya persistido de uno
@@ -580,11 +564,6 @@ class TrainingHandler implements HandlerInterface
         if ($firstExercise !== null) {
             $this->deliverExercise($firstExercise, $from, $tenant);
         }
-
-        // Hito 15.1 (Cambio 4) — siempre al final, después del primer
-        // ejercicio entregado: nunca antes, para no fragmentar la entrega ni
-        // competir con el contenido del entrenamiento mismo.
-        $this->reply($from, self::EXECUTION_INSTRUCTIONS_MESSAGE, $tenant);
     }
 
     /**
@@ -807,14 +786,18 @@ class TrainingHandler implements HandlerInterface
             $facts = $this->buildSessionCloseFacts($intent, $outcome, $stillUnreported, $session, $contact);
             $this->reply($from, $this->sessionCloseComposer->compose($intent, $facts, $tenant), $tenant);
         } else {
-            $this->reply($from, $this->buildDeterministicReportMessage($outcome), $tenant);
+            // H16.2 Fase 1.2 — confirmación + transición van en UN solo
+            // mensaje (nunca dos `reply()` separados) para que se sienta
+            // como una única intervención del coach, no como un recibo
+            // seguido de un mensaje administrativo aparte.
+            $this->reply($from, $this->buildReportResponseMessage($outcome, $stillUnreported), $tenant);
 
             // H16.2 Fase 1 — avanzar al siguiente ejercicio: ÚNICAMENTE tras
             // un reporte REAL ya persistido este turno (`logged !== []`) —
             // una pregunta sola, o un intento que no logró resolverse a
             // ningún ejercicio (solo `clarifications`), NUNCA avanza ni
             // reenvía el ejercicio actual.
-            if ($outcome->logged !== [] && ! $outcome->sessionCompleted && $stillUnreported->isNotEmpty()) {
+            if ($outcome->logged !== [] && $outcome->clarifications === [] && ! $outcome->sessionCompleted && $stillUnreported->isNotEmpty()) {
                 $next = $stillUnreported->first();
 
                 Log::info('TRAINING_EXERCISE_ADVANCED', [
@@ -823,7 +806,6 @@ class TrainingHandler implements HandlerInterface
                     'order' => $next->order,
                 ]);
 
-                $this->reply($from, $this->exerciseAdvanceTransition($next), $tenant);
                 $this->deliverExercise($next, $from, $tenant);
             }
         }
@@ -837,34 +819,55 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
-     * H16.2 Fase 1 — mensaje determinista para el camino SIN intento
-     * explícito de cierre (reporte normal). Nunca puede coexistir un cierre
-     * afirmado con pendientes reales: `sessionCompleted` ya no puede ser
-     * `true` mientras exista un ejercicio sin `ExerciseLog` (fix de
+     * H16.2 Fase 1.2 — UN solo mensaje determinista para el camino SIN
+     * intento explícito de cierre (reporte normal): confirmación + (cierre
+     * implícito o transición al siguiente), nunca fragmentado en varios
+     * `reply()`. Nunca puede coexistir un cierre afirmado con pendientes
+     * reales: `sessionCompleted` ya no puede ser `true` mientras exista un
+     * ejercicio sin `ExerciseLog` (fix de
      * `ExecutionReportRecorder::maybeCompleteSession()`).
+     *
+     * @param  Collection<int, WorkoutExercise>  $stillUnreported
      */
-    private function buildDeterministicReportMessage(ExecutionReportOutcome $outcome): string
+    private function buildReportResponseMessage(ExecutionReportOutcome $outcome, Collection $stillUnreported): string
     {
-        $lines = [];
+        $sentences = [];
 
         if ($outcome->logged !== []) {
-            $lines[] = '✅ Registré:';
-
-            foreach ($outcome->logged as $summary) {
-                $lines[] = "- {$summary}";
-            }
+            $sentences[] = $this->humanizedConfirmation($outcome->logged);
         }
 
         foreach ($outcome->clarifications as $question) {
-            $lines[] = $question;
+            $sentences[] = $question;
         }
 
         if ($outcome->sessionCompleted) {
-            $lines[] = '';
-            $lines[] = self::SESSION_COMPLETED_IMPLICIT_MESSAGE;
+            $sentences[] = self::SESSION_COMPLETED_IMPLICIT_MESSAGE;
+        } elseif ($outcome->logged !== [] && $outcome->clarifications === [] && $stillUnreported->isNotEmpty()) {
+            // Misma frase de transición determinista de Fase 1 — ahora
+            // enlazada en el MISMO mensaje que la confirmación, en vez de un
+            // segundo `reply()` aparte.
+            $sentences[] = $this->exerciseAdvanceTransition($stillUnreported->first());
         }
 
-        return $lines !== [] ? implode("\n", $lines) : 'Listo.';
+        return $sentences !== [] ? implode(' ', $sentences) : 'Listo.';
+    }
+
+    /**
+     * H16.2 Fase 1.2 — lenguaje natural, nunca notación técnica: envuelve
+     * cada frase ya humanizada por `ExecutionReportRecorder::summaryOf()`
+     * (que nunca incluye verbo de apertura) con un único verbo neutro
+     * ("Registré...") que funciona igual de bien para lo realizado, lo no
+     * realizado, o un reporte sin datos cuantificables — nunca celebra
+     * automáticamente un "no realizado" (punto 11 de la especificación).
+     */
+    private function humanizedConfirmation(array $loggedSummaries): string
+    {
+        if (count($loggedSummaries) === 1) {
+            return "Registré {$loggedSummaries[0]}.";
+        }
+
+        return 'Registré: '.implode('; ', $loggedSummaries).'.';
     }
 
     /**
@@ -892,20 +895,28 @@ class TrainingHandler implements HandlerInterface
 
     /**
      * @param  Collection<int, WorkoutExercise>  $stillUnreported
-     * @return array{intent: string, contact_name: ?string, pending_exercise_names: string[], logged_summaries: string[], skipped_exercise_names: string[]}
+     * @return array{intent: string, contact_name: ?string, pending_exercises: string[], next_exercise: ?string, logged_summaries: string[], skipped_exercise_names: string[]}
      */
     private function buildSessionCloseFacts(SessionCloseIntent $intent, ExecutionReportOutcome $outcome, Collection $stillUnreported, WorkoutSession $session, Contact $contact): array
     {
+        // `skipped_exercise_names` es de uso EXCLUSIVO del fallback
+        // determinista de SessionCloseMessageComposer — nunca se expone en
+        // el bloque de HECHOS del prompt; `logged_summaries` ya comunica en
+        // lenguaje natural qué quedó sin realizar (ver
+        // ExecutionReportRecorder::summaryOf(), H16.2 Fase 1.2).
         $skippedNames = $session->workoutExercises
             ->filter(fn (WorkoutExercise $we) => $we->exerciseLog !== null && $we->exerciseLog->exerciseSets->isEmpty())
             ->map(fn (WorkoutExercise $we) => $we->exercise_snapshot['name'] ?? 'ese ejercicio')
             ->values()
             ->all();
 
+        $pendingNames = $stillUnreported->map(fn (WorkoutExercise $we) => $we->exercise_snapshot['name'] ?? 'ese ejercicio')->values()->all();
+
         return [
             'intent' => $intent->value,
             'contact_name' => $contact->customer_name,
-            'pending_exercise_names' => $stillUnreported->map(fn (WorkoutExercise $we) => $we->exercise_snapshot['name'] ?? 'ese ejercicio')->values()->all(),
+            'pending_exercises' => $pendingNames,
+            'next_exercise' => $pendingNames[0] ?? null,
             'logged_summaries' => $outcome->logged,
             'skipped_exercise_names' => $skippedNames,
         ];

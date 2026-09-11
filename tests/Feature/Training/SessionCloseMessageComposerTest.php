@@ -23,7 +23,7 @@ it('composes a BlockedStillPending message via the AI when it responds validly a
 
     $text = (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::BlockedStillPending,
-        ['intent' => 'blocked_still_pending', 'contact_name' => 'Alex', 'pending_exercise_names' => ['Sentadilla', 'Fondos en banco'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
+        ['intent' => 'blocked_still_pending', 'contact_name' => 'Alex', 'pending_exercises' => ['Sentadilla', 'Fondos en banco'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -35,7 +35,7 @@ it('degrades BlockedStillPending to the deterministic fallback, naming the real 
 
     $text = (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::BlockedStillPending,
-        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercise_names' => ['Sentadilla', 'Fondos en banco'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
+        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercises' => ['Sentadilla', 'Fondos en banco'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -47,7 +47,7 @@ it('rejects a BlockedStillPending response that falsely claims the session is co
 
     $text = (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::BlockedStillPending,
-        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercise_names' => ['Sentadilla'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
+        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercises' => ['Sentadilla'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -60,7 +60,7 @@ it('rejects a SuccessFull response that falsely claims pending exercises remain,
 
     $text = (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::SuccessFull,
-        ['intent' => 'success_full', 'contact_name' => null, 'pending_exercise_names' => [], 'logged_summaries' => ['Sentadilla: 10rep@40kg'], 'skipped_exercise_names' => []],
+        ['intent' => 'success_full', 'contact_name' => null, 'pending_exercises' => [], 'logged_summaries' => ['Sentadilla: 10rep@40kg'], 'skipped_exercise_names' => []],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -73,7 +73,7 @@ it('composes a SuccessPartial fallback naming the real skipped exercises when th
 
     $text = (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::SuccessPartial,
-        ['intent' => 'success_partial', 'contact_name' => null, 'pending_exercise_names' => [], 'logged_summaries' => ['Sentadilla: 10rep@40kg'], 'skipped_exercise_names' => ['Fondos en banco']],
+        ['intent' => 'success_partial', 'contact_name' => null, 'pending_exercises' => [], 'logged_summaries' => ['Sentadilla: 10rep@40kg'], 'skipped_exercise_names' => ['Fondos en banco']],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -85,7 +85,7 @@ it('never invents an exercise, set or load not present in the facts — the prom
 
     (new SessionCloseMessageComposer)->compose(
         SessionCloseIntent::BlockedStillPending,
-        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercise_names' => ['Sentadilla'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
+        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercises' => ['Sentadilla'], 'logged_summaries' => [], 'skipped_exercise_names' => []],
         Tenant::factory()->create(['ai_provider' => 'openai']),
     );
 
@@ -95,4 +95,27 @@ it('never invents an exercise, set or load not present in the facts — the prom
         return str_contains($systemPrompt, 'NUNCA inventes un ejercicio, una serie, una repetición, una carga')
             && str_contains($systemPrompt, 'NUNCA decidas tú si la sesión está completa');
     });
+});
+
+it('exposes "next_exercise" (the first pending) in the prompt only for BlockedStillPending, never for the other two intents', function () {
+    Http::fake(['api.openai.com/*' => Http::response(sessionCloseAiResponse('Texto cualquiera.'))]);
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+
+    (new SessionCloseMessageComposer)->compose(
+        SessionCloseIntent::BlockedStillPending,
+        ['intent' => 'blocked_still_pending', 'contact_name' => null, 'pending_exercises' => ['Sentadilla', 'Fondos en banco'], 'next_exercise' => 'Sentadilla', 'logged_summaries' => [], 'skipped_exercise_names' => []],
+        $tenant,
+    );
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'messages.0.content', ''), 'next_exercise: Sentadilla'));
+
+    Http::fake(['api.openai.com/*' => Http::response(sessionCloseAiResponse('Texto cualquiera.'))]);
+
+    (new SessionCloseMessageComposer)->compose(
+        SessionCloseIntent::SuccessFull,
+        ['intent' => 'success_full', 'contact_name' => null, 'pending_exercises' => [], 'next_exercise' => null, 'logged_summaries' => ['3 series de 10 repeticiones con 8kg en Sentadilla'], 'skipped_exercise_names' => []],
+        $tenant,
+    );
+
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'messages.0.content', ''), 'next_exercise'));
 });

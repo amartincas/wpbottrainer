@@ -104,11 +104,21 @@ class ExecutionReportService
     private function buildPrompt(array $reportableExercises, ?CoachContext $coachContext): string
     {
         $names = json_encode(array_map(fn ($e) => $e['name'], $reportableExercises));
+        // H16.2 Fase 1.1 — el primero de $reportableExercises es, por
+        // construcción, el ejercicio actualmente presentado (entrega
+        // progresiva, ver TrainingHandler::deliverExercise()) — nunca un
+        // supuesto de esta clase. Ayuda a que la propia extracción acierte
+        // el "exercise_name" explícito más seguido; el código (ver
+        // ExecutionReportRecorder::resolveExercise()) sigue siendo quien
+        // decide de forma determinista cuando la IA no lo determina.
+        $currentExerciseName = $reportableExercises[0]['name'] ?? null;
 
         $prompt = <<<PROMPT
 Eres un asistente que EXTRAE de un mensaje de WhatsApp lo que un usuario reporta haber ejecutado de un entrenamiento. NUNCA inventes un valor que el usuario no mencionó explícitamente.
 
 Ejercicios que el usuario podría estar reportando (debes usar el nombre EXACTO de esta lista, o null si no puedes determinar a cuál se refiere): {$names}
+
+El ejercicio que ACABAS de mostrarle al usuario, ahora mismo, es: "{$currentExerciseName}". Si el usuario responde sin mencionar explícitamente un ejercicio distinto de la lista de arriba (ej. "listo", "3 series de 10", "10, 10, 8 con 8kg", "me costó"), asume que "exercise_name" es ese mismo ejercicio — nunca lo dejes en null solo porque no repitió el nombre.
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 {
@@ -125,7 +135,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
       "uncertain": true (si el usuario usó lenguaje de duda: "creo que", "más o menos", "unas", "tal vez") | false
     }
   ],
-  "session_finished": true (si el usuario indica que terminó/cerró toda la sesión, ej. "eso fue todo", "ya terminé") | false,
+  "session_finished": true (SOLO si el usuario indica de manera inequívoca que terminó TODOS los ejercicios o que desea cerrar toda la sesión, ej. "eso fue todo", "ya terminé", "acabé la sesión", "terminé todos los ejercicios") | false,
   "intents": ["<uno o más de: exercise_question, continue_training, general_conversation, membership_status, faq_question, reminder_request, reminder_cancel, reminder_modify, mentioned_forgetting, asked_when_to_train>"],
   "training_reply": "<texto conversacional, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation) Y el mensaje no es (solo) un reporte>" | null,
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" | null,
@@ -141,6 +151,7 @@ Reglas del reporte:
 - Puedes incluir más de un elemento en "reports" si el mensaje cubre varios ejercicios.
 - IMPORTANTE: una confirmación breve sin ningún detalle (ej. "hecho", "listo", "ya", "terminado", "list") SIGUE siendo un reporte real, no un mensaje vacío — genera UN elemento en "reports" para ese caso, con "exercise_name": null (deja que el sistema determine a cuál ejercicio se refiere), "not_performed": false, "sets": [], y todo lo demás null. NUNCA devuelvas "reports": [] para una confirmación de este tipo.
 - Si el mensaje genuinamente no tiene ninguna relación con el entrenamiento (ej. cambia de tema por completo), "reports" debe ser [].
+- CRÍTICO: "listo", "hecho", "ya está" o expresiones equivalentes referidas al ejercicio que se le acaba de mostrar (ver más arriba) NUNCA significan por sí solas que el usuario terminó TODA la sesión — son un reporte de ESE ejercicio, "session_finished" debe quedar en false. Marca "session_finished" en true ÚNICAMENTE cuando el usuario comunique de forma inequívoca que terminó todos los ejercicios o toda la sesión (ver ejemplos arriba) — nunca lo infieras de una confirmación corta de un solo ejercicio.
 
 Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej. un reporte real Y una pregunta de membresía juntos):
 - "exercise_question": preguntas sobre un ejercicio, carga, reps, RPE, técnica, o el motivo de una decisión ya tomada.

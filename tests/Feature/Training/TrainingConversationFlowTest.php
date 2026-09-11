@@ -341,16 +341,22 @@ it('Hito 15: a Contact who already had a Trial before is NOT re-granted one — 
 it('generates and delivers a WorkoutSession with videos when access is granted, without asking onboarding questions again', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true]);
+    // experience_level/difficulty_level fijos y coincidentes en los 3 —
+    // ambas factories usan un valor ALEATORIO por defecto, y
+    // TrainingEngine::sortCandidates() desempata primero por coincidencia
+    // de nivel, antes que por id ascendente — sin fijarlo, cuál ejercicio
+    // queda "primero" (asunción de este test) dejaría de ser determinista.
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true, 'experience_level' => \App\Training\Enums\ExperienceLevel::Intermediate]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
     $chest = Exercise::factory()->create([
         'muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4',
         'instructions' => ['Manos a la anchura de los hombros', 'Cuerpo alineado'],
         'breathing_cue' => 'Inhala al bajar, exhala al subir',
+        'difficulty_level' => 'intermediate',
     ]);
-    $legs = Exercise::factory()->create(['muscle_group' => 'legs', 'name' => 'Sentadilla', 'video_url' => 'https://videos.example.test/squat.mp4']);
-    $back = Exercise::factory()->create(['muscle_group' => 'back', 'name' => 'Remo', 'video_url' => 'https://videos.example.test/row.mp4']);
+    $legs = Exercise::factory()->create(['muscle_group' => 'legs', 'name' => 'Sentadilla', 'video_url' => 'https://videos.example.test/squat.mp4', 'difficulty_level' => 'intermediate']);
+    $back = Exercise::factory()->create(['muscle_group' => 'back', 'name' => 'Remo', 'video_url' => 'https://videos.example.test/row.mp4', 'difficulty_level' => 'intermediate']);
 
     // Bloque 9 (D052): perfil ya completo y sin sesión pendiente ->
     // CoachService es la única llamada de IA de este turno (antes del

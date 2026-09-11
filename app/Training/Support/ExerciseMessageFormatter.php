@@ -37,6 +37,30 @@ class ExerciseMessageFormatter
 
     private const MAX_MISTAKE_BULLETS = 2;
 
+    /**
+     * H16.2.2 — "músculos trabajados": mismo vocabulario cerrado que ya usa
+     * `App\Training\Enums\MuscleFocus` (Exercise.primary_muscle/
+     * secondary_muscles, congelado en exercise_snapshot desde Hito 8.4) —
+     * mismas etiquetas en español ya establecidas en el prompt de onboarding
+     * (`OnboardingConversationService`), reutilizadas aquí para no tener dos
+     * traducciones distintas del mismo vocabulario. Puramente descriptivo,
+     * determinista, sin IA — la IA nunca es la fuente de verdad de qué
+     * músculos trabaja un ejercicio.
+     */
+    private const MUSCLE_LABELS = [
+        'glutes' => 'glúteos',
+        'quads' => 'cuádriceps',
+        'hamstrings' => 'isquiotibiales',
+        'calves' => 'pantorrillas',
+        'chest' => 'pecho',
+        'back' => 'espalda',
+        'shoulders' => 'hombros',
+        'biceps' => 'bíceps',
+        'triceps' => 'tríceps',
+        'abs' => 'abdomen',
+        'full_body' => 'cuerpo completo',
+    ];
+
     public function format(WorkoutExercise $workoutExercise, int $order): string
     {
         $snapshot = $workoutExercise->exercise_snapshot;
@@ -44,6 +68,12 @@ class ExerciseMessageFormatter
 
         $lines[] = "{$order}. *{$snapshot['name']}* — {$this->formatPrescription($workoutExercise)}";
         $lines[] = '';
+
+        $muscleSection = $this->muscleSection($snapshot);
+        if ($muscleSection !== null) {
+            $lines[] = $muscleSection;
+            $lines[] = '';
+        }
 
         $weightGuidance = $this->weightGuidance($workoutExercise);
         if ($weightGuidance !== null) {
@@ -114,6 +144,56 @@ class ExerciseMessageFormatter
 
         return 'Elige un peso con el que las últimas 2-3 repeticiones te cuesten de verdad, sin perder la técnica. '
             .'Cuéntame qué peso usaste cuando reportes, así ajusto la próxima vez.';
+    }
+
+    /**
+     * H16.2.2 — lee EXCLUSIVAMENTE de `exercise_snapshot` (`primary_muscle`/
+     * `secondary_muscles`, ya congelados por `Exercise::toSnapshot()` desde
+     * Hito 8.4 — no es un dato nuevo, ni una columna nueva, solo un dato ya
+     * existente que este formateador no mostraba todavía) — nunca del
+     * `Exercise` en vivo, mismo criterio de inmutabilidad histórica que el
+     * resto de esta clase. Nunca deduce músculos a partir del nombre del
+     * ejercicio. Ausente por completo (nunca una sección vacía) cuando el
+     * snapshot no trae ningún dato de músculo.
+     */
+    private function muscleSection(array $snapshot): ?string
+    {
+        $primaryLabel = self::MUSCLE_LABELS[$snapshot['primary_muscle'] ?? ''] ?? null;
+
+        $secondaryLabels = collect($snapshot['secondary_muscles'] ?? [])
+            ->map(fn ($muscle) => self::MUSCLE_LABELS[$muscle] ?? null)
+            ->filter()
+            ->values();
+
+        if ($primaryLabel === null && $secondaryLabels->isEmpty()) {
+            return null;
+        }
+
+        $lines = ['🎯 Músculos trabajados:'];
+
+        if ($primaryLabel !== null) {
+            $lines[] = "Principalmente: {$primaryLabel}.";
+        }
+
+        if ($secondaryLabels->isNotEmpty()) {
+            $lines[] = 'También: '.$this->naturalJoin($secondaryLabels->all()).'.';
+        }
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * @param  string[]  $items
+     */
+    private function naturalJoin(array $items): string
+    {
+        if (count($items) <= 1) {
+            return $items[0] ?? '';
+        }
+
+        $last = array_pop($items);
+
+        return implode(', ', $items).' y '.$last;
     }
 
     private function formatPrescription(WorkoutExercise $workoutExercise): string

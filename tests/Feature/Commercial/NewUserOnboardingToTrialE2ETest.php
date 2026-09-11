@@ -2,6 +2,7 @@
 
 use App\Jobs\ProcessWhatsAppMessage;
 use App\Models\Contact;
+use App\Models\Exercise;
 use App\Models\Payment;
 use App\Models\Tenant;
 use App\Models\TrainingAccess;
@@ -102,14 +103,24 @@ it('a Contact acquired via a Referral is just as eligible for the automatic Tria
     expect(TrainingProfile::where('contact_id', $referred->id)->exists())->toBeTrue();
 });
 
-it('a new session delivery is ordered Trial notice -> header -> every exercise -> execution instructions, in that exact order', function () {
-    // Ronda 2 (piloto real), Cambios 2 y 4: el aviso de Trial (paso 3, tan
-    // pronto se concede) siempre antecede a la entrega; las instrucciones
-    // de ejecución (paso 6) siempre la cierran, después de TODOS los
-    // mensajes de ejercicio — nunca intercalada entre ellos.
+it('a new session delivery is ordered Trial notice -> header -> only the first exercise, in that exact order', function () {
+    // Ronda 2 (piloto real), Cambio 2: el aviso de Trial (paso 3, tan
+    // pronto se concede) siempre antecede a la entrega. H16.2 Fase 1
+    // (entrega progresiva): la entrega ya NO enumera todos los ejercicios
+    // de una sola vez — solo el primero (order más bajo) — y ya no existe
+    // un mensaje fijo de "instrucciones de ejecución" al final (retirado en
+    // H16.2 Fase 1.1, ver ExecutionReportService/ExecutionReportRecorder).
     $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'trial_duration_days' => 5]);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001110004']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
+    // experience_level/difficulty_level fijos y coincidentes en ambos
+    // ejercicios — ambas factories usan un valor ALEATORIO por defecto, y
+    // TrainingEngine::sortCandidates() desempata primero por
+    // coincidencia de nivel: sin fijarlo, el orden entre Flexiones y
+    // Sentadilla dejaría de ser determinista (id ascendente solo desempata
+    // *después* del nivel).
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true, 'experience_level' => \App\Training\Enums\ExperienceLevel::Intermediate]);
+    Exercise::factory()->create(['muscle_group' => 'chest', 'name' => 'Flexiones', 'difficulty_level' => 'intermediate']);
+    Exercise::factory()->create(['muscle_group' => 'legs', 'name' => 'Sentadilla', 'difficulty_level' => 'intermediate']);
 
     Http::fake([
         'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
@@ -127,13 +138,14 @@ it('a new session delivery is ordered Trial notice -> header -> every exercise -
         ->values();
 
     $session = WorkoutSession::where('contact_id', $contact->id)->sole();
-    $exerciseCount = $session->workoutExercises->count();
+    expect($session->workoutExercises->count())->toBeGreaterThan(1); // catálogo real con más de 1 candidato
 
     expect($replyTexts->first())->toContain('período de prueba gratis');
     expect($replyTexts->get(1))->toBe('🔥 Tu entrenamiento de hoy');
-    expect($replyTexts->last())->toContain('ya terminé');
-    // aviso de Trial + header + un mensaje por ejercicio + cierre.
-    expect($replyTexts)->toHaveCount(2 + $exerciseCount + 1);
+    // Header + exactamente 1 tarjeta de ejercicio (la del primero, order=1)
+    // — nunca las demás, nunca un mensaje de cierre fijo adicional.
+    expect($replyTexts)->toHaveCount(3);
+    expect($replyTexts->last())->toContain('1. *Flexiones*');
 });
 
 it('a Contact who already had a confirmed Payment historically is never granted an automatic Trial, even if somehow their TrainingAccess row went missing', function () {

@@ -192,3 +192,88 @@ it('never assumes an exercise needs load when its live Exercise relation cannot 
 
     expect($text)->not->toContain('Elige un peso');
 });
+
+// ── H16.2.2 — "músculos trabajados": lee exclusivamente del snapshot ya
+// congelado (Exercise::toSnapshot() ya incluía primary_muscle/
+// secondary_muscles desde Hito 8.4) — determinista, sin IA. ────────────
+
+it('renders the real "Elevaciones de gemelos con mancuernas" card in the exact expected shape: nombre+prescripción -> músculos -> técnica', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        ['name' => 'Elevaciones de gemelos con mancuernas', 'instructions' => ['Sube el talón hasta arriba', 'Baja controlando']],
+        exerciseOverrides: ['primary_muscle' => \App\Training\Enums\MuscleFocus::Calves, 'secondary_muscles' => []],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toStartWith("1. *Elevaciones de gemelos con mancuernas* — 3 series x 10 repeticiones\n");
+    expect($text)->toContain("🎯 Músculos trabajados:\nPrincipalmente: pantorrillas.");
+    expect(strpos($text, 'Músculos trabajados'))->toBeLessThan(strpos($text, '📋 Técnica:'));
+    // Sin explicación anatómica extensa: solo el nombre del músculo, nada
+    // más que lo que el snapshot trae.
+    expect(substr_count($text, "\n"))->toBeLessThan(15);
+});
+
+it('shows the primary and secondary muscles worked, grounded in the frozen snapshot', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(exerciseOverrides: [
+        'primary_muscle' => \App\Training\Enums\MuscleFocus::Glutes,
+        'secondary_muscles' => ['hamstrings'],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('🎯 Músculos trabajados:');
+    expect($text)->toContain('Principalmente: glúteos.');
+    expect($text)->toContain('También: isquiotibiales.');
+});
+
+it('joins 2+ secondary muscles naturally with "y", never a raw comma-only list nor the raw enum values', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(exerciseOverrides: [
+        'primary_muscle' => \App\Training\Enums\MuscleFocus::Glutes,
+        'secondary_muscles' => ['hamstrings', 'calves'],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('También: isquiotibiales y pantorrillas.');
+    expect($text)->not->toContain('hamstrings');
+    expect($text)->not->toContain('calves');
+});
+
+it('shows only the primary muscle when there are no secondary muscles, without an empty "También" line', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(exerciseOverrides: [
+        'primary_muscle' => \App\Training\Enums\MuscleFocus::Chest,
+        'secondary_muscles' => [],
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->toContain('Principalmente: pecho.');
+    expect($text)->not->toContain('También:');
+});
+
+it('omits the "músculos trabajados" section entirely when the snapshot has no muscle data — never invented from the exercise name', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(['name' => 'Sentadilla búlgara'], exerciseOverrides: [
+        'primary_muscle' => null,
+        'secondary_muscles' => null,
+    ]);
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    expect($text)->not->toContain('Músculos trabajados');
+});
+
+it('the "músculos trabajados" section appears right after the name/prescription and before the technique instructions', function () {
+    $workoutExercise = makeWorkoutExerciseWithSnapshot(
+        ['instructions' => ['Baja controlando']],
+        exerciseOverrides: ['primary_muscle' => \App\Training\Enums\MuscleFocus::Back, 'secondary_muscles' => []],
+    );
+
+    $text = (new ExerciseMessageFormatter)->format($workoutExercise, 1);
+
+    $musclePosition = strpos($text, 'Músculos trabajados');
+    $techniquePosition = strpos($text, '📋 Técnica:');
+
+    expect($musclePosition)->not->toBeFalse();
+    expect($techniquePosition)->not->toBeFalse();
+    expect($musclePosition)->toBeLessThan($techniquePosition);
+});

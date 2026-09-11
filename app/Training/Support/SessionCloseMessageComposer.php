@@ -55,7 +55,49 @@ class SessionCloseMessageComposer
     ];
 
     /**
-     * @param  array{intent: string, contact_name: ?string, pending_exercise_names: string[], logged_summaries: string[], skipped_exercise_names: string[]}  $facts
+     * H16.2 Fase 1.2 (revisión) — reglas por intención, en la redacción
+     * exacta aprobada. Nunca se reinterpretan ni se combinan entre sí — el
+     * `match` en `buildPrompt()`/`fallbackFor()` garantiza que solo una
+     * aplique por invocación.
+     */
+    private const BLOCKED_STILL_PENDING_RULE = <<<'RULE'
+Si "session_close_intent" es "BlockedStillPending":
+- El usuario indicó que terminó la sesión, pero todavía existen ejercicios sin reportar.
+- NO digas que la sesión está completada.
+- NO digas que terminó el entrenamiento.
+- Explica brevemente que todavía quedan ejercicios pendientes.
+- Menciona los nombres de los ejercicios contenidos en "pending_exercises".
+- Orienta al usuario hacia "next_exercise", que es el siguiente ejercicio que debe realizar/reportar.
+- No inventes ejercicios, resultados, series, repeticiones, pesos ni información que no esté en los hechos proporcionados.
+- Mantén un tono de entrenador: natural, breve y útil. No suenes como un mensaje de error del sistema.
+RULE;
+
+    private const SUCCESS_FULL_RULE = <<<'RULE'
+Si "session_close_intent" es "SuccessFull":
+- Todos los ejercicios fueron realizados y registrados.
+- Confirma que la sesión quedó completada.
+- Puedes reconocer brevemente el trabajo realizado, usando "logged_summaries".
+- No menciones ejercicios pendientes.
+- No inventes resultados ni hagas afirmaciones sobre rendimiento que no estén en los hechos proporcionados.
+- El mensaje debe sentirse como el cierre natural de un entrenador, no como un reporte administrativo.
+RULE;
+
+    private const SUCCESS_PARTIAL_RULE = <<<'RULE'
+Si "session_close_intent" es "SuccessPartial":
+- La sesión quedó cerrada, pero uno o más ejercicios fueron registrados como no realizados (ver "logged_summaries").
+- Reconoce que la sesión quedó registrada sin celebrar que un ejercicio no se haya realizado.
+- Puedes mencionar brevemente que hubo ejercicios que no se pudieron realizar.
+- NO digas que quedaron ejercicios pendientes: ya fueron procesados.
+- No confundas "Skipped" (ya procesado, no realizado) con "Unreported" (todavía sin reportar) — ver REGLA FUNDAMENTAL.
+RULE;
+
+    /**
+     * @param  array{intent: string, contact_name: ?string, pending_exercises: string[], next_exercise: ?string, logged_summaries: string[], skipped_exercise_names?: string[]}  $facts
+     *         `skipped_exercise_names` es de uso EXCLUSIVO del fallback
+     *         determinista (`fallbackFor()`) — nunca se expone en el bloque
+     *         de HECHOS del prompt; `logged_summaries` ya comunica en
+     *         lenguaje natural qué quedó sin realizar (ver
+     *         `ExecutionReportRecorder::summaryOf()`, H16.2 Fase 1.2).
      */
     public function compose(SessionCloseIntent $intent, array $facts, Tenant $tenant): string
     {
@@ -77,30 +119,64 @@ class SessionCloseMessageComposer
 
     private function buildPrompt(SessionCloseIntent $intent, array $facts): string
     {
-        $name = $facts['contact_name'] ?? null;
-        $greeting = $name !== null ? " El usuario se llama {$name} — puedes usar su nombre con naturalidad, sin abusar." : '';
-
-        $stateInstructions = match ($intent) {
-            SessionCloseIntent::BlockedStillPending => 'El usuario intentó cerrar su entrenamiento (dijo algo como "ya terminé"), pero el sistema determinó que TODAVÍA tiene ejercicios pendientes de reportar: '
-                .implode(', ', $facts['pending_exercise_names']).'. NUNCA afirmes que la sesión terminó o se completó — todavía NO. Reconoce el intento, indica con claridad (usando los nombres exactos de arriba) cuáles ejercicios faltan, y anímalo a seguir.',
-            SessionCloseIntent::SuccessFull => 'El usuario completó TODOS los ejercicios de su entrenamiento de hoy. Esto es lo que se registró: '
-                .implode('; ', $facts['logged_summaries']).'. Reconoce el logro, sé breve y directo, sin exagerar, e indica que puede escribir cuando quiera su próximo entrenamiento. NUNCA menciones ningún ejercicio pendiente — no quedó ninguno.',
-            SessionCloseIntent::SuccessPartial => 'El usuario cerró su entrenamiento de hoy sin completar todo. Esto es lo que SÍ se registró: '
-                .implode('; ', $facts['logged_summaries']).'. Esto quedó marcado como no realizado hoy: '
-                .implode(', ', $facts['skipped_exercise_names']).'. Reconoce lo que sí hizo, menciona con naturalidad (sin regañar ni sonar decepcionado) que lo demás queda para otra sesión.',
+        $rule = match ($intent) {
+            SessionCloseIntent::BlockedStillPending => self::BLOCKED_STILL_PENDING_RULE,
+            SessionCloseIntent::SuccessFull => self::SUCCESS_FULL_RULE,
+            SessionCloseIntent::SuccessPartial => self::SUCCESS_PARTIAL_RULE,
         };
+        $factsBlock = $this->formatFacts($intent, $facts);
 
         return <<<PROMPT
-Eres el entrenador personal de WpbotTrainer, escribiendo por WhatsApp. Tu ÚNICA tarea es redactar UN mensaje breve, natural y propio de un entrenador — nunca de un sistema — usando EXCLUSIVAMENTE este hecho ya determinado por el sistema:{$greeting}
+Eres el entrenador personal de WpbotTrainer, escribiendo por WhatsApp.
 
-{$stateInstructions}
+El campo "session_close_intent" es determinado exclusivamente por el sistema después de registrar el reporte del usuario. Debes respetarlo y NO reinterpretarlo.
+
+{$rule}
+
+REGLA FUNDAMENTAL:
+"BlockedStillPending" significa: hay ejercicios que todavía NO han sido reportados.
+"SuccessPartial" significa: todos los ejercicios ya fueron procesados, aunque alguno haya sido marcado como no realizado.
+Nunca confundas estos dos estados.
+
+HECHOS DISPONIBLES (única fuente de verdad — utiliza ÚNICAMENTE estos hechos para redactar el mensaje):
+{$factsBlock}
 
 REGLAS DURAS, INAMOVIBLES:
-- NUNCA inventes un ejercicio, una serie, una repetición, una carga ni ningún dato que no aparezca arriba.
+- NUNCA inventes un ejercicio, una serie, una repetición, una carga ni ningún dato que no aparezca en los hechos.
 - NUNCA decidas tú si la sesión está completa, parcial o pendiente — eso ya está decidido, solo redactas cómo se dice.
+- Puedes usar "contact_name" con naturalidad si está disponible, sin abusar.
 - Sé breve (2-4 frases como máximo), directo, sin frases motivacionales vacías ni exceso de emojis.
 - Responde EXCLUSIVAMENTE con el texto final del mensaje — sin JSON, sin comillas envolventes, sin explicaciones, sin markdown.
 PROMPT;
+    }
+
+    /**
+     * Renderiza EXACTAMENTE los 5 hechos aprobados (`session_close_intent`,
+     * `contact_name`, `pending_exercises`, `next_exercise`,
+     * `logged_summaries`) — nunca `skipped_exercise_names` (uso interno del
+     * fallback, ver docblock de `compose()`). `pending_exercises`/
+     * `next_exercise` solo tienen sentido para `BlockedStillPending` — se
+     * omiten para los otros dos intents, mismo criterio de "ausencia =
+     * no corresponde" ya usado en el resto de la capa conversacional.
+     */
+    private function formatFacts(SessionCloseIntent $intent, array $facts): string
+    {
+        $lines = ['session_close_intent: '.$intent->value];
+
+        if (($facts['contact_name'] ?? null) !== null) {
+            $lines[] = 'contact_name: '.$facts['contact_name'];
+        }
+
+        if ($intent === SessionCloseIntent::BlockedStillPending) {
+            $lines[] = 'pending_exercises: '.implode(', ', $facts['pending_exercises']);
+            $lines[] = 'next_exercise: '.($facts['next_exercise'] ?? ($facts['pending_exercises'][0] ?? ''));
+        }
+
+        if ($facts['logged_summaries'] !== []) {
+            $lines[] = 'logged_summaries: '.implode('; ', $facts['logged_summaries']);
+        }
+
+        return implode("\n", $lines);
     }
 
     /**
@@ -112,12 +188,12 @@ PROMPT;
         return match ($intent) {
             SessionCloseIntent::BlockedStillPending => sprintf(
                 '¡Casi! 💪 Todavía te faltan estos ejercicios: %s. Cuando los tengas, cuéntame y cerramos el entrenamiento.',
-                implode(', ', $facts['pending_exercise_names']),
+                implode(', ', $facts['pending_exercises']),
             ),
             SessionCloseIntent::SuccessFull => '🏁 ¡Entrenamiento completado! Buen trabajo. Escríbeme cuando quieras tu próximo entrenamiento.',
             SessionCloseIntent::SuccessPartial => sprintf(
                 '🏁 Cerré tu entrenamiento de hoy. Quedó pendiente: %s — lo retomamos otro día. Escríbeme cuando quieras el siguiente.',
-                implode(', ', $facts['skipped_exercise_names']),
+                implode(', ', $facts['skipped_exercise_names'] ?? []),
             ),
         };
     }
