@@ -173,6 +173,31 @@ class TrainingHandler implements HandlerInterface
     private const PROFILE_READY_FALLBACK_MESSAGE = 'Con esto ya tengo lo que necesito para armar tu plan.';
 
     /**
+     * Control P0 de lanzamiento — presupuesto determinista de llamadas de IA
+     * durante el onboarding, para proteger el costo real ante un contacto
+     * (o un abuso) que nunca completa el perfil. `onboarding_turns` (Bloque
+     * 4/D047, columna ya existente) se sigue incrementando exactamente
+     * igual que antes, ANTES de esta comprobación — el único cambio es que,
+     * a partir de aquí, un turno adicional YA NO llama a
+     * `OnboardingConversationService::extractAndRespond()`. Máximo absoluto:
+     * MAX_ONBOARDING_AI_TURNS llamadas reales de IA por TrainingProfile
+     * mientras el onboarding permanezca incompleto — nunca se resetea, y
+     * deja de aplicar en cuanto el onboarding se completa (el bloque entero
+     * de onboarding, incluida esta comprobación, solo se ejecuta mientras
+     * `!isOnboardingComplete()`).
+     */
+    private const MAX_ONBOARDING_AI_TURNS = 10;
+
+    /**
+     * Mismo criterio de tono que HEALTH_SCREENING_PENDING_MESSAGE: nunca
+     * afirma que el bot "falló", nunca promete un plazo — solo informa que
+     * continúa con ayuda humana.
+     */
+    private const ONBOARDING_BUDGET_EXCEEDED_MESSAGE = 'Has alcanzado el límite de sesiones de configuración '
+        .'automática. Para continuar, necesitamos ayudarte de forma manual. Nuestro equipo puede revisar tu '
+        .'configuración y continuar contigo.';
+
+    /**
      * H16.2 Fase 1 — entrega progresiva: transición determinista (sin IA,
      * ver docblock de `recordExecutionReport()`) enviada antes del siguiente
      * ejercicio, únicamente tras un reporte real ya persistido de uno
@@ -341,6 +366,27 @@ class TrainingHandler implements HandlerInterface
             // progresivos (secondaryOpportunisticFor()) ya conozca el número
             // de turno correcto de ESTE turno.
             $profile->increment('onboarding_turns');
+
+            // Control P0 de lanzamiento — presupuesto de IA de onboarding
+            // (ver MAX_ONBOARDING_AI_TURNS). El chequeo va INMEDIATAMENTE
+            // después del incremento (arriba) y ANTES de cualquier llamada
+            // de IA: el turno ya cuenta contra el presupuesto sin importar
+            // si la llamada de abajo llega a ejecutarse o no — así protege
+            // el costo real incluso ante un cliente que fuerce timeouts/
+            // errores repetidos para intentar seguir generando tráfico al
+            // proveedor sin agotar nunca el contador.
+            if ($profile->onboarding_turns > self::MAX_ONBOARDING_AI_TURNS) {
+                Log::warning('ONBOARDING_AI_BUDGET_EXCEEDED', [
+                    'tenant_id' => $tenant->id,
+                    'contact_id' => $contact->id,
+                    'onboarding_turns' => $profile->onboarding_turns,
+                    'max_onboarding_ai_turns' => self::MAX_ONBOARDING_AI_TURNS,
+                ]);
+
+                $this->reply($from, self::ONBOARDING_BUDGET_EXCEEDED_MESSAGE, $tenant);
+
+                return;
+            }
 
             $fragment = $this->buildContext($context, 'training_profile');
             $pending = $this->requirementRegistry->firstPendingBlocking($profile, $contact);

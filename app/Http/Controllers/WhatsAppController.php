@@ -16,6 +16,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
 
 class WhatsAppController extends Controller
 {
@@ -103,6 +104,68 @@ class WhatsAppController extends Controller
     $message = $messages[0];
     $phoneId = $message['id'] ?? null; // Este es el WAMID único de Meta
 
+    // Controles P0 de lanzamiento — reordenamiento explícito: tenant y
+    // fromPhone se resuelven ANTES del control de idempotencia (y, más
+    // abajo, antes del rate limit por tenant+contacto). Ambos son funciones
+    // puras de $payload/$message ya disponibles — moverlos aquí no cambia
+    // su lógica, solo su posición relativa. Motivo: si una petición se
+    // rechaza por rate limit (o, antes de eso, si el tenant no resuelve),
+    // el WAMID nunca debe marcarse como procesado — de lo contrario, un
+    // reintento legítimo posterior de Meta para ese mismo WAMID se
+    // descartaría como "duplicado" sin haber sido procesado nunca.
+    $tenant = $this->resolveTenantFromPayload($payload);
+    $fromPhone = $message['from'] ?? null;
+
+    if (!$tenant) {
+        Log::warning('WhatsApp message handling failed: unable to resolve tenant from webhook metadata', [
+            'tenant_token' => $tenant_token,
+            'payload_metadata' => data_get($payload, 'entry.0.changes.0.value.metadata'),
+        ]);
+        return response('Not Found', 404);
+    }
+
+    // Control P0 de lanzamiento — rate limit por tenant+contacto: la capa
+    // que realmente protege el costo de IA (a diferencia del throttle por
+    // IP de la ruta, que solo frena un flood bruto al endpoint). Clave
+    // "wa-contact:{tenant_id}:{fromPhone}" — independiente por tenant y por
+    // contacto (dos tenants, o dos contactos del mismo tenant, nunca
+    // comparten balde).
+    //
+    // IMPORTANTE — orden de operaciones para no exceder el límite bajo
+    // concurrencia real: RateLimiter::hit() incrementa de forma ATÓMICA
+    // (Illuminate\Cache\DatabaseStore::incrementOrDecrement() usa una
+    // transacción con lockForUpdate() sobre la fila de caché — verificado
+    // en vendor/laravel/framework antes de implementar esto), y devuelve el
+    // conteo YA actualizado. Comparar ESE valor devuelto contra el máximo es
+    // seguro incluso con peticiones simultáneas; el patrón ingenuo
+    // "tooManyAttempts() y luego hit()" (dos operaciones separadas) tiene una
+    // ventana real entre la lectura y el incremento donde dos peticiones
+    // concurrentes podrían leer el mismo conteo "todavía disponible" antes
+    // de que cualquiera incremente, permitiendo superar el límite.
+    //
+    // Se ejecuta ANTES del control de idempotencia (ver más abajo): si esta
+    // petición se rechaza, el WAMID NUNCA debe quedar marcado como
+    // procesado, para que un reintento legítimo posterior de Meta pueda
+    // procesarse una vez que la ventana de rate limit expire.
+    if ($fromPhone) {
+        $rateLimitKey = "wa-contact:{$tenant->id}:{$fromPhone}";
+        $maxAttempts = (int) config('services.meta.contact_rate_limit_max');
+        $decaySeconds = (int) config('services.meta.contact_rate_limit_minutes') * 60;
+
+        $hits = RateLimiter::hit($rateLimitKey, $decaySeconds);
+
+        if ($hits > $maxAttempts) {
+            Log::warning('WHATSAPP_CONTACT_RATE_LIMITED', [
+                'tenant_id' => $tenant->id,
+                'from' => $fromPhone,
+                'hits' => $hits,
+                'max_attempts' => $maxAttempts,
+            ]);
+
+            return response('Too Many Requests', 429);
+        }
+    }
+
     // 🔥 CONTROL DE IDEMPOTENCIA: Bloquear reintentos de Meta de inmediato
     //
     // IMPORTANTE: Cache::add() es atómico (check-and-set en una sola operación).
@@ -111,6 +174,10 @@ class WhatsAppController extends Controller
     // procesado por otro worker antes de que el primero alcanzara a escribir
     // la caché) podían pasar ambas el chequeo y disparar el job dos veces,
     // generando dos respuestas de IA para el mismo mensaje del cliente.
+    //
+    // MISMA LÓGICA que antes — solo se movió después de resolver tenant/
+    // fromPhone (ver comentario arriba) y del rate limit de contacto (ver
+    // más abajo), nunca antes de ellos.
     if ($phoneId) {
         $cacheKey = "whatsapp_msg_processed:{$phoneId}";
 
@@ -124,17 +191,7 @@ class WhatsAppController extends Controller
     // Si pasa los filtros, guardamos el log real del mensaje entrante
     Log::info('Raw WhatsApp Webhook Payload', ['payload' => $payload]);
 
-    $tenant = $this->resolveTenantFromPayload($payload);
-    if (!$tenant) {
-        Log::warning('WhatsApp message handling failed: unable to resolve tenant from webhook metadata', [
-            'tenant_token' => $tenant_token,
-            'payload_metadata' => data_get($payload, 'entry.0.changes.0.value.metadata'),
-        ]);
-        return response('Not Found', 404);
-    }
-
     $type = $message['type'] ?? null;
-    $fromPhone = $message['from'] ?? null;
 
     $body = null;
     $mediaId = null;

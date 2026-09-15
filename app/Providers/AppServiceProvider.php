@@ -40,9 +40,12 @@ use App\Training\Support\SafetySignalPreRoutingScreen;
 use App\Training\Support\TrainingIntentClassifier;
 use App\Training\Support\TrainingReminderExecutor;
 use Carbon\CarbonImmutable;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\ServiceProvider;
@@ -183,6 +186,17 @@ class AppServiceProvider extends ServiceProvider
         }
 
         $this->configureDefaults();
+
+        // Controles P0 de lanzamiento — capa 1 de rate limiting del webhook
+        // de WhatsApp: protección genérica por IP, aplicada vía
+        // 'throttle:whatsapp-webhook-ip' únicamente sobre la ruta POST (ver
+        // routes/api.php). Deliberadamente generosa (config
+        // 'services.meta.webhook_ip_rate_limit') — solo frena un flood bruto
+        // al endpoint; la protección real de costo de IA es la capa 2
+        // (por tenant+contacto, ver WhatsAppController::handle()).
+        RateLimiter::for('whatsapp-webhook-ip', function (Request $request) {
+            return Limit::perMinute(config('services.meta.webhook_ip_rate_limit'))->by($request->ip());
+        });
 
         // Hito 13 — primer listener real de PaymentConfirmed (el seam que
         // Hito 11 dejó preparado, sin consumidor hasta ahora). Registro
