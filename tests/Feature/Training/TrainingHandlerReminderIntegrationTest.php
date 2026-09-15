@@ -131,7 +131,11 @@ it('proposing a reminder never creates one automatically — requires the separa
         'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
     ]);
 
-    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar el lunes a las 7');
+    // "a las 7 de la mañana" — H16.2 Fase 1.3: un mensaje real con indicador
+    // de periodo explícito, para que este test siga probando lo que dice su
+    // nombre (el flujo de confirmación en dos pasos) y no la validación de
+    // ambigüedad AM/PM (cubierta aparte).
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar el lunes a las 7 de la mañana');
 
     expect(Reminder::count())->toBe(0);
 });
@@ -234,6 +238,83 @@ it('a RECURRING reminder request without any day still asks for clarification, e
 
     expect(ReminderSuggestion::count())->toBe(0);
     Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'Qué día y a qué hora'));
+});
+
+// ── H16.2 Fase 1.3 (corrección post-auditoría E2E) — AM/PM ambiguo,
+// end-to-end vía CoachService (sin sesión activa) ───────────────────────
+//
+// Este es exactamente el camino que la prueba E2E real ejercitó y donde se
+// encontró el fallo (CoachService no tenía la regla ni el mecanismo). El
+// mock del LLM en el primer test devuelve deliberadamente una hora
+// "adivinada" (nunca null) — igual que el LLM real hizo en la prueba E2E —
+// para probar que el CÓDIGO la descarta, no que el mock "se porta bien".
+
+it('without an active session, "Recuérdame entrenar a las 9" asks for clarification and never creates a ReminderSuggestion', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '09:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 9');
+
+    expect(ReminderSuggestion::count())->toBe(0);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'Qué día y a qué hora'));
+});
+
+it('"Recuérdame entrenar a las 9 PM" correctly creates the proposal', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '21:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 9 PM');
+
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'a las 21:00'));
+});
+
+it('"Recuérdame entrenar a las 21" correctly creates the proposal', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '21:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 21');
+
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'a las 21:00'));
+});
+
+it('"Recuérdame entrenar a las 7 de la mañana" correctly creates the proposal', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '07:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 7 de la mañana');
+
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'a las 07:00'));
 });
 
 it('cancelling an active Reminder via conversation marks it cancelled', function () {

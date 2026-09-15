@@ -88,7 +88,7 @@ RULES;
             $ai = AIServiceFactory::make($tenant);
             $raw = $ai->getResponse($messageBody, $this->buildPrompt($coachContext), $coachContext->recentMessages);
 
-            return $this->parseJson($raw);
+            return $this->parseJson($raw, $messageBody);
         } catch (\Throwable $e) {
             Log::warning('COACH_RESPONSE_ERROR', ['error' => $e->getMessage()]);
 
@@ -126,6 +126,7 @@ Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber
 - "reminder_request": el usuario pide explícitamente un recordatorio ("recuérdame mañana a las 7", "todos los martes recuérdame entrenar", "ponme una alarma para entrenar") — extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial.
 - "reminder_cancel": el usuario quiere cancelar un recordatorio ya configurado ("ya no quiero ese recordatorio").
 - "reminder_modify": el usuario quiere cambiar un recordatorio ya configurado ("cámbialo para las 8").
+- AM/PM: normaliza "reminder_time" a HH:MM 24h con tu mejor esfuerzo, aunque el usuario haya dado una hora de 1 a 12 sin am/pm ni ningún otro indicio (ej. "a las 7") — compón igual tu mejor estimación. El código, no tú, verifica después si el mensaje realmente traía un indicador de periodo y descarta el valor si no lo trajo. Nunca dependas solo de esta instrucción: el código es la garantía real.
 - "mentioned_forgetting": el usuario menciona una dificultad genérica para entrenar por su cuenta, SIN pedir un recordatorio ni dar día/hora ("siempre se me olvida entrenar", "no tengo constancia", "se me pasa por alto entrenar"). Es una señal, no una petición — NUNCA extraigas "reminder_day"/"reminder_time"/"reminder_recurrence" para este caso; el sistema decide si ofrece algo.
 - "asked_when_to_train": el usuario pregunta genéricamente cuándo debería entrenar, sin pedir un recordatorio explícitamente ("¿cuándo debería entrenar?", "¿qué días me conviene entrenar?"). Puede combinarse con "general_conversation" si además esperas que respondas la pregunta en "training_reply".
 - "customer_service_request": el usuario pide EXPLÍCITAMENTE hablar con una persona/atención humana, o describe un problema que necesita que un humano lo resuelva ("necesito hablar con alguien", "tengo un problema con el pago", "el video no carga y necesito ayuda"). Distinto de "faq_question" — no es una pregunta que una FAQ pueda responder, es una petición directa de ayuda humana.
@@ -214,7 +215,7 @@ TXT;
         return "\n  \"conversation_reinforcement_included\": true | false,";
     }
 
-    private function parseJson(string $raw): array
+    private function parseJson(string $raw, string $messageBody): array
     {
         $cleaned = trim($raw);
         $cleaned = preg_replace('/^```(?:json)?/i', '', $cleaned) ?? $cleaned;
@@ -234,7 +235,7 @@ TXT;
             'training_reply' => is_string($decoded['training_reply'] ?? null) && trim($decoded['training_reply']) !== ''
                 ? $decoded['training_reply']
                 : null,
-            ...ReminderExtractionFields::validate($decoded),
+            ...ReminderExtractionFields::validate($decoded, $messageBody),
             'faq_match_id' => is_int($decoded['faq_match_id'] ?? null) ? $decoded['faq_match_id'] : null,
             'faq_response_text' => is_string($decoded['faq_response_text'] ?? null) && trim($decoded['faq_response_text']) !== ''
                 ? $decoded['faq_response_text']

@@ -329,3 +329,56 @@ it('parses faq_match_id/faq_response_text/customer_service_needed/customer_servi
     expect($result['customer_service_needed'])->toBeFalse(); // no era exactamente true
     expect($result['customer_service_message'])->toBeNull(); // no era string
 });
+
+// ── H16.2 Fase 1.3 (corrección post-auditoría E2E) — AM/PM ambiguo ──────
+//
+// CoachService es el camino que la prueba E2E real demostró sin cobertura:
+// no tenía la regla de AM/PM ni el mecanismo de resolución determinista —
+// esta era la causa raíz real del fallo (ver docs/DECISIONS.md H16.2). Los
+// mismos 4 casos que ExecutionReportServiceTest, mockeando al LLM
+// devolviendo una hora "adivinada" (nunca null) para probar que el CÓDIGO
+// la descarta de todos modos.
+
+it('a genuinely ambiguous bare hour ("a las 9") never produces a usable reminder_time, even if the LLM guesses one anyway', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+        'reminder_day' => null, 'reminder_time' => '09:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+    ]))]);
+
+    $result = (new CoachService)->respond('Recuerdame entreno a las 9', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBeNull();
+});
+
+it('an explicit 24h-format hour ("a las 21") is always preserved, regardless of any period wording', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+        'reminder_day' => null, 'reminder_time' => '21:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+    ]))]);
+
+    $result = (new CoachService)->respond('Recuérdame entrenar a las 21', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('21:00');
+});
+
+it('an explicit AM/PM marker ("a las 9 PM") is preserved — the period indicator in the raw message is what unlocks it', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+        'reminder_day' => null, 'reminder_time' => '21:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+    ]))]);
+
+    $result = (new CoachService)->respond('Recuérdame entrenar a las 9 PM', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('21:00');
+});
+
+it('"de la mañana"/"de la noche" phrasing is preserved as a valid period indicator', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+        'reminder_day' => null, 'reminder_time' => '07:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+    ]))]);
+
+    $result = (new CoachService)->respond('Recuérdame entrenar a las 7 de la mañana', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('07:00');
+});

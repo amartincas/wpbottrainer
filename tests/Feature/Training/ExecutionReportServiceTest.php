@@ -315,17 +315,59 @@ it('an enumeration "10, 10 y 8" is extracted as exactly 3 sets — test de extra
     expect($result['reports'][0]['sets'])->toHaveCount(3);
 });
 
-it('the prompt explicitly instructs the LLM to never guess AM/PM for a genuinely ambiguous bare hour', function () {
-    fakeReportExtraction(['reports' => [], 'session_finished' => false]);
+// ── H16.2 Fase 1.3 (corrección post-auditoría E2E) — AM/PM ambiguo ──────
+//
+// Una prueba E2E real demostró que confiar SOLO en una instrucción de
+// prompt para suprimir "reminder_time" no es una garantía suficiente — el
+// LLM puede ignorarla y producir una hora igual de "válida" en forma. La
+// garantía real ahora es 100% código (ReminderExtractionFields::resolveTime()),
+// que revisa el MENSAJE ORIGINAL del usuario, nunca la salida de la IA, en
+// busca de un indicador de periodo explícito. Estos tests mockean
+// deliberadamente al LLM devolviendo una hora "adivinada" (nunca null) para
+// probar que el CÓDIGO la descarta de todos modos — no que el LLM "se
+// comportó bien".
 
-    (new ExecutionReportService)->extractReport('recuérdame a las 7', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+it('a genuinely ambiguous bare hour ("a las 7") never produces a usable reminder_time, even if the LLM guesses one anyway', function () {
+    fakeReportExtraction([
+        'reports' => [], 'session_finished' => false,
+        'reminder_time' => '07:00', // el LLM "adivinó" — el código debe descartarlo igual
+    ]);
 
-    Http::assertSent(function ($request) {
-        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
 
-        return str_contains($systemPrompt, 'CRÍTICO — AM/PM AMBIGUO')
-            && str_contains($systemPrompt, 'NO adivines si es AM o PM');
-    });
+    expect($result['reminder_time'])->toBeNull();
+});
+
+it('an explicit 24h-format hour ("a las 21") is always preserved, regardless of any period wording', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
+
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 21', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('21:00');
+});
+
+it('an explicit AM/PM marker ("a las 9 PM") is preserved — the period indicator in the raw message is what unlocks it', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
+
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 PM', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('21:00');
+});
+
+it('"de la mañana" phrasing is preserved as a valid period indicator', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '07:00']);
+
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7 de la mañana', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('07:00');
+});
+
+it('"de la noche" phrasing is preserved as a valid period indicator', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
+
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 de la noche', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reminder_time'])->toBe('21:00');
 });
 
 it('validateSets() never inflates or reduces the count returned by the LLM — it only validates ranges per element', function () {

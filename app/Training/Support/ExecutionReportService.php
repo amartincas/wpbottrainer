@@ -93,7 +93,7 @@ class ExecutionReportService
             $history = $coachContext?->recentMessages ?? [];
             $raw = $ai->getResponse($messageBody, $this->buildPrompt($reportableExercises, $coachContext), $history);
 
-            return $this->parseJson($raw);
+            return $this->parseJson($raw, $messageBody);
         } catch (\Throwable $e) {
             Log::warning('TRAINING_REPORT_EXTRACTION_ERROR', ['error' => $e->getMessage()]);
 
@@ -163,7 +163,7 @@ Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej.
 - Si el mensaje es ÚNICAMENTE un reporte, sin ninguna otra pregunta, "intents" debe ser [] y "training_reply" null.
 - Para "membership_status"/"faq_question" NUNCA generes contenido factual en "training_reply" — solo detecta que el intent está presente; el sistema responde esos dominios por su cuenta.
 - "reminder_request": el usuario pide explícitamente un recordatorio — extrae "reminder_day"/"reminder_time"/"reminder_recurrence" de lo que haya dicho, aunque sea parcial. "reminder_cancel"/"reminder_modify": quiere cancelar/cambiar uno ya configurado.
-- CRÍTICO — AM/PM AMBIGUO: si el usuario da una hora SIN am/pm (ej. "a las 7") y no hay ningún contexto en el mensaje que la desambigüe (ni "de la mañana"/"de la noche", ni "am"/"pm", ni una referencia horaria clara), NO adivines si es AM o PM — deja "reminder_time" en null. Es preferible que el sistema pida aclaración a que asumas silenciosamente una hora que el usuario no especificó. Si el usuario SÍ da un indicio (am/pm explícito, "de la mañana", "de la noche", "esta tarde", etc.), normaliza normalmente a HH:MM 24h.
+- AM/PM: normaliza la hora a HH:MM 24h con tu mejor esfuerzo. Si el usuario da una hora de 1 a 12 SIN am/pm ni ningún otro indicio (ej. "a las 7"), igual compón tu mejor estimación — el código, no tú, verifica después si el mensaje realmente traía un indicador de periodo y descarta el valor si no lo trajo. Nunca dependas solo de esta instrucción: el código es la garantía real.
 - "mentioned_forgetting": el usuario menciona una dificultad genérica para entrenar por su cuenta, SIN pedir un recordatorio ni dar día/hora ("siempre se me olvida entrenar"). Es una señal, no una petición — nunca extraigas "reminder_day"/"reminder_time"/"reminder_recurrence" para este caso.
 - "asked_when_to_train": el usuario pregunta genéricamente cuándo debería entrenar, sin pedir un recordatorio explícitamente. Puede combinarse con "general_conversation" si además esperas una respuesta en "training_reply".
 - "reminder_confirmation": true/false SOLO si el mensaje ACTUAL confirma o rechaza la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" (más abajo, si aparece) — null si esa línea no aparece o el mensaje no se refiere a ella. NUNCA uses el HISTORIAL DE CONVERSACIÓN para esto, solo ese HECHO estructurado. El código, nunca tú, calcula la fecha/hora real y crea o modifica cualquier recordatorio.
@@ -183,7 +183,7 @@ PROMPT;
         return $prompt;
     }
 
-    private function parseJson(string $raw): array
+    private function parseJson(string $raw, string $messageBody): array
     {
         $cleaned = trim($raw);
         $cleaned = preg_replace('/^```(?:json)?/i', '', $cleaned) ?? $cleaned;
@@ -225,7 +225,7 @@ PROMPT;
             'training_reply' => is_string($decoded['training_reply'] ?? null) && trim($decoded['training_reply']) !== ''
                 ? $decoded['training_reply']
                 : null,
-            ...ReminderExtractionFields::validate($decoded),
+            ...ReminderExtractionFields::validate($decoded, $messageBody),
         ];
     }
 
