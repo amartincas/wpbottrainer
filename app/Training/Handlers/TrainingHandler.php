@@ -222,6 +222,13 @@ class TrainingHandler implements HandlerInterface
     private const REMINDER_MODIFIED_MESSAGE = 'Listo, actualicé tu recordatorio para %s a las %s. 🔔';
 
     /**
+     * Issue F — misma forma que REMINDER_PROPOSAL_TEMPLATE (sigue siendo una
+     * propuesta PENDIENTE, no un Reminder confirmado), con acuse de la
+     * corrección en vez de una oferta desde cero.
+     */
+    private const REMINDER_SUGGESTION_MODIFIED_TEMPLATE = 'Perfecto. Entonces te recordaré entrenar %s a las %s. ¿Confirmas? 💪';
+
+    /**
      * // DECISIÓN DE NEGOCIO PENDIENTE — valor técnico provisional,
      * compartido por los 3 triggers MVP de proactividad (D053).
      */
@@ -1032,8 +1039,8 @@ class TrainingHandler implements HandlerInterface
     {
         match ($data['decision']) {
             'confirmation' => $this->applyReminderConfirmation($data, $contact, $tenant, $from),
-            'cancel' => $this->cancelActiveReminder($contact, $tenant, $from),
-            'modify' => $this->modifyActiveReminder($data, $contact, $tenant, $from),
+            'cancel' => $this->cancelReminderOrSuggestion($contact, $tenant, $from),
+            'modify' => $this->applyReminderModification($data, $contact, $tenant, $from),
             default => null,
         };
     }
@@ -1063,16 +1070,12 @@ class TrainingHandler implements HandlerInterface
 
         // Override ("Sí, pero a las 8"): CÓDIGO revalida con el mismo
         // resolver — nunca se acepta el valor de la IA a ciegas, ni
-        // siquiera en una confirmación.
-        $params = $suggestion->proposed_params;
-        $day = $data['day'] ?? $params['day'];
-        $time = $data['time'] ?? $params['time'];
-        $recurring = $params['recurring'];
+        // siquiera en una confirmación. Mismo mecanismo que Issue F
+        // reutiliza para modificar una suggestion sin confirmarla todavía
+        // — ver resolveOverrideAgainstSuggestion().
+        $override = $this->resolveOverrideAgainstSuggestion($suggestion, $data, $contact);
 
-        $timezone = $this->timezoneResolver->resolve($contact);
-        $resolution = $this->reminderTimeResolver->resolve($day, $time, $recurring, $timezone, now());
-
-        if ($resolution === null) {
+        if ($override['resolution'] === null) {
             // La suggestion sigue pending — no se pierde la aceptación
             // implícita, se pide precisar el dato que falta.
             $this->reply($from, self::REMINDER_CLARIFICATION_MESSAGE, $tenant);
@@ -1085,14 +1088,45 @@ class TrainingHandler implements HandlerInterface
             'contact_id' => $contact->id,
             'type' => $suggestion->proposed_type,
             'status' => \App\Training\Enums\ReminderStatus::Pending,
-            'fire_at' => $resolution->fireAt,
-            'recurrence' => $resolution->recurrence,
+            'fire_at' => $override['resolution']->fireAt,
+            'recurrence' => $override['resolution']->recurrence,
             'created_from_suggestion_id' => $suggestion->id,
         ]);
 
         $suggestion->update(['status' => ReminderSuggestionStatus::Accepted]);
 
-        $this->reply($from, sprintf(self::REMINDER_CONFIRMED_MESSAGE, $this->resolvedDayLabel($day, $recurring, $resolution->fireAt, $timezone), $time), $tenant);
+        $this->reply($from, sprintf(self::REMINDER_CONFIRMED_MESSAGE, $this->resolvedDayLabel($override['day'], $override['recurring'], $override['resolution']->fireAt, $override['timezone']), $override['time']), $tenant);
+    }
+
+    /**
+     * Issue F — un `Reminder` YA CONFIRMADO tiene prioridad absoluta sobre
+     * una `ReminderSuggestion` pendiente: nunca deben coexistir por el flujo
+     * normal (`proposeReminder()` bloquea una segunda oferta mientras exista
+     * cualquiera de los dos), pero si coexistieran por cualquier motivo, el
+     * recordatorio YA REAL es el que el usuario espera que se cancele.
+     */
+    private function cancelReminderOrSuggestion(Contact $contact, Tenant $tenant, string $from): void
+    {
+        if (Reminder::activeFor($contact) !== null) {
+            $this->cancelActiveReminder($contact, $tenant, $from);
+
+            return;
+        }
+
+        $suggestion = ReminderSuggestion::activePendingFor($contact);
+
+        if ($suggestion === null) {
+            $this->reply($from, self::REMINDER_NONE_ACTIVE_MESSAGE, $tenant);
+
+            return;
+        }
+
+        // Nunca crea ni toca un Reminder — rechaza la propuesta con el
+        // mismo mecanismo (y el mismo mensaje) que un "no" explícito a la
+        // confirmación, porque es semánticamente lo mismo: la propuesta
+        // nunca llegó a confirmarse.
+        $suggestion->update(['status' => ReminderSuggestionStatus::Declined]);
+        $this->reply($from, self::REMINDER_DECLINED_MESSAGE, $tenant);
     }
 
     private function cancelActiveReminder(Contact $contact, Tenant $tenant, string $from): void
@@ -1107,6 +1141,24 @@ class TrainingHandler implements HandlerInterface
 
         $reminder->update(['status' => \App\Training\Enums\ReminderStatus::Cancelled, 'cancelled_at' => now()]);
         $this->reply($from, self::REMINDER_CANCELLED_MESSAGE, $tenant);
+    }
+
+    /**
+     * Issue F — mismo criterio de prioridad que cancelReminderOrSuggestion():
+     * un `Reminder` confirmado nunca se ignora a favor de una `ReminderSuggestion`
+     * pendiente antigua.
+     *
+     * @param  array{day: ?string, time: ?string}  $data
+     */
+    private function applyReminderModification(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        if (Reminder::activeFor($contact) !== null) {
+            $this->modifyActiveReminder($data, $contact, $tenant, $from);
+
+            return;
+        }
+
+        $this->modifyPendingSuggestion($data, $contact, $tenant, $from);
     }
 
     /**
@@ -1143,6 +1195,80 @@ class TrainingHandler implements HandlerInterface
         $reminder->update(['fire_at' => $resolution->fireAt, 'recurrence' => $resolution->recurrence]);
 
         $this->reply($from, sprintf(self::REMINDER_MODIFIED_MESSAGE, $this->describeDay($day, $recurring), $time), $tenant);
+    }
+
+    /**
+     * Issue F — "A las 8PM" sobre una `ReminderSuggestion` PENDIENTE (nunca
+     * confirmada todavía) NUNCA debe exigir la palabra "sí": actualiza
+     * `proposed_params` con el mismo mecanismo de override que
+     * `applyReminderConfirmation()` ya usa para "Sí, pero a las 8", y vuelve
+     * a pedir confirmación — nunca crea el `Reminder` en este paso.
+     *
+     * @param  array{day: ?string, time: ?string}  $data
+     */
+    private function modifyPendingSuggestion(array $data, Contact $contact, Tenant $tenant, string $from): void
+    {
+        $suggestion = ReminderSuggestion::activePendingFor($contact);
+
+        if ($suggestion === null) {
+            $this->reply($from, self::REMINDER_NONE_ACTIVE_MESSAGE, $tenant);
+
+            return;
+        }
+
+        $override = $this->resolveOverrideAgainstSuggestion($suggestion, $data, $contact);
+
+        if ($override['resolution'] === null) {
+            $this->reply($from, self::REMINDER_CLARIFICATION_MESSAGE, $tenant);
+
+            return;
+        }
+
+        // Se guarda el vocabulario CRUDO (day/time/recurring), nunca el
+        // fire_at ya resuelto — mismo criterio que proposeReminder(): la
+        // resolución real se recalcula recién en la confirmación (ver
+        // docs/DECISIONS.md D053, docblock de ReminderSuggestion).
+        $suggestion->update(['proposed_params' => [
+            'day' => $override['day'],
+            'time' => $override['time'],
+            'recurring' => $override['recurring'],
+        ]]);
+
+        $this->reply(
+            $from,
+            sprintf(self::REMINDER_SUGGESTION_MODIFIED_TEMPLATE, $this->resolvedDayLabel($override['day'], $override['recurring'], $override['resolution']->fireAt, $override['timezone']), $override['time']),
+            $tenant,
+        );
+    }
+
+    /**
+     * Único lugar que aplica un override parcial (día y/o hora) a una
+     * `ReminderSuggestion` pendiente — compartido por `applyReminderConfirmation()`
+     * ("Sí, pero a las 8") y `modifyPendingSuggestion()` ("A las 8PM", Issue
+     * F). Cualquier componente que el override NO especifique se conserva
+     * tal cual estaba en `proposed_params` — nunca se adivina ni se
+     * reemplaza por un valor por defecto. `recurring` nunca viene en el
+     * override (ningún intent lo extrae para confirmación/modificación), así
+     * que siempre se conserva el de la propuesta.
+     *
+     * @param  array{day: ?string, time: ?string}  $override
+     * @return array{day: ?string, time: ?string, recurring: bool, timezone: string, resolution: ?ReminderTimeResolution}
+     */
+    private function resolveOverrideAgainstSuggestion(ReminderSuggestion $suggestion, array $override, Contact $contact): array
+    {
+        $params = $suggestion->proposed_params;
+        $day = $override['day'] ?? $params['day'];
+        $time = $override['time'] ?? $params['time'];
+        $recurring = $params['recurring'];
+        $timezone = $this->timezoneResolver->resolve($contact);
+
+        return [
+            'day' => $day,
+            'time' => $time,
+            'recurring' => $recurring,
+            'timezone' => $timezone,
+            'resolution' => $this->reminderTimeResolver->resolve($day, $time, $recurring, $timezone, now()),
+        ];
     }
 
     /**

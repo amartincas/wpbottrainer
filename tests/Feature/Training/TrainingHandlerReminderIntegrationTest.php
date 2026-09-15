@@ -317,6 +317,218 @@ it('"Recuérdame entrenar a las 7 de la mañana" correctly creates the proposal'
     Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'a las 07:00'));
 });
 
+// ── Issue F — modificar/cancelar una ReminderSuggestion PENDIENTE ───────
+// Una propuesta aún sin confirmar debe poder corregirse ("A las 8PM") sin
+// exigir la palabra "sí", y debe poder rechazarse ("ya no la quiero") sin
+// caer en el mensaje de "no tienes ningún recordatorio activo" — ambos
+// reutilizan el mecanismo de override/decline ya existente para la
+// confirmación, nunca duplican la resolución de día/hora/recurrencia.
+
+it('Issue F: "A las 8PM" modifies a pending ReminderSuggestion without the word "sí", and keeps it pending', function () {
+    $contact = reminderIntegrationContact();
+    $suggestion = ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'A las 8PM');
+
+    $suggestion->refresh();
+    expect($suggestion->status)->toBe(ReminderSuggestionStatus::Pending);
+    expect($suggestion->proposed_params)->toBe(['day' => 'tomorrow', 'time' => '20:00', 'recurring' => false]);
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), '¿Confirmas'));
+});
+
+it('Issue F: modifying only the time preserves the original day ("mañana") in storage and in the reply', function () {
+    $contact = reminderIntegrationContact();
+    ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'A las 8PM');
+
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->first()->proposed_params['day'])->toBe('tomorrow');
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'mañana a las 20:00'));
+});
+
+it('Issue F: explicitly changing both day and time updates both on the pending suggestion', function () {
+    $contact = reminderIntegrationContact();
+    ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            'reminder_day' => 'friday', 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'El viernes a las 8PM');
+
+    $suggestion = ReminderSuggestion::where('contact_id', $contact->id)->first();
+    expect($suggestion->proposed_params)->toBe(['day' => 'friday', 'time' => '20:00', 'recurring' => false]);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'el viernes a las 20:00'));
+});
+
+it('Issue F: reminder_cancel on a pending suggestion declines it, never the "no active reminder" message, and creates no Reminder', function () {
+    $contact = reminderIntegrationContact();
+    $suggestion = ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_cancel'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Ya no quiero ese recordatorio');
+
+    expect($suggestion->fresh()->status)->toBe(ReminderSuggestionStatus::Declined);
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+    Http::assertNotSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'No tienes ningún recordatorio activo'));
+});
+
+it('Issue F: with BOTH an active Reminder and a pending ReminderSuggestion, reminder_modify targets the Reminder, never the suggestion', function () {
+    $contact = reminderIntegrationContact();
+    $reminder = Reminder::factory()->create(['contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id]);
+    $suggestion = ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'A las 8PM');
+
+    $timezone = $contact->tenant->timezone;
+    expect($reminder->fresh()->fire_at->setTimezone($timezone)->format('H:i'))->toBe('20:00');
+    // La suggestion nunca se tocó — sigue exactamente como estaba.
+    expect($suggestion->fresh()->proposed_params)->toBe(['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false]);
+});
+
+it('Issue F: with neither a Reminder nor a ReminderSuggestion, reminder_modify keeps the existing "no reminder" behavior', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Cámbialo a las 8PM');
+
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'No tienes ningún recordatorio activo'));
+});
+
+it('Issue F: a genuinely ambiguous modification ("a las 9") never invents AM/PM — the existing time is neither altered nor guessed', function () {
+    $contact = reminderIntegrationContact();
+    $suggestion = ReminderSuggestion::create([
+        'tenant_id' => $contact->tenant_id, 'contact_id' => $contact->id,
+        'origin' => \App\Training\Enums\ReminderSuggestionOrigin::UserRequest,
+        'proposed_type' => 'training_one_off', 'proposed_params' => ['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false],
+        'status' => ReminderSuggestionStatus::Pending, 'expires_at' => now()->addHours(24),
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+            // El LLM "adivina" 09:00 — la validación de AM/PM ya existente
+            // (ReminderExtractionFields, sin tocar aquí) lo descarta a null
+            // ANTES de que ConversationTurnResolver/TrainingHandler lo vean,
+            // porque "a las 9" no trae ningún indicador de periodo.
+            'reminder_day' => null, 'reminder_time' => '09:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'A las 9');
+
+    // Nunca se inventa 09:00 ni 21:00 "adivinado" — al llegar reminder_time
+    // ya en null, el override se resuelve contra el valor EXISTENTE de la
+    // propuesta (mismo mecanismo que "Sí" sin override), así que el horario
+    // queda exactamente igual a como estaba, nunca alterado por una
+    // suposición.
+    expect($suggestion->fresh()->proposed_params)->toBe(['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false]);
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+});
+
+it('Issue F: E2E — "Recuérdame entrenar mañana a las 9 PM" then "A las 8PM" modifies the pending suggestion, never creating a Reminder before "sí"', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::sequence()
+            ->push(reminderChatBody([
+                'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+                'reminder_day' => 'tomorrow', 'reminder_time' => '21:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+            ]))
+            ->push(reminderChatBody([
+                'safety_signal_text' => null, 'intents' => ['reminder_modify'], 'training_reply' => null,
+                'reminder_day' => null, 'reminder_time' => '20:00', 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+            ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar mañana a las 9 PM');
+
+    $suggestion = ReminderSuggestion::where('contact_id', $contact->id)->sole();
+    expect($suggestion->status)->toBe(ReminderSuggestionStatus::Pending);
+    expect($suggestion->proposed_params)->toBe(['day' => 'tomorrow', 'time' => '21:00', 'recurring' => false]);
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+
+    sendReminderIntegrationMessage($contact, 'A las 8PM');
+
+    $suggestion->refresh();
+    expect($suggestion->status)->toBe(ReminderSuggestionStatus::Pending);
+    expect($suggestion->proposed_params)->toBe(['day' => 'tomorrow', 'time' => '20:00', 'recurring' => false]);
+    // Crítico: sigue sin existir ningún Reminder confirmado — el usuario
+    // nunca dijo "sí" en ninguno de los dos turnos.
+    expect(Reminder::where('contact_id', $contact->id)->count())->toBe(0);
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+});
+
 it('cancelling an active Reminder via conversation marks it cancelled', function () {
     $contact = reminderIntegrationContact();
     $reminder = Reminder::factory()->create(['contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id]);
