@@ -136,6 +136,106 @@ it('proposing a reminder never creates one automatically — requires the separa
     expect(Reminder::count())->toBe(0);
 });
 
+// ── H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 2) ──────────
+// "Recuérdame a las X" sin ningún día: ya no pide aclaración si la IA
+// extrajo la hora correctamente — ReminderTimeResolver infiere hoy/mañana.
+
+it('"recuérdame a las 19:00" without a day, still in the future today, proposes TODAY — never asks for the day', function () {
+    \Illuminate\Support\Carbon::setTestNow(\Illuminate\Support\Carbon::parse('2026-09-09 10:00:00', 'America/Bogota'));
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '19:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 7pm');
+
+    expect(ReminderSuggestion::where('contact_id', $contact->id)->count())->toBe(1);
+    Http::assertNotSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'Qué día'));
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'hoy a las 19:00'));
+
+    \Illuminate\Support\Carbon::setTestNow();
+});
+
+it('"recuérdame a las 19:00" without a day, already passed today, proposes TOMORROW — never asks for the day', function () {
+    \Illuminate\Support\Carbon::setTestNow(\Illuminate\Support\Carbon::parse('2026-09-09 20:00:00', 'America/Bogota'));
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '19:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 7pm');
+
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'mañana a las 19:00'));
+
+    \Illuminate\Support\Carbon::setTestNow();
+});
+
+it('the implicit today/tomorrow decision uses the TENANT timezone, not the server clock', function () {
+    // 23:30 UTC == 18:30 en America/Bogota (UTC-5) — todavía no son las
+    // 19:00 locales, así que debe proponer HOY, no "ya pasó".
+    \Illuminate\Support\Carbon::setTestNow(\Illuminate\Support\Carbon::parse('2026-09-09 23:30:00', 'UTC'));
+    $contact = reminderIntegrationContact();
+    expect($contact->tenant->timezone)->toBe('America/Bogota');
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '19:00', 'reminder_recurrence' => false, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 7pm');
+
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'hoy a las 19:00'));
+
+    \Illuminate\Support\Carbon::setTestNow();
+});
+
+it('a genuinely ambiguous bare hour with no am/pm and no day, when the AI correctly leaves reminder_time null, still asks for clarification — never guesses', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame entrenar a las 7');
+
+    expect(ReminderSuggestion::count())->toBe(0);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'Qué día y a qué hora'));
+});
+
+it('a RECURRING reminder request without any day still asks for clarification, even though a bare time now resolves for a one-off', function () {
+    $contact = reminderIntegrationContact();
+
+    Http::fake([
+        'api.openai.com/*' => Http::response(reminderChatBody([
+            'safety_signal_text' => null, 'intents' => ['reminder_request'], 'training_reply' => null,
+            'reminder_day' => null, 'reminder_time' => '19:00', 'reminder_recurrence' => true, 'reminder_confirmation' => null,
+        ])),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    sendReminderIntegrationMessage($contact, 'Recuérdame todos los días a las 7pm');
+
+    expect(ReminderSuggestion::count())->toBe(0);
+    Http::assertSent(fn ($r) => str_contains(data_get($r->data(), 'text.body', ''), 'Qué día y a qué hora'));
+});
+
 it('cancelling an active Reminder via conversation marks it cancelled', function () {
     $contact = reminderIntegrationContact();
     $reminder = Reminder::factory()->create(['contact_id' => $contact->id, 'tenant_id' => $contact->tenant_id]);
@@ -414,6 +514,11 @@ it('a pending suggestion still gets confirmed correctly even after 12 unrelated 
 it('Trigger 2: completing a session offers a proactive reminder when the gate allows it', function () {
     $contact = reminderIntegrationContact();
     [$session, $we] = reminderIntegrationSession($contact);
+    // prescribed_sets: 1 — el reporte de este test cubre exactamente 1 serie
+    // (H16.2 Fase 1.3, Caso 1B: con el prescribed_sets:3 por defecto del
+    // helper, este reporte de "1 serie" se trataría como parcial y
+    // bloquearía el cierre, algo ajeno al propósito de este test).
+    $we->update(['prescribed_sets' => 1]);
 
     Http::fake([
         'api.openai.com/*' => Http::response(reminderChatBody([

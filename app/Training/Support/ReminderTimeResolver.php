@@ -43,10 +43,19 @@ class ReminderTimeResolver
         $nowLocal = CarbonImmutable::instance($now)->setTimezone($timezone);
         $weekday = self::WEEKDAYS[$day] ?? null;
 
+        // H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 2) — el
+        // usuario dio una hora sin ningún día ("recuérdame a las 7"): en vez
+        // de tratarlo como ambiguo, se asume HOY si esa hora todavía no pasó,
+        // o MAÑANA si ya pasó — usando el mismo $nowLocal que el resto de
+        // esta clase ya calcula. Nunca delegado a la IA: el LLM solo extrae
+        // que no hubo día explícito (day=null), esta clase decide la fecha
+        // real. `$recurring` sigue rechazado más abajo cuando no hay un día
+        // de la semana real (weekday===null) — este cambio no lo afecta.
         $candidateDate = match (true) {
             $weekday !== null => $this->nextOccurrenceOfWeekday($nowLocal, $weekday),
             $day === 'today' => $nowLocal->startOfDay(),
             $day === 'tomorrow' => $nowLocal->startOfDay()->addDay(),
+            $day === null => $this->inferImplicitDay($nowLocal, $hour, $minute),
             default => null,
         };
 
@@ -86,5 +95,22 @@ class ReminderTimeResolver
         }
 
         return $candidate;
+    }
+
+    /**
+     * H16.2 Fase 1.3 (Caso 2) — el usuario dio una hora sin día ("a las 7").
+     * HOY si esa hora todavía no ha pasado en $nowLocal; MAÑANA si ya pasó o
+     * es exactamente la hora actual (misma convención de "igual = ya pasó"
+     * que el resto de esta clase usa en la línea de `lessThanOrEqualTo` de
+     * arriba). Devuelve solo la FECHA (medianoche local) — resolve() le
+     * aplica la hora exacta justo después, igual que a cualquier otra rama.
+     */
+    private function inferImplicitDay(CarbonImmutable $nowLocal, int $hour, int $minute): CarbonImmutable
+    {
+        $todayAtRequestedTime = $nowLocal->setTime($hour, $minute, 0);
+
+        return $todayAtRequestedTime->greaterThan($nowLocal)
+            ? $nowLocal->startOfDay()
+            : $nowLocal->startOfDay()->addDay();
     }
 }

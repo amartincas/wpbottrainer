@@ -163,8 +163,12 @@ it('records only what was actually reported in a partial session, leaving the re
 // 5. Ejercicio por tiempo.
 it('records a time-based exercise using duration instead of reps/load', function () {
     $contact = readyTrainingContact();
+    // prescribed_sets: 1 — el reporte de este test cubre exactamente 1 serie
+    // (H16.2 Fase 1.3, Caso 1B: con el default de 3 del helper, este reporte
+    // de "1 serie" se trataría como parcial y bloquearía el cierre, algo
+    // ajeno al propósito de este test).
     [$session, $workoutExercises] = makeSessionWithExercises($contact, [
-        ['name' => 'Plancha', 'tracking_type' => TrackingType::TimeBased],
+        ['name' => 'Plancha', 'tracking_type' => TrackingType::TimeBased, 'workout_exercise_overrides' => ['prescribed_sets' => 1]],
     ]);
 
     Http::fake([
@@ -643,7 +647,11 @@ it('"ya terminé" with real pendientes never completes the session and never cla
 
 it('"ya terminé" with everything reported in the same message closes the session with a SuccessFull message', function () {
     $contact = readyTrainingContact();
-    [$session, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Sentadilla']]);
+    // prescribed_sets: 1 — el reporte cubre exactamente 1 serie (ver nota de
+    // H16.2 Fase 1.3 más arriba en este archivo).
+    [$session, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Sentadilla', 'workout_exercise_overrides' => ['prescribed_sets' => 1]],
+    ]);
 
     Http::fake([
         'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
@@ -819,8 +827,10 @@ it('Test 2 — "listo" alone, right after the exercise was presented, asks only 
 
 it('Test 3 — after registering the current exercise, delivers exactly the next pending one, never re-sending the one just completed', function () {
     $contact = readyTrainingContact();
+    // prescribed_sets: 1 en el primer ejercicio — el reporte de este test
+    // cubre exactamente 1 serie (ver nota de H16.2 Fase 1.3 más arriba).
     [, $workoutExercises] = makeSessionWithExercises($contact, [
-        ['name' => 'Elevaciones de gemelos con mancuernas'],
+        ['name' => 'Elevaciones de gemelos con mancuernas', 'workout_exercise_overrides' => ['prescribed_sets' => 1]],
         ['name' => 'Curl de bíceps con mancuernas de pie'],
     ]);
 
@@ -1099,4 +1109,167 @@ it('H16.2 Fase 1.2 — a "not_performed" report is confirmed neutrally, never ce
     expect($confirmation)->not->toContain('¡Perfecto!');
     expect($confirmation)->not->toContain('Buen trabajo');
     expect($confirmation)->not->toContain('progres');
+});
+
+// ── H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 1B) ─────────
+// Reporte de MENOS series que las prescritas: se persiste exactamente lo
+// reportado (nunca se infla), y el turno NO avanza/cierra en silencio —
+// pregunta si el usuario continuará o lo deja hasta ahí.
+
+it('a report with fewer sets than prescribed persists exactly what was reported, never inflating to the prescription', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Vuelo reverso con mancuernas inclinado']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Hice una serie de 10 con 8kg');
+
+    $log = ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->first();
+    expect($log)->not->toBeNull();
+    expect($log->exerciseSets)->toHaveCount(1);
+});
+
+it('a partial report generates a clarification and never delivers the next exercise', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Vuelo reverso con mancuernas inclinado'],
+        ['name' => 'Sentadilla con peso corporal'],
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Lista la serie de 10 repeticiones con peso de 8Kg');
+
+    // Nunca se entrega la tarjeta del siguiente ejercicio en este turno.
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla con peso corporal'));
+});
+
+it('a partial report\'s response contains both the confirmation of what was logged AND the follow-up question, in one message', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [['name' => 'Vuelo reverso con mancuernas inclinado']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Lista la serie de 10 repeticiones con peso de 8Kg');
+
+    $message = collect(Http::recorded())
+        ->filter(fn ($pair) => str_contains($pair[0]->url(), 'graph.facebook.com'))
+        ->map(fn ($pair) => data_get($pair[0]->data(), 'text.body'))
+        ->filter()
+        ->values()
+        ->first();
+
+    expect($message)->toContain('1 serie de 10 repeticiones con 8kg en Vuelo reverso con mancuernas inclinado');
+    expect($message)->toContain('¿Vas a hacer 2 series más de Vuelo reverso con mancuernas inclinado, o lo dejas hasta ahí por hoy?');
+});
+
+it('a partial report on the LAST pending exercise never closes the session automatically', function () {
+    $contact = readyTrainingContact();
+    [$session] = makeSessionWithExercises($contact, [['name' => 'Vuelo reverso con mancuernas inclinado']]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Hice una serie de 10 con 8kg');
+
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
+    Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'completado'));
+});
+
+it('a report matching exactly prescribed_sets keeps advancing normally (no regression)', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Vuelo reverso con mancuernas inclinado'],
+        ['name' => 'Sentadilla con peso corporal'],
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                ],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Hice las 3 series de 10 con 8kg');
+
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla con peso corporal'));
+});
+
+it('a report with MORE sets than prescribed is never blocked by the partial-report check (out of scope for this change)', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Vuelo reverso con mancuernas inclinado'],
+        ['name' => 'Sentadilla con peso corporal'],
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(reportExtractionBody([
+            'reports' => [[
+                'exercise_name' => 'Vuelo reverso con mancuernas inclinado', 'not_performed' => false,
+                'sets' => [
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                    ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                ],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ]],
+            'session_finished' => false,
+        ]), 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT1']]], 200),
+    ]);
+
+    sendMessageAsContact($contact, 'Hice 4 series de 10 con 8kg');
+
+    $log = ExerciseLog::where('workout_exercise_id', $workoutExercises[0]->id)->first();
+    expect($log->exerciseSets)->toHaveCount(4);
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla con peso corporal'));
 });

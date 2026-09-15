@@ -35,6 +35,7 @@ class ExecutionReportRecorder
 
         $logged = [];
         $clarifications = [];
+        $partialIds = [];
 
         foreach ($extraction['reports'] as $report) {
             $resolved = $this->resolveExercise($report['exercise_name'], $unreported);
@@ -64,11 +65,61 @@ class ExecutionReportRecorder
             $this->persist($resolved, $report);
             $unreported = $unreported->reject(fn (WorkoutExercise $we) => $we->is($resolved))->values();
             $logged[] = $this->summaryOf($resolved, $report);
+
+            // H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 1B) —
+            // el usuario reportó MENOS series de las prescritas: se persiste
+            // exactamente lo dicho (nunca se infla), pero el turno no debe
+            // avanzar en silencio al siguiente ejercicio — se pregunta si
+            // continuará o lo deja hasta ahí. `$partialIds` hace que ese
+            // ejercicio siga contando como "sin resolver" SOLO para las
+            // decisiones de este mismo turno (avance/cierre) — ver
+            // maybeCompleteSession() y TrainingHandler::recordExecutionReport().
+            // Nunca cambia qué significa "Unreported" (exerciseLog === null)
+            // para ningún otro consumidor del sistema.
+            if ($this->isPartialReport($resolved, $report)) {
+                $clarifications[] = $this->partialSetsClarification($resolved, $report);
+                $partialIds[] = $resolved->id;
+
+                Log::info('TRAINING_REPORT_PARTIAL_SETS', [
+                    'workout_exercise_id' => $resolved->id,
+                    'reported_sets' => count($report['sets']),
+                    'prescribed_sets' => $resolved->prescribed_sets,
+                ]);
+            }
         }
 
-        $sessionCompleted = $this->maybeCompleteSession($session);
+        $sessionCompleted = $this->maybeCompleteSession($session, $partialIds);
 
-        return new ExecutionReportOutcome($logged, $clarifications, $sessionCompleted);
+        return new ExecutionReportOutcome($logged, $clarifications, $sessionCompleted, $partialIds);
+    }
+
+    /**
+     * H16.2 Fase 1.3 — true únicamente cuando el usuario reportó ejecución
+     * real (no `not_performed`), el ejercicio tiene una prescripción de
+     * series conocida, y reportó AL MENOS una serie pero MENOS de las
+     * prescritas. Nunca dispara para más series que las prescritas (fuera
+     * de alcance) ni cuando `prescribed_sets` es null (sin prescripción
+     * conocida, nada contra qué comparar).
+     */
+    private function isPartialReport(WorkoutExercise $we, array $report): bool
+    {
+        return ! $report['not_performed']
+            && $we->prescribed_sets !== null
+            && count($report['sets']) > 0
+            && count($report['sets']) < $we->prescribed_sets;
+    }
+
+    /**
+     * Pregunta determinista de seguimiento — nunca decide nada, solo
+     * pregunta; el código nunca asume la respuesta ni completa las series
+     * faltantes por su cuenta.
+     */
+    private function partialSetsClarification(WorkoutExercise $we, array $report): string
+    {
+        $remaining = $we->prescribed_sets - count($report['sets']);
+        $word = $remaining === 1 ? 'serie' : 'series';
+
+        return "¿Vas a hacer {$remaining} {$word} más de {$this->nameOf($we)}, o lo dejas hasta ahí por hoy?";
     }
 
     /**
@@ -131,12 +182,22 @@ class ExecutionReportRecorder
         }
     }
 
-    private function maybeCompleteSession(WorkoutSession $session): bool
+    /**
+     * @param  array<int, int>  $excludeFromCompletionIds  H16.2 Fase 1.3 — IDs
+     *         de WorkoutExercise con un reporte parcial ESTE turno (ver
+     *         isPartialReport()): cuentan como "sin resolver" únicamente para
+     *         esta decisión de cierre, aunque ya tengan un ExerciseLog real.
+     *         Vacío por defecto preserva exactamente el comportamiento previo
+     *         — no cambia qué significa "Unreported" para ningún otro
+     *         consumidor (CoachContextProvider, SessionCloseIntent, etc.),
+     *         que siguen usando `exerciseLog === null` sin este ajuste.
+     */
+    private function maybeCompleteSession(WorkoutSession $session, array $excludeFromCompletionIds = []): bool
     {
         $session->load(['workoutExercises.exerciseLog']);
 
         $stillUnreported = $session->workoutExercises->contains(
-            fn (WorkoutExercise $we) => $we->exerciseLog === null
+            fn (WorkoutExercise $we) => $we->exerciseLog === null || in_array($we->id, $excludeFromCompletionIds, true)
         );
 
         // H16.2 Fase 1 (fix de la contradicción "pendientes"+"completada"):

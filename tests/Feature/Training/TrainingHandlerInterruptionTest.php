@@ -358,6 +358,11 @@ it('53: a real report combined with a commercial question in the same message re
 it('54: a report that completes the session, combined with a commercial question, closes the session and answers the stub after', function () {
     $contact = interruptionReadyContact();
     [$session, $workoutExercise] = interruptionPendingSession($contact);
+    // prescribed_sets: 1 — el reporte de este test cubre exactamente 1 serie
+    // (H16.2 Fase 1.3, Caso 1B: con el prescribed_sets:3 por defecto del
+    // helper, este reporte de "1 serie" se trataría como parcial y
+    // bloquearía el cierre, algo ajeno al propósito de este test).
+    $workoutExercise->update(['prescribed_sets' => 1]);
 
     Http::fake([
         'api.openai.com/v1/chat/completions' => Http::response(interruptionChatBody([

@@ -235,3 +235,119 @@ it('accepts a report with a null exercise_name and empty sets — the single-pen
     expect($result['reports'][0]['exercise_name'])->toBeNull();
     expect($result['reports'][0]['sets'])->toBe([]);
 });
+
+// ── H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 1A) ─────────
+//
+// El conteo de series es una tarea de comprensión de lenguaje natural, no
+// algo que el código pueda validar contra una fuente de verdad externa (a
+// diferencia de RPE, que sí tiene una tabla cerrada) — por eso la garantía
+// aquí es de PROMPT (instrucción explícita a la IA), nunca de código. Estos
+// tests documentan el contrato del prompt y que el pipeline de validación
+// (parseJson/validateSets) sigue sin alterar la cantidad de "sets" que
+// llega — nunca pretenden demostrar que el código puede corregir una
+// respuesta incorrecta del LLM, porque esa garantía no existe.
+
+it('the prompt explicitly instructs an exact set count matching what the user literally said', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false]);
+
+    (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'CRÍTICO — CONTEO DE SERIES')
+            && str_contains($systemPrompt, 'NUNCA completes automáticamente hasta el número de series prescritas')
+            && str_contains($systemPrompt, 'NUNCA asumas que el usuario hizo todas sus series');
+    });
+});
+
+it('"la serie de 10 con 8kg" (singular) is extracted as exactly 1 set — test de extracción, no de persistencia', function () {
+    fakeReportExtraction([
+        'reports' => [[
+            'exercise_name' => 'Sentadilla', 'not_performed' => false,
+            'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+    ]);
+
+    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reports'][0]['sets'])->toHaveCount(1);
+    expect($result['reports'][0]['sets'][0])->toBe(['reps' => 10, 'load' => 8.0, 'duration_seconds' => null]);
+});
+
+it('"3 series de 10" is extracted as exactly 3 identical sets — test de extracción, no de persistencia', function () {
+    fakeReportExtraction([
+        'reports' => [[
+            'exercise_name' => 'Sentadilla', 'not_performed' => false,
+            'sets' => [
+                ['reps' => 10, 'load' => null, 'duration_seconds' => null],
+                ['reps' => 10, 'load' => null, 'duration_seconds' => null],
+                ['reps' => 10, 'load' => null, 'duration_seconds' => null],
+            ],
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+    ]);
+
+    $result = (new ExecutionReportService)->extractReport('3 series de 10', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reports'][0]['sets'])->toHaveCount(3);
+});
+
+it('an enumeration "10, 10 y 8" is extracted as exactly 3 sets — test de extracción, no de persistencia', function () {
+    fakeReportExtraction([
+        'reports' => [[
+            'exercise_name' => 'Sentadilla', 'not_performed' => false,
+            'sets' => [
+                ['reps' => 10, 'load' => null, 'duration_seconds' => null],
+                ['reps' => 10, 'load' => null, 'duration_seconds' => null],
+                ['reps' => 8, 'load' => null, 'duration_seconds' => null],
+            ],
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+    ]);
+
+    $result = (new ExecutionReportService)->extractReport('10, 10 y 8', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['reports'][0]['sets'])->toHaveCount(3);
+});
+
+it('the prompt explicitly instructs the LLM to never guess AM/PM for a genuinely ambiguous bare hour', function () {
+    fakeReportExtraction(['reports' => [], 'session_finished' => false]);
+
+    (new ExecutionReportService)->extractReport('recuérdame a las 7', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemPrompt = data_get($request->data(), 'messages.0.content', '');
+
+        return str_contains($systemPrompt, 'CRÍTICO — AM/PM AMBIGUO')
+            && str_contains($systemPrompt, 'NO adivines si es AM o PM');
+    });
+});
+
+it('validateSets() never inflates or reduces the count returned by the LLM — it only validates ranges per element', function () {
+    // Documenta explícitamente que la garantía de conteo es de PROMPT, no de
+    // código: si el LLM devolviera un conteo distinto al que el usuario dijo
+    // (un fallo de extracción), el pipeline de validación lo deja pasar tal
+    // cual — no existe ninguna lógica que cuente palabras del mensaje
+    // original ni que corrija la cantidad de elementos.
+    fakeReportExtraction([
+        'reports' => [[
+            'exercise_name' => 'Sentadilla', 'not_performed' => false,
+            'sets' => [
+                ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+                ['reps' => 10, 'load' => 8, 'duration_seconds' => null],
+            ],
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+    ]);
+
+    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    // El pipeline de validación copia 1:1 lo que la IA devolvió.
+    expect($result['reports'][0]['sets'])->toHaveCount(2);
+});

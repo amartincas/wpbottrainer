@@ -776,8 +776,17 @@ class TrainingHandler implements HandlerInterface
         // como para calcular SessionCloseIntent — exerciseSets se necesita
         // para distinguir Performed de Skipped (mismo criterio ya usado en
         // CoachContextProvider/TrainingHistoryContextProvider).
+        //
+        // H16.2 Fase 1.3 (Caso 1B) — un ejercicio con reporte parcial este
+        // turno (menos series que las prescritas) YA tiene ExerciseLog, pero
+        // debe seguir contando como "sin resolver" para decidir si se avanza
+        // o se cierra la sesión — ver ExecutionReportOutcome::$partialExerciseIds
+        // y ExecutionReportRecorder::isPartialReport(). Esto NO cambia el
+        // significado de "Unreported" en ningún otro lugar del sistema.
         $session->load(['workoutExercises.exerciseLog.exerciseSets']);
-        $stillUnreported = $session->workoutExercises->filter(fn (WorkoutExercise $we) => $we->exerciseLog === null)->values();
+        $stillUnreported = $session->workoutExercises
+            ->filter(fn (WorkoutExercise $we) => $we->exerciseLog === null || in_array($we->id, $outcome->partialExerciseIds, true))
+            ->values();
 
         $explicitCloseAttempt = ($report['session_finished'] ?? false) === true;
 
@@ -1013,7 +1022,7 @@ class TrainingHandler implements HandlerInterface
             'expires_at' => now()->addHours(24),
         ]);
 
-        $this->reply($from, sprintf(self::REMINDER_PROPOSAL_TEMPLATE, $this->describeDay($data['day'], $data['recurring']), $data['time']), $tenant);
+        $this->reply($from, sprintf(self::REMINDER_PROPOSAL_TEMPLATE, $this->resolvedDayLabel($data['day'], $data['recurring'], $resolution->fireAt, $timezone), $data['time']), $tenant);
     }
 
     /**
@@ -1083,7 +1092,7 @@ class TrainingHandler implements HandlerInterface
 
         $suggestion->update(['status' => ReminderSuggestionStatus::Accepted]);
 
-        $this->reply($from, sprintf(self::REMINDER_CONFIRMED_MESSAGE, $this->describeDay($day, $recurring), $time), $tenant);
+        $this->reply($from, sprintf(self::REMINDER_CONFIRMED_MESSAGE, $this->resolvedDayLabel($day, $recurring, $resolution->fireAt, $timezone), $time), $tenant);
     }
 
     private function cancelActiveReminder(Contact $contact, Tenant $tenant, string $from): void
@@ -1197,6 +1206,29 @@ class TrainingHandler implements HandlerInterface
         $map = $recurring ? self::WEEKDAY_PLURAL : self::WEEKDAY_SINGULAR;
 
         return $map[$day] ?? 'ese día';
+    }
+
+    /**
+     * H16.2 Fase 1.3 (Caso 2) — cuando el usuario no dio ningún día
+     * explícito ("recuérdame a las 7"), `ReminderTimeResolver::resolve()` ya
+     * infirió hoy/mañana a partir de `$fireAt` (ver
+     * ReminderTimeResolver::inferImplicitDay()); `describeDay(null, ...)`
+     * por sí solo caería en el fallback genérico "ese día", una confirmación
+     * vaga que no refleja lo que el sistema ya resolvió. Este helper traduce
+     * ese `$fireAt` ya resuelto a la misma etiqueta "hoy"/"mañana" — nunca
+     * vuelve a decidir la fecha, solo la describe. Cuando `$day` SÍ vino
+     * explícito, delega sin cambios a `describeDay()`.
+     */
+    private function resolvedDayLabel(?string $day, bool $recurring, \Carbon\CarbonInterface $fireAt, string $timezone): string
+    {
+        if ($day !== null) {
+            return $this->describeDay($day, $recurring);
+        }
+
+        $fireAtLocal = \Carbon\CarbonImmutable::instance($fireAt)->setTimezone($timezone);
+        $nowLocal = \Carbon\CarbonImmutable::now($timezone);
+
+        return $fireAtLocal->isSameDay($nowLocal) ? 'hoy' : 'mañana';
     }
 
     /**
