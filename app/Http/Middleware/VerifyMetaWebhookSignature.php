@@ -53,6 +53,21 @@ class VerifyMetaWebhookSignature
             if ($mode === 'strict') {
                 return response('Invalid signature', 401);
             }
+        } else {
+            // Firma válida: solo se llega aquí si isValidSignature() confirmó
+            // las tres condiciones (secreto configurado, cabecera con el
+            // formato correcto, hash_equals() coincidente) — ver
+            // isValidSignature() más abajo. has_header/has_secret_configured
+            // son literalmente true en este punto por construcción; no hace
+            // falta recalcularlos. Sin esto, una firma válida no dejaba
+            // ningún rastro — no había forma de distinguir "silencio porque
+            // pasó" de "silencio porque nadie firmó nada".
+            Log::info('META_WEBHOOK_SIGNATURE_VALID', [
+                'mode' => $mode,
+                'has_header' => true,
+                'has_secret_configured' => true,
+                'timestamp' => now()->toIso8601String(),
+            ]);
         }
 
         return $next($request);
