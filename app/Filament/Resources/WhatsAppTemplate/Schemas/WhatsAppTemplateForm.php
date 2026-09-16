@@ -45,6 +45,8 @@ class WhatsAppTemplateForm
                     'payment_confirmed' => 'Pago confirmado',
                     'payment_rejected'  => 'Pago rechazado',
                     'training_invite'   => 'Invitación a entrenar (tras pago confirmado)',
+                    'training_reminder' => 'Recordatorio de entrenamiento',
+                    'exercise_nudge'    => 'Nudge por ejercicio no reportado',
                 ])
                 ->native(false)
                 ->nullable()

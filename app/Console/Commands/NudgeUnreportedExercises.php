@@ -64,11 +64,22 @@ class NudgeUnreportedExercises extends Command
                 continue;
             }
 
+            // La plantilla aprobada por Meta para exercise_nudge usa {{1}}
+            // para el nombre del contacto — mismo mecanismo genérico ya
+            // existente en CustomerNotifier::resolveVariables() (probado con
+            // 'amount' en Payments y con 'customer_name'/'customer_phone'/etc.
+            // en WhatsAppController::sendManualTemplate()): la clave aquí
+            // ('customer_name') debe coincidir EXACTAMENTE con el valor que
+            // el tenant configure en WhatsAppTemplate.parameters_map (ej.
+            // {"1": "customer_name"}) — CustomerNotifier resuelve la posición
+            // {{N}} buscando esa clave en este arreglo, nunca al revés. Solo
+            // se usa en el camino de plantilla (ventana cerrada); el mensaje
+            // libre de abajo ya no depende de parameters_map en absoluto.
             $result = $notifier->notify(
                 $tenant,
                 $contact->customer_phone,
                 self::EVENT_KEY,
-                [],
+                ['customer_name' => $contact->customer_name ?? ''],
                 $this->messageFor($workoutExercise),
                 "exercise_nudge:{$workoutExercise->id}",
             );

@@ -324,6 +324,35 @@ it('uses event_key = exercise_nudge and, with the window closed, delegates to th
     Http::assertSent(fn ($request) => $request['type'] === 'template' && $request['template']['name'] === 'exercise_nudge_v1');
 });
 
+it('resolves {{1}} in the approved exercise_nudge template to the contact real name via parameters_map', function () {
+    $tenant = Tenant::factory()->create(['exercise_nudge_after_minutes' => 30]);
+    // nudgeMakeContact() fija customer_name='Ana' — es exactamente el valor
+    // que debe aparecer en {{1}}, resuelto por CustomerNotifier::
+    // resolveVariables() a partir de 'customer_name' en el arreglo de
+    // variables que NudgeUnreportedExercises ahora provee — mismo mecanismo
+    // ya usado por WhatsAppController::sendManualTemplate()/Payments, sin
+    // ningún cambio en CustomerNotifier.
+    $contact = nudgeMakeContact($tenant, '573001112233');
+    WhatsAppTemplate::create([
+        'tenant_id' => $tenant->id,
+        'name' => 'exercise_nudge_v1',
+        'event_key' => 'exercise_nudge',
+        'body_preview' => '¿Pudiste completar este ejercicio, {{1}}? Cuando termines, envíame tu reporte para continuar con el siguiente.',
+        'parameters_map' => ['1' => 'customer_name'],
+        'language' => 'es_CO',
+        'type' => 'utility',
+    ]);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id]);
+    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1, 'delivered_at' => now()->subMinutes(40)]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+    Artisan::call('training:nudge-unreported-exercises');
+
+    Http::assertSent(fn ($request) => $request['type'] === 'template'
+        && $request['template']['name'] === 'exercise_nudge_v1'
+        && $request['template']['components'][0]['parameters'][0]['text'] === 'Ana');
+});
+
 it('with the window closed and no exercise_nudge template configured, never sends via any alternative channel', function () {
     $tenant = Tenant::factory()->create(['exercise_nudge_after_minutes' => 30]);
     $contact = nudgeMakeContact($tenant, '573001112233');
