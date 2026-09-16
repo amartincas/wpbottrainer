@@ -64,6 +64,22 @@ services:
       # configurados. Puerto por defecto 8082 (wpbotreserva ya usa 8081 en
       # este mismo VPS) — cambiar si choca con algo más.
       - "${APP_PORT:-8082}:80"
+    networks:
+      # "default": la red propia del proyecto (wpbottrainer_default) —
+      # necesaria para hablar con "app" vía FastCGI, igual que siempre.
+      # "whatfunnels-edge": red externa compartida del VPS por la que
+      # whatfunnels-nginx-proxy-manager (el reverse proxy compartido que
+      # termina TLS para botrainer.whatfunnels.com) alcanza a este
+      # contenedor por nombre. Antes de este cambio, esta conexión existía
+      # solo como estado manual del contenedor en ejecución (`docker
+      # network connect`), nunca declarada aquí — cualquier recreación de
+      # "nginx" la perdía silenciosamente y rompía el webhook externo sin
+      # dejar rastro en los logs propios de la app (ver incidente
+      # 2026-09-15/16, documentado en la memoria del proyecto). Declararla
+      # aquí hace que Compose la reconecte automáticamente en cada
+      # recreación, sin depender de que alguien la repare a mano.
+      - default
+      - whatfunnels-edge
     depends_on:
       app:
         condition: service_healthy
@@ -160,3 +176,12 @@ services:
 volumes:
   mariadb_data:
   storage_data:
+
+networks:
+  # Red externa preexistente en el VPS (creada y administrada fuera de este
+  # proyecto, compartida con otras apps del mismo host) — Compose nunca la
+  # crea ni la destruye, solo la usa. "name:" fija el nombre real exacto
+  # ("whatfunnels-edge"), sin depender de ningún prefijo de proyecto.
+  whatfunnels-edge:
+    external: true
+    name: whatfunnels-edge
