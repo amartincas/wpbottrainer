@@ -133,6 +133,14 @@ class TrainingHandler implements HandlerInterface
      * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
      * rutina cuando ya existe una sesión pendiente (contexto activo): se
      * informa brevemente en vez de dejar el turno sin ninguna respuesta.
+     *
+     * Corrección post-P1-A (auditoría 2026-09-16): este mensaje solo aplica
+     * cuando el ejercicio actualmente pendiente YA fue entregado (tiene
+     * `delivered_at`) — antes de P1-A esto era siempre cierto (la entrega
+     * progresiva de H16.2 garantizaba que nunca hubiera un ejercicio sin
+     * `ExerciseLog` que no se le hubiera mostrado ya al usuario), pero P1-A
+     * introdujo por primera vez ese estado intermedio real. Ver
+     * `executeTurnActions()`, rama `ConversationActionType::DeliverSession`.
      */
     private const PENDING_SESSION_REMINDER = 'Ya tienes una sesión de entrenamiento pendiente. Cuéntame cómo te fue '
         .'con los ejercicios cuando la completes 💪';
@@ -789,10 +797,36 @@ class TrainingHandler implements HandlerInterface
 
             if ($action->type === ConversationActionType::DeliverSession) {
                 if ($activeSessionData !== null) {
-                    // Ya existe una sesión pendiente — nunca se genera ni se
-                    // reenvía una rutina desde esta rama (D052). Se informa
-                    // brevemente en vez de dejar el turno sin respuesta.
-                    $this->reply($from, self::PENDING_SESSION_REMINDER, $tenant);
+                    // Ya existe una sesión pendiente — nunca se GENERA una
+                    // rutina nueva desde esta rama (D052 sigue intacto:
+                    // TrainingEngine no se invoca aquí). Pero "sesión activa"
+                    // ya no implica necesariamente "el usuario ya tiene el
+                    // ejercicio actual en su chat" — desde P1-A, el ejercicio
+                    // sin ExerciseLog puede no haberse entregado nunca
+                    // (`delivered_at` null). Se resuelve cuál es ese
+                    // ejercicio con el mismo criterio de progresividad ya
+                    // usado en recordExecutionReport()/handle() (el primero
+                    // sin ExerciseLog, ordenado por `order`, garantizado por
+                    // WorkoutSession::workoutExercises()).
+                    $pendingExercise = WorkoutSession::find($activeSessionData['workout_session_id'])
+                        ?->workoutExercises()
+                        ->whereDoesntHave('exerciseLog')
+                        ->first();
+
+                    if ($pendingExercise !== null && $pendingExercise->delivered_at === null) {
+                        // Nunca se le mostró al usuario — se entrega ahora,
+                        // reutilizando deliverExercise() sin ningún cambio
+                        // (mismo mecanismo que el primer ejercicio de una
+                        // sesión nueva y que el avance tras un reporte real).
+                        $this->deliverExercise($pendingExercise, $from, $tenant);
+                    } else {
+                        // Ya fue entregado (o, defensivamente, no quedó
+                        // ningún pendiente por resolver en este mismo turno —
+                        // ej. un reporte previo en esta misma acción ya cerró
+                        // todo) — comportamiento D052 sin cambios: nunca se
+                        // reenvía ni se genera una rutina nueva.
+                        $this->reply($from, self::PENDING_SESSION_REMINDER, $tenant);
+                    }
 
                     continue;
                 }
