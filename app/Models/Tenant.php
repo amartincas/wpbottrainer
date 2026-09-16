@@ -23,6 +23,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'referral_reward_days',
     'referral_program_enabled',
     'trial_duration_days',
+    'exercise_nudge_enabled',
+    'exercise_nudge_after_minutes',
     'currency',
     'country',
     'timezone',
@@ -57,6 +59,10 @@ class Tenant extends Model
             'referral_program_enabled' => 'boolean',
             // Hito 15 — mismo criterio que referral_reward_days.
             'trial_duration_days' => 'integer',
+            // P1-A — mismo criterio que trial_duration_days/referral_reward_days:
+            // configuración de negocio simple, por Tenant, sin tabla propia.
+            'exercise_nudge_enabled' => 'boolean',
+            'exercise_nudge_after_minutes' => 'integer',
         ];
     }
 

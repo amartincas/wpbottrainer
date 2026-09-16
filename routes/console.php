@@ -24,3 +24,12 @@ Schedule::command('reminders:recover-stuck')->everyFiveMinutes()->withoutOverlap
 // nueva. Cierra un gap real: `PaymentStatus::Expired` existía pero nada lo
 // asignaba nunca (ver App\Console\Commands\ExpireStalePayments).
 Schedule::command('payments:expire-stale')->everyFiveMinutes()->withoutOverlapping();
+
+// P1-A (Nudge por ejercicio no reportado) — mismo contenedor `scheduler`,
+// mismo mecanismo, sin infraestructura nueva. `everyMinute()` porque el
+// umbral (`Tenant.exercise_nudge_after_minutes`) es configurable por tenant
+// y puede ser tan bajo como unos pocos minutos — una cadencia más lenta
+// retrasaría el nudge para tenants con umbrales cortos. `withoutOverlapping()`
+// evita que dos ejecuciones programadas de este comando corran a la vez
+// (ver App\Console\Commands\NudgeUnreportedExercises).
+Schedule::command('training:nudge-unreported-exercises')->everyMinute()->withoutOverlapping();

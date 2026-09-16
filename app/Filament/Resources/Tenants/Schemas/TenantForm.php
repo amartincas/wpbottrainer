@@ -110,6 +110,26 @@ class TenantForm
                             ->default(true)
                             ->helperText('Desactivarlo detiene nuevas atribuciones — nunca invalida atribuciones ya existentes.'),
                     ]),
+
+                // P1-A — nudge de ejercicio no reportado: configuración de
+                // negocio simple por Tenant, mismo criterio que "Programa de
+                // Referidos" arriba (columnas planas en tenants, sin tabla
+                // propia).
+                Section::make('Nudge de ejercicio no reportado')
+                    ->columns(2)
+                    ->schema([
+                        Toggle::make('exercise_nudge_enabled')
+                            ->label('Nudge activo')
+                            ->default(true)
+                            ->helperText('Desactivarlo detiene nuevos nudges — nunca afecta uno ya enviado.'),
+                        TextInput::make('exercise_nudge_after_minutes')
+                            ->label('Minutos sin reportar antes del nudge')
+                            ->numeric()
+                            ->required()
+                            ->minValue(1)
+                            ->default(30)
+                            ->helperText('Tiempo desde que se entrega un ejercicio (sin reporte todavía) antes de enviar un recordatorio único por ese ejercicio.'),
+                    ]),
             ]);
     }
 }

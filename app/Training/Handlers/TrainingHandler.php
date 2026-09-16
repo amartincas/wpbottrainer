@@ -634,6 +634,20 @@ class TrainingHandler implements HandlerInterface
     {
         $this->reply($from, $this->messageFormatter->format($workoutExercise, $workoutExercise->order), $tenant);
 
+        // P1-A (Nudge por ejercicio no reportado) — se marca aquí, inmediatamente
+        // después del mensaje de TEXTO (nunca condicionado al video de abajo,
+        // que puede fallar a resolver sin que eso signifique que el ejercicio
+        // no se entregó). Mismo criterio "fire and forget, sin bloquear" que
+        // ya usa reply() en todo el resto de este archivo — reply() es void y
+        // no expone si Meta confirmó la entrega (eso lo rastrea de forma
+        // asíncrona WhatsAppStatusTracker vía el webhook de status, no en este
+        // punto); cambiar ese contrato afectaría todos los llamadores
+        // existentes de reply(), fuera de alcance de este cambio. Idempotente
+        // por construcción: un update() repetido sobre el mismo WorkoutExercise
+        // solo actualiza el timestamp, nunca crea una fila nueva ni duplica
+        // el envío ya hecho arriba.
+        $workoutExercise->update(['delivered_at' => now()]);
+
         // Hito 9.1: la URL de video NUNCA viene del snapshot histórico
         // (que puede describir un ejercicio de proveedor sin video_url
         // propio, por diseño) — se resuelve fresca en este mismo

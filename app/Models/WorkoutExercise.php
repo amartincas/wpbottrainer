@@ -23,6 +23,7 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
     'prescribed_duration_seconds',
     'rest_seconds',
     'exercise_snapshot',
+    'delivered_at',
 ])]
 class WorkoutExercise extends Model
 {
@@ -33,6 +34,11 @@ class WorkoutExercise extends Model
         return [
             'prescribed_load' => 'decimal:2',
             'exercise_snapshot' => 'array',
+            // P1-A — momento real de entrega del mensaje de técnica de ESTE
+            // ejercicio (ver TrainingHandler::deliverExercise()), nunca de
+            // creación de la fila. Null en ejercicios creados antes de este
+            // cambio — sin backfill (ver migración).
+            'delivered_at' => 'datetime',
         ];
     }
 
