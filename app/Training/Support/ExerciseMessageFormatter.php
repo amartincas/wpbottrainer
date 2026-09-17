@@ -46,8 +46,13 @@ class ExerciseMessageFormatter
      * traducciones distintas del mismo vocabulario. Puramente descriptivo,
      * determinista, sin IA — la IA nunca es la fuente de verdad de qué
      * músculos trabaja un ejercicio.
+     *
+     * Público (no privado) desde la duración objetivo de sesión: reutilizado
+     * también por App\Training\Support\SessionIntroComposer para nombrar el
+     * focus en la introducción — única fuente de verdad del diccionario,
+     * nunca duplicado.
      */
-    private const MUSCLE_LABELS = [
+    public const MUSCLE_LABELS = [
         'glutes' => 'glúteos',
         'quads' => 'cuádriceps',
         'hamstrings' => 'isquiotibiales',
@@ -59,6 +64,33 @@ class ExerciseMessageFormatter
         'triceps' => 'tríceps',
         'abs' => 'abdomen',
         'full_body' => 'cuerpo completo',
+    ];
+
+    /**
+     * Duración objetivo de sesión — vocabulario GRUESO de `Exercise.muscle_group`
+     * (`App\Training\Engine\TrainingEngine::ROTATIONS`, 6 valores: arms, back,
+     * chest, core, legs, shoulders — ver
+     * `App\ExerciseCatalog\Providers\YMove\YMoveExerciseNormalizer::MUSCLE_GROUP_COARSE_MAP`,
+     * que agrupa el vocabulario fino de `MUSCLE_LABELS` en estos 6 buckets).
+     * Distinto de `MUSCLE_LABELS` (fino, por músculo específico) — NO es un
+     * duplicado: es la traducción española del vocabulario grueso que usa
+     * `decided_focus`, que `MUSCLE_LABELS` no cubre para `arms`/`core`/`legs`
+     * (no tienen equivalente 1:1 en el vocabulario fino). `chest`/`back`/
+     * `shoulders` son grupos gruesos de un solo músculo fino, por eso
+     * comparten la misma palabra en español que en `MUSCLE_LABELS` — no hay
+     * dos traducciones distintas del mismo concepto.
+     *
+     * Reutilizado por `App\Training\Support\SessionIntroComposer` para que
+     * ningún `decided_focus` producido por `TrainingEngine::ROTATIONS`
+     * desaparezca silenciosamente de la introducción.
+     */
+    public const MUSCLE_GROUP_LABELS = [
+        'arms' => 'brazos',
+        'back' => 'espalda',
+        'chest' => 'pecho',
+        'core' => 'core',
+        'legs' => 'piernas',
+        'shoulders' => 'hombros',
     ];
 
     public function format(WorkoutExercise $workoutExercise, int $order): string

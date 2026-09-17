@@ -17,6 +17,7 @@ use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
@@ -31,6 +32,16 @@ function makeReadyContact(array $profileOverrides = []): Contact
     TrainingProfile::factory()->create(array_merge([
         'contact_id' => $contact->id,
         'split_type' => SplitType::FullBody,
+        // Duración objetivo dinámica: la cantidad de ejercicios ahora
+        // depende de GOAL_DEFAULTS[goal] (ver TrainingEngine::exercisesForTargetDuration()),
+        // no solo de sets/reps como antes. TrainingProfileFactory sortea el
+        // goal por defecto — fijarlo aquí a general_fitness (9 min/ejercicio,
+        // exactamente 3 con el default de 30 min del Tenant) preserva la
+        // cantidad estable que la mayoría de estos tests ya asumía
+        // implícitamente antes de este cambio. Los tests que SÍ quieren
+        // variar el goal (ej. "combines focus and goal") lo siguen
+        // sobreescribiendo explícitamente via $profileOverrides.
+        'goal' => TrainingGoal::GeneralFitness,
     ], $profileOverrides));
 
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
@@ -47,6 +58,7 @@ function trainingEngine(): TrainingEngine
         $safetyResolver,
         new TrainingHistoryContextProvider($safetyResolver),
         new ProgressionEvaluator,
+        new DurationEstimator,
     );
 }
 
@@ -312,8 +324,15 @@ it('prioritizes an exercise matching a simple primary_focus over the general poo
 });
 
 it('resolves a compound focus ("piernas") into every matching primary_muscle, not just one', function () {
+    // goal fijado explícitamente (mismo criterio que el resto de tests de
+    // este archivo tras la duración objetivo dinámica): con 4 candidatos en
+    // el catálogo pero solo 3 esperados, un goal aleatorio que computara
+    // exercisesPerSession=4 incluiría también el ejercicio ajeno al foco,
+    // rompiendo esta aserción — el propósito del test es el FOCO, no la
+    // cantidad.
     $contact = makeReadyContact([
         'primary_focus' => [MuscleFocus::Quads->value, MuscleFocus::Hamstrings->value, MuscleFocus::Glutes->value, MuscleFocus::Calves->value],
+        'goal' => TrainingGoal::GeneralFitness,
     ]);
 
     $quads = Exercise::factory()->withPrimaryMuscle(MuscleFocus::Quads)->create(['muscle_group' => 'legs']);
@@ -384,7 +403,10 @@ it('guarantees at least a majority of the session comes from the focus pool when
 });
 
 it('deprioritizes an exercise used in the immediately preceding session over an equally-good alternative', function () {
-    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Beginner]);
+    // goal fijado (ver nota en "resolves a compound focus" arriba) — 4
+    // candidatos para 3 cupos esperados; el propósito es la anti-repetición,
+    // no la cantidad.
+    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Beginner, 'goal' => TrainingGoal::GeneralFitness]);
 
     $used = Exercise::factory()->create(['muscle_group' => 'core', 'difficulty_level' => 'beginner']);
     $freshA = Exercise::factory()->create(['muscle_group' => 'core', 'difficulty_level' => 'beginner']);
@@ -406,7 +428,9 @@ it('deprioritizes an exercise used in the immediately preceding session over an 
 });
 
 it('prioritizes exercises matching the profile experience_level over a difficulty mismatch', function () {
-    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Intermediate]);
+    // goal fijado (ver nota arriba) — 4 candidatos para 3 cupos esperados;
+    // el propósito es el ajuste de nivel, no la cantidad.
+    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Intermediate, 'goal' => TrainingGoal::GeneralFitness]);
 
     $matchA = Exercise::factory()->create(['muscle_group' => 'legs', 'difficulty_level' => 'intermediate']);
     $matchB = Exercise::factory()->create(['muscle_group' => 'legs', 'difficulty_level' => 'intermediate']);
@@ -668,7 +692,9 @@ it('prioritizes an exercise matching only secondary_focus over the general pool,
 // ─────────────────────────────────────────────────────────────────────────
 
 it('never lets rich technique content override a real ranking criterion (difficulty match) when there is genuine competition for slots', function () {
-    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Intermediate]);
+    // goal fijado (ver nota arriba) — el propio test depende de "4
+    // candidatos para solo 3 cupos", así que la cantidad debe ser estable.
+    $contact = makeReadyContact(['experience_level' => ExperienceLevel::Intermediate, 'goal' => TrainingGoal::GeneralFitness]);
 
     // 4 candidatos elegibles para solo 3 cupos — hay competencia real.
     // A/B/D coinciden con el nivel del perfil (rank 0); C NO coincide
@@ -692,4 +718,93 @@ it('never lets rich technique content override a real ranking criterion (difficu
 
     expect($selectedIds)->toEqualCanonicalizing([$matchA->id, $matchB->id, $matchD->id]);
     expect($selectedIds)->not->toContain($mismatchButRichTechnique->id);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Duración objetivo de sesión — la cantidad de ejercicios ya no es
+// EXERCISES_PER_SESSION (constante fija eliminada): se deriva de
+// Tenant.target_session_duration_minutes vía
+// TrainingEngine::exercisesForTargetDuration() + DurationEstimator. Ver
+// DurationEstimatorTest.php para la fórmula aislada.
+// ─────────────────────────────────────────────────────────────────────────
+
+it('derives the exercise count from Tenant.target_session_duration_minutes — never a hardcoded constant', function (int $targetMinutes, int $expectedCount) {
+    Log::spy();
+
+    // makeReadyContact() ya fija goal=general_fitness por defecto (9
+    // min/ejercicio) — los resultados esperados surgen de la fórmula
+    // (round(target*60 / 540)), nunca hardcodeados aquí como tabla.
+    $contact = makeReadyContact();
+    $contact->tenant()->update(['target_session_duration_minutes' => $targetMinutes]);
+
+    // Catálogo generoso (8, cubre el máximo de 7 pedido en este dataset)
+    // repartido en los grupos de la rotación full_body por defecto.
+    foreach (['chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'chest', 'back'] as $muscleGroup) {
+        Exercise::factory()->create(['muscle_group' => $muscleGroup]);
+    }
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    expect($session->workoutExercises)->toHaveCount($expectedCount);
+
+    // Catálogo (8) siempre alcanza lo pedido (máximo 7 en este dataset) —
+    // requested === selected, por lo tanto NUNCA debe registrarse el log de
+    // catálogo insuficiente (contraparte del test de abajo, donde sí falta).
+    Log::shouldNotHaveReceived('info', ['TRAINING_DURATION_TARGET_UNREACHABLE', Mockery::any()]);
+})->with([
+    '30 min (9 min/ejercicio en general_fitness) -> 3' => [30, 3],
+    '45 min (9 min/ejercicio en general_fitness) -> 5' => [45, 5],
+    '60 min (9 min/ejercicio en general_fitness) -> 7' => [60, 7],
+]);
+
+it('the focus guarantee ceil(N/2) holds correctly across every dynamically-computed exercise count', function (int $targetMinutes, int $expectedCount, int $expectedMinFocusSlots) {
+    $contact = makeReadyContact(['primary_focus' => [MuscleFocus::Chest->value]]);
+    $contact->tenant()->update(['target_session_duration_minutes' => $targetMinutes]);
+
+    // Candidatos de sobra en ambos niveles (foco y general) — el catálogo
+    // insuficiente se prueba aparte, aquí solo importa la proporción.
+    for ($i = 0; $i < 8; $i++) {
+        Exercise::factory()->withPrimaryMuscle(MuscleFocus::Chest)->create(['muscle_group' => 'chest']);
+    }
+    for ($i = 0; $i < 8; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'legs']);
+    }
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    expect($session->workoutExercises)->toHaveCount($expectedCount);
+
+    $focusMatchedCount = $session->workoutExercises
+        ->filter(fn (WorkoutExercise $we) => ($we->exercise_snapshot['primary_muscle'] ?? null) === 'chest')
+        ->count();
+    expect($focusMatchedCount)->toBeGreaterThanOrEqual($expectedMinFocusSlots);
+})->with([
+    '3 ejercicios -> ceil(3/2)=2 de foco' => [30, 3, 2],
+    '4 ejercicios -> ceil(4/2)=2 de foco' => [35, 4, 2],
+    '5 ejercicios -> ceil(5/2)=3 de foco' => [45, 5, 3],
+    '6 ejercicios -> ceil(6/2)=3 de foco' => [54, 6, 3],
+    '7 ejercicios -> ceil(7/2)=4 de foco' => [60, 7, 4],
+]);
+
+it('when the eligible catalog has fewer exercises than the target duration requests, the session simply has fewer — never invented, never relaxed eligibility', function () {
+    Log::spy();
+
+    $contact = makeReadyContact();
+    // 60 min (general_fitness) pide 7 — el catálogo solo tiene 4 elegibles.
+    $contact->tenant()->update(['target_session_duration_minutes' => 60]);
+
+    Exercise::factory()->create(['muscle_group' => 'chest']);
+    Exercise::factory()->create(['muscle_group' => 'back']);
+    Exercise::factory()->create(['muscle_group' => 'legs']);
+    Exercise::factory()->create(['muscle_group' => 'shoulders']);
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    // Nunca 7 (lo pedido), nunca inventado — exactamente lo que el catálogo
+    // real tiene disponible.
+    expect($session->workoutExercises)->toHaveCount(4);
+
+    Log::shouldHaveReceived('info')
+        ->withArgs(fn (string $message) => $message === 'TRAINING_DURATION_TARGET_UNREACHABLE')
+        ->once();
 });

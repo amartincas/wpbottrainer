@@ -11,6 +11,7 @@ use App\Models\WorkoutSession;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\SplitType;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
@@ -29,6 +30,18 @@ function readyContactForProgressionIntegration(array $profileOverrides = []): Co
     TrainingProfile::factory()->create(array_merge([
         'contact_id' => $contact->id,
         'split_type' => SplitType::FullBody,
+        // Duración objetivo dinámica: la cantidad de ejercicios ahora
+        // depende de GOAL_DEFAULTS[goal] (ver TrainingEngine::exercisesForTargetDuration()).
+        // Este archivo prueba prescripción/progresión numérica sobre UN
+        // ejercicio nombrado con historial — nunca la cantidad de
+        // ejercicios — pero WorkoutExerciseFactory crea un Exercise
+        // aleatorio como efecto secundario en cada llamada (ver su
+        // definition()), así que ahora SÍ puede haber competencia real por
+        // los cupos si el goal aleatorio del factory produjera una cantidad
+        // menor que antes. Fijar general_fitness (3 ejercicios con el
+        // default de 30 min del Tenant) restaura la determinismo que estos
+        // tests ya asumían implícitamente.
+        'goal' => \App\Training\Enums\TrainingGoal::GeneralFitness,
     ], $profileOverrides));
 
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
@@ -45,6 +58,7 @@ function progressionIntegrationEngine(): TrainingEngine
         $safetyResolver,
         new TrainingHistoryContextProvider($safetyResolver),
         new ProgressionEvaluator,
+        new DurationEstimator,
     );
 }
 
@@ -253,7 +267,10 @@ it('8: a single execution with no usable signal yields insufficient_data, never 
 // ── 9: un solo contexto por generación ──
 
 it('9: a single generation builds TrainingHistoryContext exactly once, regardless of exercises prescribed', function () {
-    $contact = readyContactForProgressionIntegration();
+    // goal fijado — 3 candidatos en el catálogo, la aserción de abajo
+    // (toHaveCount(3)) requiere que la duración objetivo dinámica compute
+    // exactamente 3 para no depender del goal aleatorio del factory.
+    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
     Exercise::factory()->create(['muscle_group' => 'chest']);
     Exercise::factory()->create(['muscle_group' => 'legs']);
     Exercise::factory()->create(['muscle_group' => 'back']);
@@ -264,7 +281,7 @@ it('9: a single generation builds TrainingHistoryContext exactly once, regardles
     $spyProvider = Mockery::mock(TrainingHistoryContextProvider::class);
     $spyProvider->shouldReceive('build')->once()->andReturn($realContext);
 
-    $engine = new TrainingEngine(new TrainingAccessGate, $safetyResolver, $spyProvider, new ProgressionEvaluator);
+    $engine = new TrainingEngine(new TrainingAccessGate, $safetyResolver, $spyProvider, new ProgressionEvaluator, new DurationEstimator);
     $session = $engine->decideNextSession($contact->fresh());
 
     expect($session->workoutExercises)->toHaveCount(3);
@@ -287,7 +304,14 @@ it('10: query count is unaffected by how much history each prescribed exercise h
     // no relacionada de TrainingAccessGate (revisión de screening de salud
     // antes de la primera rutina, ver D048), que ensuciaría la comparación
     // si solo uno de los dos escenarios la disparara.
-    $contactA = readyContactForProgressionIntegration();
+    // goal fijado en AMBOS contactos (A y B): con exactamente 3 candidatos
+    // elegibles en cada escenario, un goal aleatorio distinto entre A y B
+    // podría computar una cantidad de ejercicios distinta (2, 3 o 4 según
+    // GOAL_DEFAULTS), cambiando cuántos WorkoutExercise se prescriben — y
+    // por tanto cuántas queries de INSERT/progresión se ejecutan — sin que
+    // eso tenga nada que ver con lo que este test realmente compara
+    // (profundidad de historial, no cantidad de ejercicios).
+    $contactA = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
     $keepIdsA = [];
     foreach (['chest', 'legs', 'back'] as $muscleGroup) {
         $exercise = Exercise::factory()->create(['muscle_group' => $muscleGroup]);
@@ -318,7 +342,7 @@ it('10: query count is unaffected by how much history each prescribed exercise h
     // única variable real es la cantidad de historial.
     Exercise::query()->update(['is_active' => false]);
 
-    $contactB = readyContactForProgressionIntegration();
+    $contactB = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
     $chest = Exercise::factory()->create(['muscle_group' => 'chest']);
     $legs = Exercise::factory()->create(['muscle_group' => 'legs']);
     $back = Exercise::factory()->create(['muscle_group' => 'back']);

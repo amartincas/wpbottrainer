@@ -346,7 +346,13 @@ it('generates and delivers a WorkoutSession with videos when access is granted, 
     // TrainingEngine::sortCandidates() desempata primero por coincidencia
     // de nivel, antes que por id ascendente — sin fijarlo, cuál ejercicio
     // queda "primero" (asunción de este test) dejaría de ser determinista.
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true, 'experience_level' => \App\Training\Enums\ExperienceLevel::Intermediate]);
+    // goal fijado explícitamente: con la duración objetivo dinámica, la
+    // cantidad de ejercicios depende de GOAL_DEFAULTS[goal] — este test
+    // asume 3 (línea "toHaveCount(3)" abajo), que solo es estable con
+    // general_fitness (9 min/ejercicio) contra el default de 30 min del
+    // Tenant; sin fijarlo, el goal aleatorio del factory podía computar
+    // menos de 3 (ej. build_muscle) y romper esta aserción.
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'available_equipment' => [], 'health_screening_asked' => true, 'experience_level' => \App\Training\Enums\ExperienceLevel::Intermediate, 'goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
     $chest = Exercise::factory()->create([

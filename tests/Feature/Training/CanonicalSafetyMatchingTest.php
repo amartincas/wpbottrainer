@@ -9,6 +9,7 @@ use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\BodyRegion;
 use App\Training\Enums\SplitType;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
@@ -30,6 +31,7 @@ function canonicalTestEngine(): TrainingEngine
         $safetyResolver,
         new TrainingHistoryContextProvider($safetyResolver),
         new ProgressionEvaluator,
+        new DurationEstimator,
     );
 }
 

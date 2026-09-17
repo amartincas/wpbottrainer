@@ -192,6 +192,26 @@ class TenantWizardForm
                             ->default(30)
                             ->helperText('Tiempo desde que se entrega un ejercicio (sin reporte todavía) antes de enviar un recordatorio único por ese ejercicio.'),
                     ]),
+
+                // Duración objetivo APROXIMADA de sesión — mismo bloque que
+                // TenantForm.php (edición posterior). 15-90 es un guard rail
+                // de configuración, no una regla de entrenamiento. El
+                // ->default(30) es la conveniencia de formulario de creación
+                // (ver el comentario extendido en TenantForm.php) — la única
+                // fuente de verdad del default de negocio es la migración
+                // 2026_09_17_000002_add_target_session_duration_to_tenants_table.
+                Section::make('Duración objetivo de la sesión')
+                    ->columnSpanFull()
+                    ->schema([
+                        TextInput::make('target_session_duration_minutes')
+                            ->label('Duración objetivo (minutos)')
+                            ->numeric()
+                            ->required()
+                            ->minValue(15)
+                            ->maxValue(90)
+                            ->default(30)
+                            ->helperText('Duración APROXIMADA de la sesión — no es un máximo estricto ni una duración exacta. El sistema calcula cuántos ejercicios incluir en base a este valor.'),
+                    ]),
             ]);
     }
 }

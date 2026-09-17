@@ -15,6 +15,7 @@ use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
@@ -47,6 +48,7 @@ function snapshotEngine(): TrainingEngine
         $safetyResolver,
         new TrainingHistoryContextProvider($safetyResolver),
         new ProgressionEvaluator,
+        new DurationEstimator,
     );
 }
 

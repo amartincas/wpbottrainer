@@ -130,6 +130,36 @@ class TenantForm
                             ->default(30)
                             ->helperText('Tiempo desde que se entrega un ejercicio (sin reporte todavía) antes de enviar un recordatorio único por ese ejercicio.'),
                     ]),
+
+                // Duración objetivo APROXIMADA de sesión — configuración de
+                // negocio simple por Tenant, mismo criterio que las
+                // secciones anteriores. 15-90 es un guard rail de
+                // configuración, no una regla de entrenamiento — ver
+                // App\Training\Engine\TrainingEngine::exercisesForTargetDuration().
+                //
+                // ->default(30) aquí NO es una segunda fuente de verdad del
+                // default de negocio — la única fuente de verdad es la
+                // columna en la migración (2026_09_17_000002_...). Este
+                // default es solo una conveniencia del formulario de
+                // creación de Filament (pre-rellena el campo para que no
+                // quede vacío en el form); en edición Filament siempre lee
+                // el valor real ya persistido, nunca este número. Mismo
+                // patrón exacto, sin excepción, que ->default(3) en
+                // referral_reward_days y ->default(30) en
+                // exercise_nudge_after_minutes más arriba en este archivo —
+                // si el default de negocio cambia, se cambia en la migración
+                // y aquí, igual que ya se hace con esos dos campos.
+                Section::make('Duración objetivo de la sesión')
+                    ->schema([
+                        TextInput::make('target_session_duration_minutes')
+                            ->label('Duración objetivo (minutos)')
+                            ->numeric()
+                            ->required()
+                            ->minValue(15)
+                            ->maxValue(90)
+                            ->default(30)
+                            ->helperText('Duración APROXIMADA de la sesión — no es un máximo estricto ni una duración exacta. El sistema calcula cuántos ejercicios incluir en base a este valor.'),
+                    ]),
             ]);
     }
 }

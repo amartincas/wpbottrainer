@@ -1273,3 +1273,78 @@ it('a report with MORE sets than prescribed is never blocked by the partial-repo
     expect($log->exerciseSets)->toHaveCount(4);
     Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Sentadilla con peso corporal'));
 });
+
+// Duración objetivo de sesión — la entrega progresiva y el avance por
+// reporte son enteramente agnósticos a la cantidad de ejercicios (nunca
+// dependieron de EXERCISES_PER_SESSION=3, que TrainingEngine ya no tiene).
+// Este test usa makeSessionWithExercises() (bypassa TrainingEngine por
+// completo) con 5 ejercicios — un número que antes de la duración objetivo
+// dinámica NUNCA podía ocurrir de forma natural — para demostrar que
+// TrainingHandler sigue entregando uno a la vez y avanzando correctamente,
+// sin ningún supuesto de "exactamente 3" en su lógica.
+it('progressive delivery and per-report advancement work correctly with 5 exercises — no logic anywhere assumes exactly 3', function () {
+    $contact = readyTrainingContact();
+    [, $workoutExercises] = makeSessionWithExercises($contact, [
+        ['name' => 'Ejercicio Uno'],
+        ['name' => 'Ejercicio Dos'],
+        ['name' => 'Ejercicio Tres'],
+        ['name' => 'Ejercicio Cuatro'],
+        ['name' => 'Ejercicio Cinco'],
+    ]);
+
+    expect($workoutExercises)->toHaveCount(5);
+
+    $reportTurn = reportExtractionBody([
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => false,
+            'sets' => array_fill(0, 3, ['reps' => 10, 'load' => 20, 'duration_seconds' => null]),
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+    ]);
+
+    // 4 reportes (avanza del 1 al 5) — Http::sequence() porque Http::fake()
+    // llamado más de una vez para la MISMA URL acumula stubs en vez de
+    // reemplazarlos (comportamiento real verificado de Illuminate\Http\Client\Factory).
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::sequence()
+            ->push($reportTurn, 200)
+            ->push($reportTurn, 200)
+            ->push($reportTurn, 200)
+            ->push($reportTurn, 200),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    for ($i = 0; $i < 4; $i++) {
+        sendMessageAsContact($contact, '3 series de 10 con 20kg');
+
+        $nextOrder = $i + 2; // 1-indexado: tras reportar el ejercicio $i+1, se entrega el $i+2
+        $nextExercise = $workoutExercises[$i + 1];
+
+        Http::assertSent(fn ($request) => str_contains(
+            data_get($request->data(), 'text.body', ''),
+            "{$nextOrder}. *{$nextExercise->exercise_snapshot['name']}*"
+        ));
+
+        // Ese mismo ejercicio (el que se acaba de entregar en ESTE turno)
+        // nunca se entrega una segunda vez en un turno posterior — se
+        // verifica al final, comparando el conteo total de veces que su
+        // tarjeta aparece en TODO el historial (debe ser exactamente 1).
+    }
+
+    foreach (array_slice($workoutExercises, 1) as $index => $we) {
+        $order = $index + 2;
+        $cardText = "{$order}. *{$we->exercise_snapshot['name']}*";
+        $timesSent = collect(Http::recorded())
+            ->filter(fn ($pair) => str_contains(data_get($pair[0]->data(), 'text.body', ''), $cardText))
+            ->count();
+        expect($timesSent)->toBe(1);
+    }
+
+    // Los 4 primeros quedaron reportados; el 5to sigue pendiente — nunca se
+    // reportaron todos de una vez ni se saltó ninguno.
+    foreach (array_slice($workoutExercises, 0, 4) as $we) {
+        expect($we->fresh()->exerciseLog)->not->toBeNull();
+    }
+    expect($workoutExercises[4]->fresh()->exerciseLog)->toBeNull();
+});

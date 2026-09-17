@@ -4,6 +4,7 @@ namespace App\Training\Engine;
 
 use App\Models\Contact;
 use App\Models\Exercise;
+use App\Models\Tenant;
 use App\Models\TrainingProfile;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
@@ -13,6 +14,7 @@ use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\DurationEstimator;
 use App\Training\Support\HistoryExerciseEntry;
 use App\Training\Support\HistorySetEntry;
 use App\Training\Support\ProgressionEvaluation;
@@ -42,7 +44,18 @@ use Illuminate\Support\Facades\Log;
  */
 class TrainingEngine
 {
-    private const EXERCISES_PER_SESSION = 3;
+    /**
+     * Guard rail TÉCNICO sobre la cantidad calculada dinámicamente en
+     * `exercisesForTargetDuration()` — nunca una regla de producto ("la
+     * sesión debe tener entre 1 y 15 ejercicios" no es una decisión de
+     * entrenamiento, es solo un límite de cordura ante una configuración de
+     * Tenant fuera de rango). La cantidad real ya no es una constante fija
+     * — se deriva de `Tenant.target_session_duration_minutes` vía
+     * `DurationEstimator` (ver App\Training\Support\DurationEstimator).
+     */
+    private const MIN_EXERCISES_PER_SESSION = 1;
+
+    private const MAX_EXERCISES_PER_SESSION = 15;
 
     private const RECOVERY_NEGLECT_DAYS = 5;
 
@@ -116,6 +129,7 @@ class TrainingEngine
         private readonly SafetyRestrictionResolver $safetyResolver,
         private readonly TrainingHistoryContextProvider $historyProvider,
         private readonly ProgressionEvaluator $progressionEvaluator,
+        private readonly DurationEstimator $durationEstimator,
     ) {}
 
     /**
@@ -338,19 +352,28 @@ class TrainingEngine
      *    combinación de perfil/catálogo/historial produce siempre la misma
      *    sesión.
      *
-     * La selección final es, simplemente, tomar los primeros
-     * EXERCISES_PER_SESSION de [nivel primario ordenado, nivel secundario
-     * ordenado, nivel general ordenado] concatenados en ese orden — el
-     * orden de los niveles YA garantiza que el foco domina sobre todo lo
-     * demás, sin necesitar pesos numéricos calibrados a mano.
+     * La selección final es, simplemente, tomar los primeros N de [nivel
+     * primario ordenado, nivel secundario ordenado, nivel general ordenado]
+     * concatenados en ese orden — el orden de los niveles YA garantiza que
+     * el foco domina sobre todo lo demás, sin necesitar pesos numéricos
+     * calibrados a mano. N ya NO es una constante fija — se calcula
+     * dinámicamente por `exercisesForTargetDuration()` a partir de
+     * `Tenant.target_session_duration_minutes` (ver esa clase para la
+     * fórmula completa).
      *
-     * Garantía de foco (Hito 8.4, punto 5 aprobado): con primary_focus
-     * declarado, se espera que al menos ceil(EXERCISES_PER_SESSION/2) de
-     * los ejercicios elegidos vengan de los niveles primario+secundario. Si
-     * el catálogo elegible no alcanza para cumplirla, se registra
-     * TRAINING_FOCUS_FALLBACK — nunca se bloquea ni se inventa un ejercicio
-     * para forzarla (ver docs/DECISIONS.md D034: catálogo real de
+     * Garantía de foco (Hito 8.4, punto 5 aprobado; generalizada junto con
+     * la duración objetivo): con primary_focus declarado, se espera que al
+     * menos ceil(N/2) de los ejercicios elegidos vengan de los niveles
+     * primario+secundario — la misma fórmula de siempre, ahora sobre N
+     * dinámico. Si el catálogo elegible no alcanza para cumplirla, se
+     * registra TRAINING_FOCUS_FALLBACK — nunca se bloquea ni se inventa un
+     * ejercicio para forzarla (ver docs/DECISIONS.md D034: catálogo real de
      * producción hoy tiene un único ejercicio activo, sin esta metadata).
+     * Si el catálogo elegible entrega MENOS ejercicios de los N pedidos por
+     * duración (`Collection::take()` nunca inventa, solo entrega lo que
+     * hay), se registra TRAINING_DURATION_TARGET_UNREACHABLE — la sesión
+     * resultante simplemente tiene menos ejercicios, nunca ejercicios
+     * inventados ni relajación de elegibilidad.
      *
      * @return Collection<int, Exercise>
      */
@@ -398,8 +421,10 @@ class TrainingEngine
         $secondaryTier = $this->sortCandidates($secondaryTier, $profile, $recentlyUsedExerciseIds);
         $generalTier = $this->sortCandidates($generalTier, $profile, $recentlyUsedExerciseIds);
 
+        $exercisesPerSession = $this->exercisesForTargetDuration($profile, $contact->tenant);
+
         $focusSlotsAvailable = $primaryTier->count() + $secondaryTier->count();
-        $minFocusSlots = (int) ceil(self::EXERCISES_PER_SESSION / 2);
+        $minFocusSlots = (int) ceil($exercisesPerSession / 2);
 
         if ($primaryFocus !== [] && $focusSlotsAvailable < $minFocusSlots) {
             Log::info('TRAINING_FOCUS_FALLBACK', [
@@ -411,9 +436,59 @@ class TrainingEngine
             ]);
         }
 
-        return $primaryTier->concat($secondaryTier)->concat($generalTier)
-            ->take(self::EXERCISES_PER_SESSION)
+        $selected = $primaryTier->concat($secondaryTier)->concat($generalTier)
+            ->take($exercisesPerSession)
             ->values();
+
+        // Catálogo insuficiente (ver docblock arriba): Collection::take()
+        // nunca inventa — si el catálogo elegible entrega menos de lo
+        // pedido por duración objetivo, la sesión simplemente queda más
+        // corta. Solo se deja constancia operativa, mismo criterio que
+        // TRAINING_FOCUS_FALLBACK arriba.
+        if ($selected->count() < $exercisesPerSession) {
+            Log::info('TRAINING_DURATION_TARGET_UNREACHABLE', [
+                'contact_id' => $contact->id,
+                'tenant_id' => $contact->tenant->id,
+                'target_session_duration_minutes' => $contact->tenant->target_session_duration_minutes,
+                'exercises_requested' => $exercisesPerSession,
+                'exercises_selected' => $selected->count(),
+            ]);
+        }
+
+        return $selected;
+    }
+
+    /**
+     * Traduce `Tenant.target_session_duration_minutes` (duración objetivo
+     * APROXIMADA — nunca un máximo estricto ni una promesa exacta, ver
+     * migración de la columna) a una cantidad de ejercicios, usando
+     * `DurationEstimator` como herramienta de cálculo puro — este método
+     * sigue siendo quien DECIDE la cantidad (autoridad de prescripción);
+     * `DurationEstimator` nunca decide, solo estima segundos.
+     *
+     * Usa `GOAL_DEFAULTS[goal]` (sets/rest_seconds) porque en este punto
+     * los ejercicios reales todavía no están seleccionados — es una
+     * estimación "hacia adelante", sobre la prescripción TÍPICA del goal
+     * del perfil, no sobre datos ya persistidos (eso es lo que hace
+     * `DurationEstimator::estimateSessionSeconds()` después, sobre la
+     * sesión ya creada, para la introducción — ver SessionIntroComposer).
+     *
+     * MIN/MAX_EXERCISES_PER_SESSION son un guard rail técnico, no una regla
+     * de producto — protegen contra una configuración de Tenant fuera de
+     * rango llegando por cualquier vía que no sea el formulario de Filament
+     * (que ya valida 15-90 minutos en la UI).
+     */
+    private function exercisesForTargetDuration(TrainingProfile $profile, Tenant $tenant): int
+    {
+        $goalDefaults = self::GOAL_DEFAULTS[$profile->goal?->value] ?? self::GOAL_DEFAULTS['general_fitness'];
+
+        $estimatedSecondsPerExercise = $this->durationEstimator->estimateExerciseSeconds(
+            $goalDefaults['sets'], $goalDefaults['rest_seconds'], null,
+        );
+
+        $exercises = (int) round(($tenant->target_session_duration_minutes * 60) / $estimatedSecondsPerExercise);
+
+        return max(self::MIN_EXERCISES_PER_SESSION, min(self::MAX_EXERCISES_PER_SESSION, $exercises));
     }
 
     /**

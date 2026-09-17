@@ -25,6 +25,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'trial_duration_days',
     'exercise_nudge_enabled',
     'exercise_nudge_after_minutes',
+    'target_session_duration_minutes',
     'currency',
     'country',
     'timezone',
@@ -63,6 +64,9 @@ class Tenant extends Model
             // configuración de negocio simple, por Tenant, sin tabla propia.
             'exercise_nudge_enabled' => 'boolean',
             'exercise_nudge_after_minutes' => 'integer',
+            // Duración objetivo APROXIMADA de sesión — ver docblock de la
+            // migración y App\Training\Engine\TrainingEngine::exercisesForTargetDuration().
+            'target_session_duration_minutes' => 'integer',
         ];
     }
 

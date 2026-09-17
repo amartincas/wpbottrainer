@@ -47,6 +47,7 @@ use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\SessionCloseMessageComposer;
+use App\Training\Support\SessionIntroComposer;
 use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
@@ -299,6 +300,7 @@ class TrainingHandler implements HandlerInterface
         private readonly AutomaticTrialProvisioner $trialProvisioner,
         private readonly TrialEndedMessageComposer $trialEndedComposer,
         private readonly SessionCloseMessageComposer $sessionCloseComposer,
+        private readonly SessionIntroComposer $sessionIntroComposer,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -605,10 +607,13 @@ class TrainingHandler implements HandlerInterface
             'elapsed_ms' => (int) round((microtime(true) - $engineStartedAt) * 1000),
         ]);
 
-        // Hito 9.2: cabecera mínima de sesión — la prescripción y la técnica
-        // de cada ejercicio ya van en su propio mensaje (ExerciseMessageFormatter),
-        // así que repetirlas aquí sería fragmentación redundante, no menos.
-        $this->reply($from, '🔥 Tu entrenamiento de hoy', $tenant);
+        // Duración objetivo de sesión — introducción determinista (MVP, sin
+        // IA): describe la sesión YA prescrita (focus/cantidad/duración
+        // aproximada), leyendo únicamente la propia WorkoutSession ya
+        // creada — ver App\Training\Support\SessionIntroComposer. Sustituye
+        // el encabezado fijo de Hito 9.2 ("🔥 Tu entrenamiento de hoy"), que
+        // ahora es solo la primera línea de un mensaje más completo.
+        $this->reply($from, $this->sessionIntroComposer->compose($session), $tenant);
 
         // H16.2 Fase 1 — entrega progresiva: se entrega ÚNICAMENTE el primer
         // ejercicio (order más bajo — ya garantizado por
