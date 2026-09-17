@@ -12,18 +12,20 @@ use App\Models\WorkoutSession;
  *
  * `compose(WorkoutSession $session)` — un solo parámetro, deliberadamente
  * NUNCA `TrainingProfile`: `WorkoutSession.prescription_context_snapshot`
- * ya congela el `goal`/`decided_focus`/`primary_focus`/`secondary_focus`/
- * `split_type` que realmente aplicaron en el momento de la prescripción —
- * usar el perfil vivo arriesgaría leer un `goal` que cambió después de
- * generar la sesión, inconsistente con lo que el usuario realmente recibió.
+ * ya congela el `goal`/`primary_focus`/`secondary_focus`/`split_type` que
+ * realmente aplicaron en el momento de la prescripción, y
+ * `WorkoutExercise.exercise_snapshot` congela los músculos reales de cada
+ * ejercicio ya seleccionado — usar el perfil vivo arriesgaría leer un
+ * `goal` que cambió después de generar la sesión, inconsistente con lo que
+ * el usuario realmente recibió.
  */
 class SessionIntroComposer
 {
     /**
-     * Cuántos grupos musculares del focus se nombran como máximo — mismo
-     * criterio de brevedad que `ExerciseMessageFormatter::MAX_TECHNIQUE_BULLETS`.
-     * `decided_focus` puede traer hasta 6 grupos (rotación full_body
-     * completa) — nombrarlos todos sería una introducción larga, no breve.
+     * Cuántos músculos reales se nombran como máximo — mismo criterio de
+     * brevedad que `ExerciseMessageFormatter::MAX_TECHNIQUE_BULLETS`. Una
+     * sesión con muchos ejercicios podría tocar más de 3 músculos distintos
+     * — nombrarlos todos sería una introducción larga, no breve.
      */
     private const MAX_FOCUS_LABELS = 3;
 
@@ -33,7 +35,7 @@ class SessionIntroComposer
     {
         $exerciseCount = $session->workoutExercises->count();
         $estimatedMinutes = (int) round($this->durationEstimator->estimateSessionSeconds($session) / 60);
-        $focusLine = $this->focusLine($session->prescription_context_snapshot ?? []);
+        $focusLine = $this->focusLine($session);
 
         $lines = ['🔥 Tu entrenamiento de hoy', ''];
 
@@ -51,34 +53,29 @@ class SessionIntroComposer
     }
 
     /**
-     * Hallazgo E2E real de staging (contacto full_body sin foco explícito):
-     * `decided_focus` para `split_type=full_body` es el universo COMPLETO de
-     * los 6 `Exercise.muscle_group` posibles (`TrainingEngine::ROTATIONS`:
-     * "full_body no tiene nada que rotar" — un único elemento compuesto por
-     * los 6 grupos), NUNCA una lista priorizada — a diferencia de
-     * upper_lower/push_pull_legs, donde cada fase de la rotación SÍ es un
-     * subconjunto genuino que además acota la selección real
-     * (`TrainingEngine::selectExercises()`, `$generalTier`). Truncar ese
-     * universo completo a los primeros 3 (orden alfabético fijo de la
-     * constante, sin ningún significado de prioridad) y anunciarlos como
-     * "trabajaremos principalmente X, Y y Z" es, para full_body, una
-     * afirmación falsa — la sesión real puede (y normalmente va a)
-     * seleccionar ejercicios de cualquiera de los 6 grupos, sin relación con
-     * esos 3 primeros.
+     * Hallazgo E2E real de staging + investigación de seguimiento: la
+     * introducción NUNCA debe comunicar una INTENCIÓN de selección como si
+     * fuera un resultado garantizado. `decided_focus` (`TrainingEngine::
+     * ROTATIONS`) para `split_type=full_body` es el universo COMPLETO de los
+     * 6 `Exercise.muscle_group` posibles — nunca una lista priorizada. Y
+     * `primary_focus`/`secondary_focus`, aunque SÍ influyen en
+     * `selectExercises()` (primaryTier/secondaryTier), no tienen ninguna
+     * garantía de proporción estable (`ceil(N/2)` es un mínimo sin techo, y
+     * puede fallar silenciosamente con catálogo escaso) — no alcanza para
+     * afirmar honestamente "trabajaremos principalmente X". Por eso
+     * `decided_focus` YA NO SE USA aquí en absoluto como fuente de foco
+     * visible, en ningún caso.
      *
-     * Distinción correcta (nunca posicional dentro de `decided_focus`):
-     * ¿el perfil declaró un foco real (`primary_focus`/`secondary_focus`,
-     * congelados en el snapshot)? Si NO, y el split es full_body, no hay
-     * ningún foco genuino que anunciar — se comunica "todo el cuerpo". En
-     * cualquier otro caso (foco explícito declarado, o un split con fases
-     * reales como upper_lower/push_pull_legs) se conserva el comportamiento
-     * previo, mostrando `decided_focus` traducido — sin cambios ahí.
+     * Único caso especial: `split_type=full_body` sin `primary_focus` ni
+     * `secondary_focus` declarados — ahí no hay ningún foco, ni pretendido
+     * ni real, que describir: "todo el cuerpo" es simplemente la verdad.
      *
-     * El problema de bodyweight/TrackingType/carga (hallado en la misma
-     * prueba E2E) es un hito aparte, explícitamente fuera de este parche.
+     * En cualquier otro caso, la introducción describe los músculos que la
+     * sesión REALMENTE contiene — ver `realMuscleFocusLabel()`.
      */
-    private function focusLine(array $snapshot): ?string
+    private function focusLine(WorkoutSession $session): ?string
     {
+        $snapshot = $session->prescription_context_snapshot ?? [];
         $primaryFocus = $snapshot['primary_focus'] ?? [];
         $secondaryFocus = $snapshot['secondary_focus'] ?? [];
         $hasExplicitFocus = $primaryFocus !== [] || $secondaryFocus !== [];
@@ -87,31 +84,35 @@ class SessionIntroComposer
             return 'Hoy trabajaremos todo el cuerpo.';
         }
 
-        $focusLabel = $this->focusLabel($snapshot['decided_focus'] ?? null);
+        $focusLabel = $this->realMuscleFocusLabel($session);
 
-        return $focusLabel !== null ? "Hoy trabajaremos principalmente {$focusLabel}." : null;
+        return $focusLabel !== null ? "Hoy trabajaremos {$focusLabel}." : null;
     }
 
     /**
-     * `decided_focus` es una lista de `Exercise.muscle_group` separada por
-     * comas — el vocabulario GRUESO de 6 valores que produce
-     * `TrainingEngine::ROTATIONS` (arms, back, chest, core, legs,
-     * shoulders), no el vocabulario fino de `MuscleFocus`. Reutiliza
-     * `ExerciseMessageFormatter::MUSCLE_GROUP_LABELS` (única fuente de
-     * verdad de ESTE diccionario, nunca duplicado aquí) — cubre los 6
-     * valores exactos que `ROTATIONS` puede producir, así que ningún focus
-     * real desaparece silenciosamente. Un token fuera de ese vocabulario
-     * (no debería ocurrir nunca dado el código actual) se omitiría, nunca
-     * inventando una etiqueta.
+     * Describe lo que la sesión REALMENTE contiene, nunca una intención:
+     * toma `primary_muscle` (vocabulario FINO de `MuscleFocus`, ya congelado
+     * en `WorkoutExercise.exercise_snapshot` por `Exercise::toSnapshot()`)
+     * de cada ejercicio ya seleccionado, en el orden de entrega real
+     * (`workoutExercises()` ya ordena por `order`) — nunca `TrainingProfile`
+     * vivo, nunca `decided_focus`. Reutiliza `ExerciseMessageFormatter::
+     * MUSCLE_LABELS` (el mismo diccionario fino que ya usa el propio mensaje
+     * de cada ejercicio, "🎯 Músculos trabajados") — única fuente de verdad,
+     * nunca una taxonomía paralela.
+     *
+     * Regla de brevedad determinista: hasta `MAX_FOCUS_LABELS` (3) músculos
+     * distintos, en el orden en que aparecen los ejercicios de la sesión —
+     * mismo criterio de brevedad y "nunca inventar" que ya usaba el diseño
+     * anterior. Un ejercicio sin `primary_muscle` (dato ausente en el
+     * snapshot) se omite silenciosamente; una sesión sin ningún músculo
+     * identificable no muestra línea de focus, nunca inventa una.
      */
-    private function focusLabel(?string $decidedFocus): ?string
+    private function realMuscleFocusLabel(WorkoutSession $session): ?string
     {
-        if ($decidedFocus === null) {
-            return null;
-        }
-
-        $labels = collect(explode(',', $decidedFocus))
-            ->map(fn (string $muscleGroup) => ExerciseMessageFormatter::MUSCLE_GROUP_LABELS[$muscleGroup] ?? null)
+        $labels = $session->workoutExercises
+            ->pluck('exercise_snapshot.primary_muscle')
+            ->filter()
+            ->map(fn (string $muscle) => ExerciseMessageFormatter::MUSCLE_LABELS[$muscle] ?? null)
             ->filter()
             ->unique()
             ->values()

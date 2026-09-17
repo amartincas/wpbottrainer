@@ -8,9 +8,22 @@ use App\Training\Enums\WorkoutSessionStatus;
 
 /**
  * Introducción de sesión — determinista, sin IA. `compose()` describe la
- * sesión YA prescrita, leyendo únicamente `WorkoutSession` (y su
- * `prescription_context_snapshot` congelado) — nunca `TrainingProfile` vivo,
- * nunca recalcula el focus, nunca vuelve a ejecutar TrainingEngine.
+ * sesión YA prescrita, leyendo únicamente `WorkoutSession` (su
+ * `prescription_context_snapshot` y el `exercise_snapshot` congelado de cada
+ * `WorkoutExercise`) — nunca `TrainingProfile` vivo, nunca `decided_focus`
+ * (ver hallazgo de staging: para full_body es el universo completo de los 6
+ * `Exercise.muscle_group`, nunca una lista priorizada), nunca vuelve a
+ * ejecutar TrainingEngine.
+ *
+ * Decisión de diseño (segunda revisión post-E2E): la introducción NUNCA
+ * comunica una INTENCIÓN de selección como si fuera un resultado
+ * garantizado — ni siquiera cuando `primary_focus`/`secondary_focus` están
+ * declarados, porque `TrainingEngine::selectExercises()` solo garantiza
+ * `ceil(N/2)` como mínimo, sin techo, y puede fallar silenciosamente con
+ * catálogo escaso (ver investigación de casos A/B/C). Por eso el único
+ * "focus" que la introducción anuncia es: (a) "todo el cuerpo" cuando
+ * split_type=full_body sin ningún foco declarado, o (b) los músculos REALES
+ * de los WorkoutExercise ya seleccionados, en cualquier otro caso.
  */
 function sessionIntroComposer(): SessionIntroComposer
 {
@@ -24,10 +37,10 @@ function introSession(array $sessionOverrides = []): WorkoutSession
         'prescription_context_snapshot' => [
             'schema_version' => 1,
             'goal' => 'general_fitness',
-            // split_type != full_body por defecto: 'chest,shoulders' es un
-            // subconjunto genuino de una fase real de rotación (ej.
-            // upper_lower), no el universo completo de full_body — el caso
-            // "full_body sin foco explícito" se prueba aparte, explícitamente.
+            // split_type != full_body por defecto — el caso "full_body sin
+            // foco explícito" (→ "todo el cuerpo") se prueba aparte,
+            // explícitamente. decided_focus se deja presente a propósito en
+            // varios tests para demostrar que YA NO se consulta.
             'split_type' => 'upper_lower',
             'primary_focus' => [],
             'secondary_focus' => [],
@@ -37,50 +50,67 @@ function introSession(array $sessionOverrides = []): WorkoutSession
     ], $sessionOverrides));
 }
 
-// ── focus ──
+/**
+ * `WorkoutExerciseFactory::definition()` crea un `Exercise` interno al azar
+ * y deriva `exercise_snapshot` de ÉL (incluso si se sobrescribe
+ * `exercise_id`) — para controlar el `primary_muscle` real que ve
+ * `SessionIntroComposer`, hay que sobrescribir `exercise_snapshot`
+ * directamente, con solo las claves que la introducción realmente lee.
+ */
+function workoutExerciseWithMuscle(WorkoutSession $session, int $order, ?string $primaryMuscle): WorkoutExercise
+{
+    return WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id,
+        'order' => $order,
+        'exercise_snapshot' => ['name' => "Ejercicio {$order}", 'primary_muscle' => $primaryMuscle],
+    ]);
+}
 
-it('communicates the decided focus, translated from the frozen snapshot', function () {
+// ── focus: describe los músculos REALES de la sesión, nunca decided_focus ──
+
+it('describes the real primary muscles of the selected exercises, never decided_focus', function () {
+    // Ejemplo del hallazgo E2E real: decided_focus del snapshot dice
+    // 'chest,shoulders', pero los ejercicios REALMENTE seleccionados
+    // trabajan hombros/cuádriceps/pantorrillas — la introducción debe
+    // reflejar la realidad, no lo que decided_focus sugeriría.
     $session = introSession();
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+    workoutExerciseWithMuscle($session, 1, 'shoulders');
+    workoutExerciseWithMuscle($session, 2, 'quads');
+    workoutExerciseWithMuscle($session, 3, 'calves');
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
-    expect($text)->toContain('pecho')->toContain('hombros');
+    expect($text)->toContain('Hoy trabajaremos hombros, cuádriceps y pantorrillas.');
+    expect($text)->not->toContain('pecho'); // decided_focus decía 'chest,shoulders' — nunca se usa
 });
 
-it('caps the number of focus labels mentioned, joining naturally', function () {
-    // 'arms,back,chest,shoulders' es un decided_focus REAL de una fase
-    // upper_lower (TrainingEngine::ROTATIONS['upper_lower'][0]) — un
-    // subconjunto genuino (4 de 6 grupos), no el universo completo de
-    // full_body (ver el caso aparte "full body sin foco explícito" más
-    // abajo, donde truncar SÍ sería engañoso). Confirma el cap de 3 en un
-    // caso donde decided_focus realmente acota la selección.
-    $session = introSession([
-        'prescription_context_snapshot' => [
-            'schema_version' => 1,
-            'goal' => 'general_fitness',
-            'split_type' => 'upper_lower',
-            'primary_focus' => [],
-            'secondary_focus' => [],
-            'decided_focus' => 'arms,back,chest,shoulders',
-        ],
-    ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+it('caps the number of real muscles mentioned to 3, in the order the exercises were delivered', function () {
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, 'shoulders');
+    workoutExerciseWithMuscle($session, 2, 'quads');
+    workoutExerciseWithMuscle($session, 3, 'calves');
+    workoutExerciseWithMuscle($session, 4, 'chest');
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
-    // Máximo 3 etiquetas — los 3 primeros grupos del snapshot, en orden.
-    expect($text)->toContain('brazos')->toContain('espalda')->toContain('pecho');
-    expect($text)->not->toContain('hombros'); // 4to grupo, fuera del cap de 3
+    expect($text)->toContain('Hoy trabajaremos hombros, cuádriceps y pantorrillas.');
+    expect($text)->not->toContain('pecho'); // 4to músculo distinto, fuera del cap de 3
+});
+
+it('deduplicates repeated real muscles instead of counting them twice toward the cap', function () {
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, 'quads');
+    workoutExerciseWithMuscle($session, 2, 'quads'); // mismo músculo que el anterior
+    workoutExerciseWithMuscle($session, 3, 'calves');
+
+    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
+
+    expect($text)->toContain('Hoy trabajaremos cuádriceps y pantorrillas.');
 });
 
 // ── caso E2E real: full_body sin foco explícito (bug confirmado en staging) ──
 
-it('full_body with no explicit primary/secondary focus communicates "todo el cuerpo", never 3 arbitrary muscles', function () {
-    // Reproduce exactamente el snapshot real de staging que causó el bug:
-    // decided_focus es el universo completo de ROTATIONS['full_body'] (los
-    // 6 grupos, sin orden de prioridad real) — la sesión real seleccionó
-    // shoulders/quads/calves, 0 de los 3 "primeros" (arms/back/chest).
+it('full_body with no explicit primary/secondary focus communicates "todo el cuerpo", never a list of muscles', function () {
     $session = introSession([
         'prescription_context_snapshot' => [
             'schema_version' => 1,
@@ -91,57 +121,17 @@ it('full_body with no explicit primary/secondary focus communicates "todo el cue
             'decided_focus' => 'arms,back,chest,core,legs,shoulders',
         ],
     ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+    // Aunque los ejercicios reales sí tengan músculos identificables, el
+    // caso full_body-sin-foco tiene prioridad: no hay ningún foco genuino
+    // que describir, ni el universal de decided_focus ni un subconjunto real.
+    workoutExerciseWithMuscle($session, 1, 'shoulders');
+    workoutExerciseWithMuscle($session, 2, 'quads');
+    workoutExerciseWithMuscle($session, 3, 'calves');
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
     expect($text)->toContain('Hoy trabajaremos todo el cuerpo.');
-    expect($text)->not->toContain('brazos, espalda y pecho');
-    expect($text)->not->toContain('trabajaremos principalmente');
-});
-
-it('full_body with an explicit primary_focus still shows the corresponding focus (Case 2), never "todo el cuerpo"', function () {
-    // Mismo split_type=full_body y mismo decided_focus universal que el
-    // caso anterior — la única diferencia es que el perfil SÍ declaró un
-    // foco real. "Conservar el comportamiento actual" significa seguir
-    // traduciendo decided_focus tal como antes; no cambia por tener
-    // primary_focus explícito (ese es un mecanismo paralelo e independiente
-    // en TrainingEngine::selectExercises(), fuera de este parche).
-    $session = introSession([
-        'prescription_context_snapshot' => [
-            'schema_version' => 1,
-            'goal' => 'general_fitness',
-            'split_type' => 'full_body',
-            'primary_focus' => ['chest'],
-            'secondary_focus' => [],
-            'decided_focus' => 'arms,back,chest,core,legs,shoulders',
-        ],
-    ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
-
-    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
-
-    expect($text)->toContain('Hoy trabajaremos principalmente');
-    expect($text)->not->toContain('todo el cuerpo');
-});
-
-it('full_body with only secondary_focus declared (primary_focus empty) still shows the corresponding focus (Case 2)', function () {
-    $session = introSession([
-        'prescription_context_snapshot' => [
-            'schema_version' => 1,
-            'goal' => 'general_fitness',
-            'split_type' => 'full_body',
-            'primary_focus' => [],
-            'secondary_focus' => ['biceps'],
-            'decided_focus' => 'arms,back,chest,core,legs,shoulders',
-        ],
-    ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
-
-    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
-
-    expect($text)->toContain('Hoy trabajaremos principalmente');
-    expect($text)->not->toContain('todo el cuerpo');
+    expect($text)->not->toContain('cuádriceps')->not->toContain('pantorrillas')->not->toContain('hombros');
 });
 
 it('the "todo el cuerpo" case never changes the real exercise count or duration of the session', function () {
@@ -173,31 +163,77 @@ it('the "todo el cuerpo" case never changes the real exercise count or duration 
     expect($text)->toContain('⏱️ Duración aproximada: 27 minutos');
 });
 
-it('never silently drops a focus whose coarse muscle_group is arms, core or legs, when it corresponds to an explicit focus', function (string $decidedFocus, string $expectedLabel) {
-    // Hallazgo del reporte anterior, ahora corregido: ExerciseMessageFormatter::
-    // MUSCLE_GROUP_LABELS cubre los 6 valores exactos que TrainingEngine::
-    // ROTATIONS puede producir — ningún decided_focus desaparece silenciosamente.
-    // primary_focus explícito + split_type != full_body: Case 2 (foco real),
-    // no el caso "todo el cuerpo" agregado por este parche.
+// ── foco explícito declarado pero NO garantizado: nunca prometer "principalmente X" ──
+
+it('with an explicit primary_focus, describes the real exercises actually selected, never promising "principalmente X"', function () {
+    // primary_focus=['chest'] está declarado, pero — como confirma la
+    // investigación de TrainingEngine::selectExercises() — eso NUNCA
+    // garantiza que la sesión termine siendo de pecho: aquí los ejercicios
+    // REALES terminaron siendo de hombros/cuádriceps/pantorrillas. La
+    // introducción debe describir eso, nunca prometer "principalmente pecho".
     $session = introSession([
         'prescription_context_snapshot' => [
             'schema_version' => 1,
             'goal' => 'general_fitness',
-            'split_type' => 'push_pull_legs',
-            'primary_focus' => ['biceps'],
+            'split_type' => 'full_body',
+            'primary_focus' => ['chest'],
             'secondary_focus' => [],
-            'decided_focus' => $decidedFocus,
+            'decided_focus' => 'arms,back,chest,core,legs,shoulders',
         ],
     ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+    workoutExerciseWithMuscle($session, 1, 'shoulders');
+    workoutExerciseWithMuscle($session, 2, 'quads');
+    workoutExerciseWithMuscle($session, 3, 'calves');
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
-    expect($text)->toContain('Hoy trabajaremos principalmente')->toContain($expectedLabel);
+    expect($text)->toContain('Hoy trabajaremos hombros, cuádriceps y pantorrillas.');
+    expect($text)->not->toContain('principalmente');
+    expect($text)->not->toContain('pecho'); // primary_focus declarado, pero NUNCA garantizado ni prometido
+    expect($text)->not->toContain('todo el cuerpo'); // hay foco explícito declarado, no es el Caso 1
+});
+
+it('with only a secondary_focus declared (primary_focus empty), still describes the real exercises, never a promised focus', function () {
+    $session = introSession([
+        'prescription_context_snapshot' => [
+            'schema_version' => 1,
+            'goal' => 'general_fitness',
+            'split_type' => 'full_body',
+            'primary_focus' => [],
+            'secondary_focus' => ['biceps'],
+            'decided_focus' => 'arms,back,chest,core,legs,shoulders',
+        ],
+    ]);
+    workoutExerciseWithMuscle($session, 1, 'back');
+    workoutExerciseWithMuscle($session, 2, 'triceps');
+
+    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
+
+    expect($text)->toContain('Hoy trabajaremos espalda y tríceps.');
+    expect($text)->not->toContain('principalmente');
+    expect($text)->not->toContain('todo el cuerpo');
+});
+
+// ── músculos que antes (vocabulario grueso) no tenían traducción: ya no aplica, pero se conserva la cobertura fina ──
+
+it('never silently drops a real muscle from the families formerly uncovered by the coarse vocabulary (arms/core/legs)', function (string $realMuscle, string $expectedLabel) {
+    // Hallazgo histórico ya resuelto de otra forma: el vocabulario GRUESO
+    // (arms/core/legs) ya no se usa en absoluto para la introducción — se
+    // describe siempre el músculo FINO real de cada ejercicio, y
+    // ExerciseMessageFormatter::MUSCLE_LABELS cubre los 11 valores finos
+    // sin ningún hueco (biceps/triceps ⊂ "arms", abs ⊂ "core", glutes/
+    // quads/hamstrings/calves ⊂ "legs" de la taxonomía gruesa anterior).
+    // Este test confirma que ninguna de esas familias desaparece.
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, $realMuscle);
+
+    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
+
+    expect($text)->toContain("Hoy trabajaremos {$expectedLabel}.");
 })->with([
-    'arms' => ['arms', 'brazos'],
-    'core' => ['core', 'core'],
-    'legs' => ['legs', 'piernas'],
+    'biceps (familia "arms")' => ['biceps', 'bíceps'],
+    'abs (familia "core")' => ['abs', 'abdomen'],
+    'quads (familia "legs")' => ['quads', 'cuádriceps'],
 ]);
 
 // ── cantidad ──
@@ -261,34 +297,47 @@ it('communicates the real estimated duration, computed from the persisted prescr
     expect($text)->toContain('⏱️ Duración aproximada: 9 minutos');
 });
 
-// ── fuente de datos: snapshot congelado, nunca TrainingProfile vivo ──
+// ── fuente de datos: snapshots congelados, nunca TrainingProfile vivo ni decided_focus ──
 
-it('never depends on the live TrainingProfile — reflects the frozen snapshot even if the profile changed afterward', function () {
-    $session = introSession([
-        'prescription_context_snapshot' => [
-            'schema_version' => 1,
-            'goal' => 'general_fitness',
-            'decided_focus' => 'back',
-        ],
-    ]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+it('never depends on the live TrainingProfile — reflects the frozen exercise_snapshot even if the profile changed afterward', function () {
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, 'back');
 
     // El TrainingProfile del contacto cambia DESPUÉS de generar la sesión —
     // no debe afectar en nada la introducción, que ya fue prescrita.
     $contact = $session->contact;
-    \App\Models\TrainingProfile::factory()->create(['contact_id' => $contact->id, 'goal' => \App\Training\Enums\TrainingGoal::BuildMuscle]);
+    \App\Models\TrainingProfile::factory()->create([
+        'contact_id' => $contact->id,
+        'goal' => \App\Training\Enums\TrainingGoal::BuildMuscle,
+        'primary_focus' => [\App\Training\Enums\MuscleFocus::Chest->value],
+    ]);
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
-    expect($text)->toContain('espalda'); // sigue siendo 'back' del snapshot, no lo que sea que el perfil diga ahora
+    expect($text)->toContain('espalda'); // sigue siendo el músculo real congelado, no lo que el perfil vivo diga ahora
+    expect($text)->not->toContain('pecho');
 });
 
-it('gracefully omits the focus line when the snapshot has no decided_focus, without inventing one', function () {
-    $session = introSession(['prescription_context_snapshot' => ['schema_version' => 1, 'goal' => 'general_fitness']]);
-    WorkoutExercise::factory()->create(['workout_session_id' => $session->id, 'order' => 1]);
+it('never consults decided_focus as a source of visible priorities — an unrelated decided_focus never leaks into the intro', function () {
+    // decided_focus dice 'chest,shoulders' (vía introSession() por defecto),
+    // pero el músculo real del único ejercicio de la sesión es 'quads' —
+    // sin foco explícito y con split_type != full_body, la introducción
+    // debe describir 'quads', nunca nada derivado de decided_focus.
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, 'quads');
 
     $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
 
-    expect($text)->not->toContain('Hoy trabajaremos principalmente');
+    expect($text)->toContain('Hoy trabajaremos cuádriceps.');
+    expect($text)->not->toContain('pecho')->not->toContain('hombros');
+});
+
+it('gracefully omits the focus line when no exercise has an identifiable primary muscle, without inventing one', function () {
+    $session = introSession();
+    workoutExerciseWithMuscle($session, 1, null);
+
+    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
+
+    expect($text)->not->toContain('Hoy trabajaremos');
     expect($text)->toContain('💪 1 ejercicio'); // el resto de la introducción sigue funcionando
 });
