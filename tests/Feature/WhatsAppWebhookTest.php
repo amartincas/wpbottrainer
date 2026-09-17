@@ -73,6 +73,67 @@ it('resolves the tenant via wa_phone_number_id and dispatches the job on an inco
     });
 });
 
+it('P1-B: propagates the full Meta referral object (not just source_id) to ProcessWhatsAppMessage untouched', function () {
+    Queue::fake();
+
+    $tenant = Tenant::factory()->create(['wa_phone_number_id' => '1234567890']);
+    $referral = [
+        'source_id' => 'AD-99887',
+        'source_type' => 'ad',
+        'ctwa_clid' => 'CLID-XYZ',
+        'headline' => 'Entrena desde casa',
+    ];
+
+    $payload = [
+        'entry' => [[
+            'changes' => [[
+                'value' => [
+                    'metadata' => ['phone_number_id' => '1234567890'],
+                    'messages' => [[
+                        'id' => 'wamid.REFERRAL1',
+                        'from' => '573009998877',
+                        'type' => 'text',
+                        'text' => ['body' => 'Hola'],
+                        'referral' => $referral,
+                    ]],
+                ],
+            ]],
+        ]],
+    ];
+
+    $this->postJson('/api/whatsapp/webhook/anything', $payload)->assertOk();
+
+    Queue::assertPushed(ProcessWhatsAppMessage::class, function (ProcessWhatsAppMessage $job) use ($referral) {
+        return $job->referral === $referral;
+    });
+});
+
+it('P1-B: passes referral=null to ProcessWhatsAppMessage when the incoming message has no referral object', function () {
+    Queue::fake();
+
+    Tenant::factory()->create(['wa_phone_number_id' => '1234567890']);
+
+    $payload = [
+        'entry' => [[
+            'changes' => [[
+                'value' => [
+                    'metadata' => ['phone_number_id' => '1234567890'],
+                    'messages' => [[
+                        'id' => 'wamid.NOREFERRAL1',
+                        'from' => '573009998866',
+                        'type' => 'text',
+                        'text' => ['body' => 'Hola, quiero informacion'],
+                    ]],
+                ],
+            ]],
+        ]],
+    ];
+
+    $this->postJson('/api/whatsapp/webhook/anything', $payload)->assertOk();
+
+    Queue::assertPushed(ProcessWhatsAppMessage::class, fn (ProcessWhatsAppMessage $job) => $job->referral === null);
+});
+
 it('ignores the webhook payload when no tenant matches the phone_number_id', function () {
     Queue::fake();
 

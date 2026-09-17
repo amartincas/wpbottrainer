@@ -36,6 +36,7 @@ class Ingest
         ?string $phoneId,
         ?string $messageType,
         ?string $mediaId,
+        ?array $referral = null,
     ): ?IngestedMessage {
         // ===== HUMAN INTERVENTION MODE CHECK (FIRST THING) =====
         // CRITICAL: This check must happen BEFORE ANY AI PROCESSING
@@ -153,6 +154,6 @@ class Ingest
             }
         }
 
-        return new IngestedMessage($from, $messageBody, $phoneId, $messageType, $mediaId);
+        return new IngestedMessage($from, $messageBody, $phoneId, $messageType, $mediaId, $referral);
     }
 }

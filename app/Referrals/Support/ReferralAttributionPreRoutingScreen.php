@@ -4,6 +4,7 @@ namespace App\Referrals\Support;
 
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\PreRoutingScreenInterface;
+use App\Core\Support\DetectsUniqueConstraintViolation;
 use App\Models\Contact;
 use App\Models\Payment;
 use App\Payments\Enums\PaymentStatus;

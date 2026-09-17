@@ -128,6 +128,18 @@ class Contact extends Model
     }
 
     /**
+     * P1-B — dominio Acquisition. Mismo criterio que el resto: Contact
+     * sigue siendo la única identidad, esta relación expone datos que
+     * pertenecen a Acquisition, no a Core. Como máximo una fila en toda la
+     * vida del Contact (first-touch inmutable — ver
+     * App\Acquisition\Models\ContactAcquisition).
+     */
+    public function acquisition(): HasOne
+    {
+        return $this->hasOne(\App\Acquisition\Models\ContactAcquisition::class);
+    }
+
+    /**
      * Mark the contact as processed.
      */
     public function markAsProcessed(): void

@@ -27,6 +27,10 @@ use Illuminate\Support\Facades\Log;
  * The constructor signature, middleware() and failed() are unchanged from
  * before the Router was introduced, so WhatsAppController keeps dispatching
  * this Job exactly as it always has.
+ *
+ * P1-B — `$referral` added as an opaque pass-through (Meta's raw `referral`
+ * object from the webhook, or null): this Job has zero attribution logic of
+ * its own, it only carries the value to Ingest::process() -> IngestedMessage.
  */
 class ProcessWhatsAppMessage implements ShouldQueue
 {
@@ -48,6 +52,7 @@ class ProcessWhatsAppMessage implements ShouldQueue
         public ?string $messageType = null,
         public ?string $mediaId = null,
         public ?int $productContext = null,
+        public ?array $referral = null,
     ) {}
 
     /**
@@ -109,6 +114,7 @@ class ProcessWhatsAppMessage implements ShouldQueue
                 $this->phoneId,
                 $this->messageType,
                 $this->mediaId,
+                $this->referral,
             );
 
             if ($ingested === null) {

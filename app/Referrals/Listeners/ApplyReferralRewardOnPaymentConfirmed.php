@@ -13,7 +13,7 @@ use App\Payments\Events\PaymentConfirmed;
 use App\Referrals\Enums\ReferralRewardApplicationStatus;
 use App\Referrals\Models\Referral;
 use App\Referrals\Models\ReferralReward;
-use App\Referrals\Support\DetectsUniqueConstraintViolation;
+use App\Core\Support\DetectsUniqueConstraintViolation;
 use App\Training\Enums\TrainingAccessStatus;
 use App\Training\Support\TrainingAccessAdministrationService;
 use Illuminate\Database\QueryException;

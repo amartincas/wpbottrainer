@@ -167,9 +167,41 @@ class FallbackChatHandler implements HandlerInterface
             // and re-emits [LEAD_COMPLETE] each time, since from its perspective
             // it's still describing a confirmed purchase. Without this check,
             // every such follow-up created a brand new Contact row for the same order.
+            //
+            // P1-B (corrección D2, revisión de cierre): esto ya NO puede asumir
+            // que "existe un Contact reciente" == "ya existe un lead real" — un
+            // PreRoutingScreen de atribución (App\Acquisition\Support\
+            // AcquisitionSourcePreRoutingScreen, y de forma más rara
+            // App\Referrals\Support\ReferralAttributionPreRoutingScreen) puede
+            // haber creado un Contact administrativo/de atribución milisegundos
+            // antes, para el MISMO tenant+teléfono, sin que exista ningún lead
+            // real todavía. Ese Contact stub se distingue por la convención ya
+            // existente en todo el resto del código (Training/Payments/
+            // CustomerCare/Referrals/Referral-atribución/Acquisition-atribución):
+            // su `summary` siempre empieza por "Registro de " — nunca es el
+            // texto real de cierre generado por la IA (que es lo que este
+            // Handler pone en `summary` al crear un lead real, ver abajo). Se
+            // usa esa convención genérica, sin nombrar ningún dominio concreto,
+            // para que cualquier futuro PreRoutingScreen que siga el mismo
+            // patrón quede cubierto automáticamente.
+            //
+            // `summary` es NOT NULL sin default a nivel de esquema (ver
+            // create_contacts_table) y ningún punto de creación actual del
+            // repositorio lo deja nulo — pero, defensivamente, un `summary`
+            // NULL se trata como "NO es un registro administrativo" (sigue
+            // contando como posible duplicado, preservando el comportamiento
+            // legacy para ese caso), nunca como "es un stub". `whereNull()` se
+            // agrega explícitamente porque `summary NOT LIKE '...'` en SQL
+            // evalúa a NULL (no a verdadero) cuando `summary` es NULL — sin
+            // este `orWhereNull()`, una fila así quedaría excluida por
+            // accidente de la detección de duplicado.
             $recentDuplicateContact = Contact::where('tenant_id', $tenant->id)
                 ->where('customer_phone', $from)
                 ->where('created_at', '>=', now()->subHour())
+                ->where(function ($query) {
+                    $query->whereNull('summary')
+                        ->orWhere('summary', 'not like', 'Registro de %');
+                })
                 ->exists();
 
             if ($recentDuplicateContact) {

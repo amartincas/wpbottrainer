@@ -239,7 +239,7 @@ it('a second confirmed Payment of the referred contact processed BEFORE the true
 it('DetectsUniqueConstraintViolation only recognizes SQLSTATE 23000 — a different DB error is never treated as an idempotent no-op', function () {
     $trait = new class
     {
-        use \App\Referrals\Support\DetectsUniqueConstraintViolation;
+        use \App\Core\Support\DetectsUniqueConstraintViolation;
 
         public function check(\Illuminate\Database\QueryException $e): bool
         {

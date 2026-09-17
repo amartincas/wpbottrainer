@@ -243,12 +243,20 @@ class WhatsAppController extends Controller
     // producto exacto sin depender de que el mensaje prellenado del anuncio
     // coincida con el nombre del producto; si no hay match, ProcessWhatsAppMessage
     // cae de vuelta a la búsqueda por texto del mensaje.
-    $adId = $message['referral']['source_id'] ?? null;
+    $referral = $message['referral'] ?? null;
+    $adId = $referral['source_id'] ?? null;
     $productContext = $adId
         ? (new ProductFinderService())->findProductByAdId($adId, $tenant->id)?->id
         : null;
 
     // Dispatch job to process the message asynchronously
+    //
+    // P1-B — $referral (el objeto completo de Meta, no solo source_id de
+    // arriba) viaja tal cual hasta IngestedMessage, para que
+    // App\Acquisition\Support\AcquisitionSourcePreRoutingScreen pueda
+    // capturar la atribución de adquisición. Nunca se interpreta aquí ni en
+    // ningún punto de este archivo — sigue siendo metadata cruda de
+    // transporte hasta llegar a ese screen.
     ProcessWhatsAppMessage::dispatch(
         $tenant,
         $fromPhone,
@@ -256,7 +264,8 @@ class WhatsAppController extends Controller
         $phoneId,
         $type,
         $mediaId,
-        $productContext
+        $productContext,
+        $referral
     );
 
     Log::info('WhatsApp message queued for processing', [

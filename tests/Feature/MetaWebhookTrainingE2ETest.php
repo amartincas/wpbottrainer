@@ -1,5 +1,7 @@
 <?php
 
+use App\Acquisition\Enums\AcquisitionSource;
+use App\Acquisition\Models\ContactAcquisition;
 use App\Models\Contact;
 use App\Models\Exercise;
 use App\Models\ExerciseLog;
@@ -26,8 +28,27 @@ use Illuminate\Support\Facades\Http;
  * sobre el estado final en base de datos justo después del POST.
  */
 
-function realMetaTextPayload(string $wamid, string $from, string $phoneNumberId, string $body): array
+/**
+ * P1-B — `$referral` es opcional y retrocompatible (todos los call-sites
+ * existentes de este helper siguen funcionando sin cambios): cuando se
+ * provee, se adjunta tal cual al mensaje, exactamente como Meta lo hace en
+ * un webhook real de Click-to-WhatsApp (`message.referral`, sibling de
+ * `message.text`, nunca anidado dentro de él).
+ */
+function realMetaTextPayload(string $wamid, string $from, string $phoneNumberId, string $body, ?array $referral = null): array
 {
+    $message = [
+        'from' => $from,
+        'id' => $wamid,
+        'timestamp' => (string) time(),
+        'type' => 'text',
+        'text' => ['body' => $body],
+    ];
+
+    if ($referral !== null) {
+        $message['referral'] = $referral;
+    }
+
     return [
         'object' => 'whatsapp_business_account',
         'entry' => [[
@@ -40,13 +61,7 @@ function realMetaTextPayload(string $wamid, string $from, string $phoneNumberId,
                         'phone_number_id' => $phoneNumberId,
                     ],
                     'contacts' => [['profile' => ['name' => 'Usuario de prueba'], 'wa_id' => $from]],
-                    'messages' => [[
-                        'from' => $from,
-                        'id' => $wamid,
-                        'timestamp' => (string) time(),
-                        'type' => 'text',
-                        'text' => ['body' => $body],
-                    ]],
+                    'messages' => [$message],
                 ],
                 'field' => 'messages',
             ]],
@@ -107,6 +122,71 @@ it('processes a fully realistic Meta webhook payload end-to-end into Training on
     expect($contact)->not->toBeNull();
     expect(TrainingProfile::where('contact_id', $contact->id)->exists())->toBeTrue();
     expect(WhatsAppMessage::where('tenant_id', $tenant->id)->where('role', 'user')->where('content', 'Quiero empezar a entrenar')->exists())->toBeTrue();
+});
+
+it('P1-B: propagates a full, non-null Meta referral through a REAL synchronous run of the pipeline — WhatsAppController -> ProcessWhatsAppMessage::handle() -> Ingest::process() -> IngestedMessage', function () {
+    // A diferencia de tests/Feature/WhatsAppWebhookTest.php (que usa
+    // Queue::fake() y solo prueba WhatsAppController -> ProcessWhatsAppMessage,
+    // sin ejecutar el Job) y de tests/Feature/Acquisition/
+    // AcquisitionSourcePreRoutingScreenTest.php (que llama a Ingest::process()
+    // directamente, sin pasar por el Job), este test NO usa Queue::fake() —
+    // se apoya en QUEUE_CONNECTION=sync (ver phpunit.xml, mismo mecanismo que
+    // el resto de este archivo) para que ProcessWhatsAppMessage::handle() se
+    // ejecute de verdad, de forma síncrona, dentro de la misma petición HTTP.
+    //
+    // La prueba de que el referral llegó intacto hasta IngestedMessage es
+    // indirecta pero real: IngestedMessage es un objeto efímero, nunca
+    // persistido — la única forma en que App\Acquisition\Support\
+    // AcquisitionSourcePreRoutingScreen pudo persistir este referral exacto
+    // en ContactAcquisition es haberlo leído de $context->message->referral,
+    // que a su vez solo pudo llegar ahí si TODA la cadena real (Controller
+    // -> Job -> Ingest -> IngestedMessage -> ExecutionContext ->
+    // PreRoutingScreener) lo transportó sin perder ni transformar ningún
+    // campo.
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'wa_phone_number_id' => '100000000000099']);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'goal' => null, 'experience_level' => null, 'restrictions' => null,
+                'available_equipment' => null, 'sessions_per_week' => null, 'safety_signal_text' => null,
+            ])]]]])
+            ->push(['choices' => [['message' => ['content' => '¿Cuál es tu objetivo principal?']]]]),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT-REFERRAL']]], 200),
+    ]);
+
+    $referral = [
+        'source_id' => 'AD-E2E-001',
+        'ctwa_clid' => 'CLID-E2E-001',
+        'source_type' => 'ad',
+        'headline' => 'Entrena desde casa',
+        'body' => 'Rutinas personalizadas por WhatsApp',
+        'source_url' => 'https://fb.me/e2e-ad',
+        'media_type' => 'image',
+        'image_url' => 'https://scontent.example/e2e.jpg',
+    ];
+
+    $payload = realMetaTextPayload('wamid.REFERRAL-E2E', '573001119999', '100000000000099', 'Quiero empezar a entrenar', $referral);
+
+    $response = $this->postJson('/api/whatsapp/webhook/anything', $payload);
+
+    $response->assertOk();
+
+    $contact = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573001119999')->first();
+    expect($contact)->not->toBeNull();
+
+    $acquisition = ContactAcquisition::where('contact_id', $contact->id)->first();
+    expect($acquisition)->not->toBeNull();
+    expect($acquisition->source)->toBe(AcquisitionSource::MetaAds);
+    expect($acquisition->meta_ad_id)->toBe('AD-E2E-001');
+    expect($acquisition->meta_ctwa_clid)->toBe('CLID-E2E-001');
+    expect($acquisition->meta_source_type)->toBe('ad');
+    expect($acquisition->meta_headline)->toBe('Entrena desde casa');
+    expect($acquisition->meta_body)->toBe('Rutinas personalizadas por WhatsApp');
+    expect($acquisition->meta_media_url)->toBe('https://scontent.example/e2e.jpg');
+    // toEqual() (no toBe()): el orden de claves tras el viaje por el cast
+    // `array`/JSON no está garantizado — el contenido sí debe ser idéntico.
+    expect($acquisition->raw_referral_payload)->toEqual($referral);
 });
 
 it('processes a fully realistic Meta audio webhook payload end-to-end, including transcription', function () {

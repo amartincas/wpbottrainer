@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use App\Acquisition\Support\AcquisitionSourcePreRoutingScreen;
 use App\Core\Alerts\AlertService;
 use App\Core\Alerts\Channels\PersistedAlertChannel;
 use App\Core\Alerts\Channels\WhatsAppAdminAlertChannel;
@@ -80,18 +81,32 @@ class AppServiceProvider extends ServiceProvider
             FaqLikelyIntentClassifier::class,
         ]));
 
-        // Core messaging PreRoutingScreener (Hito 7, extendido Hito 13):
-        // ordered list of PreRoutingScreen classes tried BEFORE Router,
-        // regardless of what Intent the message would otherwise classify
-        // as. SafetySignalPreRoutingScreen puede reclamar el pipeline
-        // (retorna true); ReferralAttributionPreRoutingScreen NUNCA lo
-        // reclama (siempre retorna false) — es puramente un efecto
-        // secundario de atribución que debe correr sin importar a qué
-        // Handler termine yendo el mensaje (ver docs/DECISIONS.md).
+        // Core messaging PreRoutingScreener (Hito 7, extendido Hito 13,
+        // extendido P1-B): ordered list of PreRoutingScreen classes tried
+        // BEFORE Router, regardless of what Intent the message would
+        // otherwise classify as. SafetySignalPreRoutingScreen puede
+        // reclamar el pipeline (retorna true); ni
+        // ReferralAttributionPreRoutingScreen ni
+        // AcquisitionSourcePreRoutingScreen lo reclaman NUNCA (siempre
+        // retornan false) — son puramente efectos secundarios de
+        // atribución que deben correr sin importar a qué Handler termine
+        // yendo el mensaje (ver docs/DECISIONS.md).
+        //
+        // P1-B — AcquisitionSourcePreRoutingScreen va DESPUÉS de
+        // ReferralAttributionPreRoutingScreen a propósito: necesita poder
+        // ver, en la MISMA pasada, si ese screen (sin modificar) acaba de
+        // crear un Referral para este Contact, para clasificar
+        // correctamente source=referral en vez de caer a organic. Caso
+        // límite documentado, no resuelto aquí: si SafetySignalPreRoutingScreen
+        // reclama el pipeline en el primer mensaje de un Contact nuevo,
+        // AcquisitionSourcePreRoutingScreen nunca llega a ejecutarse para
+        // ese mensaje y la atribución de Meta Ads de ese mensaje se
+        // pierde — no se reordena Safety para evitar esto.
         // See App\Core\Messaging\PreRoutingScreener and docs/DECISIONS.md.
         $this->app->singleton(PreRoutingScreener::class, fn ($app) => new PreRoutingScreener($app, [
             SafetySignalPreRoutingScreen::class,
             ReferralAttributionPreRoutingScreen::class,
+            AcquisitionSourcePreRoutingScreen::class,
         ]));
 
         // Core AlertService (Hito 7.1): infraestructura transversal, no
