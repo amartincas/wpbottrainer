@@ -38,12 +38,16 @@ function coachContextProvider(): CoachContextProvider
         new \App\CustomerCare\Support\FaqRelevanceDetector,
         new \App\CustomerCare\Support\CustomerServiceEscalationDetector,
         new \App\CustomerCare\Support\FaqMatcher,
+        new \App\Training\Support\TrainingPeriodDetector,
+        new \App\Training\Support\TrainingPeriodResolver,
+        new \App\Training\Support\TrainingSessionMetrics,
+        new \App\Training\Support\TimezoneResolver,
     );
 }
 
-function executionContextFor(Tenant $tenant, string $from): ExecutionContext
+function executionContextFor(Tenant $tenant, string $from, ?string $body = 'mensaje de prueba'): ExecutionContext
 {
-    return new ExecutionContext($tenant, null, new IngestedMessage($from, 'mensaje de prueba', null, 'text', null));
+    return new ExecutionContext($tenant, null, new IngestedMessage($from, $body, null, 'text', null));
 }
 
 it('returns null data when the contact does not exist', function () {
@@ -338,4 +342,85 @@ it('CoachFactsFormatter includes the REFUERZO PENDIENTE fact only when needsConv
     $facts = (new CoachFactsFormatter)->format($context);
 
     expect($facts)->toContain('REFUERZO PENDIENTE');
+});
+
+// ── periodMetrics/requestedPeriod (Hito — Historial de progreso por período) ──
+
+it('periodMetrics reflects the REAL completed-session count, independent of the 6-session context cap', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000016']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    for ($i = 0; $i < 9; $i++) {
+        WorkoutSession::factory()->create([
+            'contact_id' => $contact->id,
+            'status' => WorkoutSessionStatus::Completed,
+            'scheduled_at' => now()->subDays($i + 1),
+            'completed_at' => now()->subDays($i + 1),
+        ]);
+    }
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000016'))->data;
+
+    expect($context->periodMetrics['last_4_weeks'])->toBe(9);
+    // El contexto de razonamiento (TrainingHistoryContextProvider) sigue
+    // acotado a 6 — ambos números coexisten sin que uno limite al otro.
+    expect($context->historyContext->windowSessionsCount)->toBeLessThanOrEqual(6);
+});
+
+it('requestedPeriod is detected from the message and CoachFactsFormatter cites the matching real number, not the 4-week one', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000017']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    // 2 esta semana, 5 más antiguas dentro de las últimas 4 semanas — los
+    // números de "esta semana" (2) y "últimas 4 semanas" (7) son
+    // deliberadamente distintos para demostrar que se cita el correcto.
+    WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Completed, 'scheduled_at' => now(), 'completed_at' => now()->subHour()]);
+    WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Completed, 'scheduled_at' => now(), 'completed_at' => now()->subHours(2)]);
+    for ($i = 0; $i < 5; $i++) {
+        WorkoutSession::factory()->create([
+            'contact_id' => $contact->id,
+            'status' => WorkoutSessionStatus::Completed,
+            'scheduled_at' => now()->subDays(10 + $i),
+            'completed_at' => now()->subDays(10 + $i),
+        ]);
+    }
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000017', '¿Cómo van mis entrenos de esta semana?'))->data;
+
+    expect($context->requestedPeriod)->toBe('current_week');
+    expect($context->periodMetrics['current_week'])->toBe(2);
+    expect($context->periodMetrics['last_4_weeks'])->toBe(7);
+
+    $facts = (new CoachFactsFormatter)->format($context);
+    expect($facts)->toContain('PERÍODO SOLICITADO DETECTADO: esta semana');
+    expect($facts)->toContain('- esta semana: 2');
+    expect($facts)->toContain('- últimas 4 semanas: 7');
+});
+
+it('requestedPeriod is null when the message does not mention an explicit period, and CoachFactsFormatter omits the hint line', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000018']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000018', 'Quiero entrenar'))->data;
+
+    expect($context->requestedPeriod)->toBeNull();
+
+    $facts = (new CoachFactsFormatter)->format($context);
+    expect($facts)->not->toContain('PERÍODO SOLICITADO DETECTADO');
+});
+
+it('CoachFactsFormatter never presents the context-window count as if it were the real completed-session total', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000019']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000019'))->data;
+    $facts = (new CoachFactsFormatter)->format($context);
+
+    expect($facts)->not->toContain('sesiones completadas en la ventana');
+    expect($facts)->toContain('MÉTRICAS REALES DE SESIONES COMPLETADAS');
+    expect($facts)->toContain('CONTEXTO DE RAZONAMIENTO');
 });

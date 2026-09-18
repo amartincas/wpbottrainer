@@ -36,6 +36,19 @@ final readonly class HistoryAggregates
      * @param  array<int, int>  $exercisesRepeatedInWindow
      */
     public function __construct(
+        /**
+         * Hito — Historial de progreso por período (corrección post-E2E):
+         * este número es el conteo de sesiones `Completed` DENTRO de la
+         * colección ya acotada por `MAX_SESSIONS`/`WINDOW_WEEKS` de
+         * `TrainingHistoryContextProvider` (contexto para razonamiento) —
+         * NUNCA el total real de sesiones completadas en la ventana. Si un
+         * contacto tiene más de `MAX_SESSIONS` sesiones completadas dentro
+         * de esas semanas, este campo queda capado en `MAX_SESSIONS` y NO
+         * refleja el total. Para un conteo real, sin `LIMIT`, usar
+         * `App\Training\Support\TrainingSessionMetrics::completedCount()`.
+         * `CoachFactsFormatter` ya NO expone este campo al LLM como si
+         * fuera el conteo real — ver `formatPeriodMetrics()`.
+         */
         public int $sessionsCompletedInWindow,
         public array $lastLoadByExerciseId,
         public array $bestRecentLoadByExerciseId,

@@ -22,8 +22,13 @@ use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\HistorySetEntry;
 use App\Training\Support\ProgressionEvaluation;
 use App\Training\Support\ProgressionEvaluator;
+use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingHistoryContext;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPeriod;
+use App\Training\Support\TrainingPeriodDetector;
+use App\Training\Support\TrainingPeriodResolver;
+use App\Training\Support\TrainingSessionMetrics;
 
 /**
  * Bloque 9 (D052) — compone `CoachContext` para UNA interacción. Reutiliza
@@ -46,12 +51,25 @@ class CoachContextProvider implements ContextProviderInterface
 {
     private const RECENT_MESSAGES_LIMIT = 10;
 
+    /**
+     * Hito — Historial de progreso por período. Los 3 labels conocidos de
+     * `TrainingPeriod` — se calculan SIEMPRE los 3, sin importar lo que
+     * `TrainingPeriodDetector` encuentre en el mensaje (mismo criterio
+     * "push" que ya usa `CoachFactsFormatter` con `lastLoadByExerciseId`
+     * para todos los ejercicios, no solo el que el usuario preguntó).
+     */
+    private const PERIOD_LABELS = ['current_week', 'last_4_weeks', 'all_time'];
+
     public function __construct(
         private readonly TrainingHistoryContextProvider $historyProvider,
         private readonly ProgressionEvaluator $progressionEvaluator,
         private readonly FaqRelevanceDetector $faqRelevance,
         private readonly CustomerServiceEscalationDetector $csEscalation,
         private readonly FaqMatcher $faqMatcher,
+        private readonly TrainingPeriodDetector $periodDetector,
+        private readonly TrainingPeriodResolver $periodResolver,
+        private readonly TrainingSessionMetrics $sessionMetrics,
+        private readonly TimezoneResolver $timezoneResolver,
     ) {}
 
     public function provide(ExecutionContext $context): ContextFragment
@@ -76,6 +94,8 @@ class CoachContextProvider implements ContextProviderInterface
         $pendingReminderSuggestion = $this->pendingReminderSuggestionFor($contact);
         $activeFaqs = $this->relevantFaqsFor($context->tenant, $context->message->messageBody ?? '');
         $needsConversationReinforcement = $contact->trainingProfile?->coach_conversation_reinforced === false;
+        $periodMetrics = $this->periodMetricsFor($contact);
+        $requestedPeriod = $this->periodDetector->detect($context->message->messageBody ?? '');
 
         $coachContext = new CoachContext(
             profileSnapshot: $historyContext->currentProfileSnapshot,
@@ -86,6 +106,8 @@ class CoachContextProvider implements ContextProviderInterface
             pendingReminderSuggestion: $pendingReminderSuggestion,
             activeFaqs: $activeFaqs,
             needsConversationReinforcement: $needsConversationReinforcement,
+            periodMetrics: $periodMetrics,
+            requestedPeriod: $requestedPeriod,
         );
 
         return new ContextFragment(
@@ -229,6 +251,30 @@ class CoachContextProvider implements ContextProviderInterface
             ->map(fn (WhatsAppMessage $message) => ['role' => $message->role, 'content' => $message->content])
             ->values()
             ->all();
+    }
+
+    /**
+     * Hito — Historial de progreso por período. Métrica REAL, independiente
+     * de `TrainingHistoryContextProvider` (contexto acotado a 6 sesiones,
+     * para razonamiento — ver `CoachFactsFormatter`) — un `COUNT()` sin
+     * `LIMIT` por cada período conocido, vía `TrainingSessionMetrics`.
+     * Pertenencia por `completed_at`, nunca `scheduled_at` — ver
+     * `TrainingSessionMetrics`.
+     *
+     * @return array<string, int>
+     */
+    private function periodMetricsFor(Contact $contact): array
+    {
+        $timezone = $this->timezoneResolver->resolve($contact);
+        $now = now();
+
+        $metrics = [];
+        foreach (self::PERIOD_LABELS as $label) {
+            $period = $this->periodResolver->resolve($label, $timezone, $now);
+            $metrics[$label] = $this->sessionMetrics->completedCount($contact, $period);
+        }
+
+        return $metrics;
     }
 
     /**

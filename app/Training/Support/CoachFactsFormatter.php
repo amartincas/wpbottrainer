@@ -74,6 +74,17 @@ class CoachFactsFormatter
         'today' => 'hoy', 'tomorrow' => 'mañana',
     ];
 
+    /**
+     * Hito — Historial de progreso por período. Traducción cerrada de
+     * `TrainingPeriod::label` — mismo vocabulario que produce
+     * `TrainingPeriodDetector`/`TrainingPeriodResolver`.
+     */
+    private const PERIOD_SPANISH = [
+        'current_week' => 'esta semana',
+        'last_4_weeks' => 'últimas 4 semanas',
+        'all_time' => 'histórico total',
+    ];
+
     public function format(CoachContext $context): string
     {
         $lines = [];
@@ -82,6 +93,7 @@ class CoachFactsFormatter
         $lines[] = $this->formatCurrentSession($context);
         $lines[] = $this->formatProgressions($context);
         $lines[] = $this->formatHistoryAggregates($context);
+        $lines[] = $this->formatPeriodMetrics($context);
         $lines[] = $this->formatPendingReminderSuggestion($context->pendingReminderSuggestion);
         $lines[] = $this->formatConversationReinforcementHint($context->needsConversationReinforcement);
 
@@ -186,9 +198,7 @@ class CoachFactsFormatter
     private function formatHistoryAggregates(CoachContext $context): string
     {
         $aggregates = $context->historyContext->aggregates;
-        $lines = ['HISTORIAL RECIENTE (ventana de '.$context->historyContext->windowSessionsCount.' sesiones / '.$context->historyContext->windowWeeks.' semanas):'];
-
-        $lines[] = "- sesiones completadas en la ventana: {$aggregates->sessionsCompletedInWindow}";
+        $lines = ['CONTEXTO DE RAZONAMIENTO (hasta '.$context->historyContext->windowSessionsCount.' sesiones recientes cargadas, ventana de '.$context->historyContext->windowWeeks.' semanas — para progresión/anti-repetición; NUNCA es el conteo total de sesiones completadas, ver MÉTRICAS REALES más abajo):'];
 
         $lines[] = $aggregates->daysSinceLastCompletedSession !== null
             ? "- última sesión completada: hace {$aggregates->daysSinceLastCompletedSession} día(s)"
@@ -197,6 +207,40 @@ class CoachFactsFormatter
         foreach ($aggregates->lastLoadByExerciseId as $exerciseId => $lastLoad) {
             $best = $aggregates->bestRecentLoadByExerciseId[$exerciseId] ?? null;
             $lines[] = "- ejercicio id={$exerciseId}: última carga registrada={$lastLoad}kg".($best !== null ? ", mejor carga reciente={$best}kg" : '');
+        }
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Hito — Historial de progreso por período. `context->periodMetrics` ya
+     * trae los 3 conteos REALES (`COUNT()` sin `LIMIT`, vía
+     * `TrainingSessionMetrics`, uno por `TrainingPeriod::label` conocido) —
+     * esta sección es la ÚNICA fuente que el prompt de `CoachService` debe
+     * usar para responder "cuántas sesiones completaste", nunca el
+     * CONTEXTO DE RAZONAMIENTO de arriba (acotado, no es un total real).
+     *
+     * La línea de "PERÍODO SOLICITADO DETECTADO" solo aparece cuando
+     * `TrainingPeriodDetector` encontró una expresión inequívoca en el
+     * mensaje actual — su ausencia es, en sí misma, la señal de "sin
+     * período explícito, usa el fallback last_4_weeks" (mismo criterio que
+     * `formatPendingReminderSuggestion()`/`formatConversationReinforcementHint()`).
+     */
+    private function formatPeriodMetrics(CoachContext $context): string
+    {
+        if ($context->periodMetrics === []) {
+            return '';
+        }
+
+        $lines = ['MÉTRICAS REALES DE SESIONES COMPLETADAS (conteos exactos — úsalos SIEMPRE que te pregunten cuántas sesiones completó/entrenó, nunca los cuentes tú mismo a partir del CONTEXTO DE RAZONAMIENTO):'];
+
+        $lines[] = '- esta semana: '.($context->periodMetrics['current_week'] ?? 0);
+        $lines[] = '- últimas 4 semanas: '.($context->periodMetrics['last_4_weeks'] ?? 0);
+        $lines[] = '- histórico total: '.($context->periodMetrics['all_time'] ?? 0);
+
+        if ($context->requestedPeriod !== null) {
+            $periodLabel = self::PERIOD_SPANISH[$context->requestedPeriod] ?? $context->requestedPeriod;
+            $lines[] = "PERÍODO SOLICITADO DETECTADO: {$periodLabel} — si la pregunta es sobre progreso, usa ese número de arriba, no otro.";
         }
 
         return implode("\n", $lines);

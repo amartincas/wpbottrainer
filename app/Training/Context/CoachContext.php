@@ -35,6 +35,16 @@ use App\Training\Support\TrainingHistoryContext;
  * `TrainingProfile.coach_conversation_reinforced`, si corresponde pedirle a
  * la IA que incluya el refuerzo de conversación libre dentro de
  * `training_reply` — la IA nunca decide esto por su cuenta.
+ *
+ * `periodMetrics`/`requestedPeriod` (Hito — Historial de progreso por
+ * período) — HECHOS estructurados más, mismo criterio: `CoachContextProvider`
+ * ya calculó, vía `TrainingSessionMetrics`/`TrainingPeriodResolver` (sin
+ * IA, sin `LIMIT`, independiente de `historyContext`), el conteo REAL de
+ * sesiones completadas para cada período de `TrainingPeriod::label`
+ * conocido, y detectó (vía `TrainingPeriodDetector`, determinista) si el
+ * mensaje actual pidió explícitamente uno de ellos. La IA nunca calcula
+ * estos números ni decide el período — solo elige, entre HECHOS ya
+ * resueltos, cuál citar.
  */
 final readonly class CoachContext
 {
@@ -55,6 +65,11 @@ final readonly class CoachContext
      *         no encontró ningún candidato (el bloque SÍ se incluye, con la variante de
      *         "sin candidatos" — la ausencia de candidatos nunca equivale a ausencia del
      *         bloque de evaluación); no vacío si hay candidatos reales. Ver docs/DECISIONS.md.
+     * @param  array<string, int>  $periodMetrics  keyed por `TrainingPeriod::label`
+     *         ('current_week'/'last_4_weeks'/'all_time') → conteo real de sesiones
+     *         completadas en ese período — siempre las 3 claves presentes.
+     * @param  ?string  $requestedPeriod  label detectado por `TrainingPeriodDetector` en
+     *         el mensaje actual, o `null` si no se detectó ninguno (fallback: `last_4_weeks`).
      */
     public function __construct(
         public array $profileSnapshot,
@@ -65,5 +80,7 @@ final readonly class CoachContext
         public ?PendingReminderSuggestion $pendingReminderSuggestion = null,
         public ?array $activeFaqs = null,
         public bool $needsConversationReinforcement = false,
+        public array $periodMetrics = [],
+        public ?string $requestedPeriod = null,
     ) {}
 }
