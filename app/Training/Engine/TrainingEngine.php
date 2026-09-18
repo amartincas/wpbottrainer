@@ -62,13 +62,16 @@ class TrainingEngine
     private const RECENT_SESSIONS_LOOKBACK = 5;
 
     /**
-     * Hito 8.4: cuántas de las sesiones más recientes cuentan para penalizar
-     * (nunca excluir) un ejercicio por repetido — ver sortCandidates(). Un
-     * valor bajo a propósito: con el catálogo real actual (1 ejercicio en
-     * producción, ver docs/DECISIONS.md D034) un valor alto dejaría la
-     * anti-repetición sin ningún candidato "no repetido" para desempatar.
+     * Hito — Exercise Variety & Selection (MVP). Base del decaimiento
+     * exponencial de `varietyScore()` — ver ese método para la fórmula
+     * completa. `0.6` es un PARÁMETRO OPERATIVO ajustable del MVP, elegido
+     * para que la pendiente entre sesiones sea suave y perceptible dentro
+     * de la ventana de `RECENT_SESSIONS_LOOKBACK` (posición 0 → 1.0,
+     * posición 4 → 0.1296) — NO representa ninguna recomendación
+     * científica de recuperación, aprendizaje motor ni periodización.
+     * Ajustable sin migración, igual que `GOAL_DEFAULTS`.
      */
-    private const ANTI_REPETITION_LOOKBACK_SESSIONS = 2;
+    private const VARIETY_DECAY = 0.6;
 
     private const DIFFICULTY_ORDER = [
         'beginner' => 0,
@@ -341,13 +344,17 @@ class TrainingEngine
      *    descanso, ver GOAL_DEFAULTS), no sobre qué ejercicios se eligen;
      *    esa es una decisión de modelado explícita, documentada en
      *    docs/DECISIONS.md D034, no una omisión.
-     * 4. Anti-repetición: SOLO desempata entre ejercicios ya empatados en
-     *    foco y nivel — nunca puede hacer que un ejercicio de un nivel de
-     *    foco inferior, o con peor ajuste de nivel, le gane a uno mejor por
-     *    el solo hecho de ser distinto. Esto es exactamente la salvaguarda
-     *    pedida: al ordenar primero por nivel de foco y luego por ajuste de
-     *    nivel, la anti-repetición nunca alcanza a comparar dos ejercicios
-     *    que no eran ya intercambiables en esas dos dimensiones.
+     * 4. Variedad (Hito Exercise Variety & Selection, MVP — reemplaza la
+     *    anti-repetición binaria anterior): SOLO desempata entre ejercicios
+     *    ya empatados en foco y nivel — nunca puede hacer que un ejercicio
+     *    de un nivel de foco inferior, o con peor ajuste de nivel, le gane
+     *    a uno mejor por tener menos exposición reciente. Se mide con
+     *    `varietyScore()`, un score continuo de exposición reciente sobre
+     *    `$recentSessions` (ver ese método) — nunca un corte binario. Al
+     *    ordenar primero por nivel de foco y luego por ajuste de nivel, la
+     *    variedad nunca alcanza a comparar dos ejercicios que no eran ya
+     *    intercambiables en esas dos dimensiones — misma salvaguarda de
+     *    siempre, ahora con un criterio continuo en vez de booleano.
      * 5. Determinismo: último desempate por id ascendente — la misma
      *    combinación de perfil/catálogo/historial produce siempre la misma
      *    sesión.
@@ -379,13 +386,6 @@ class TrainingEngine
      */
     private function selectExercises(TrainingProfile $profile, string $focus, Collection $recentSessions, Contact $contact): Collection
     {
-        $recentlyUsedExerciseIds = $recentSessions
-            ->take(self::ANTI_REPETITION_LOOKBACK_SESSIONS)
-            ->flatMap(fn (WorkoutSession $session) => $session->workoutExercises->pluck('exercise_id'))
-            ->unique()
-            ->values()
-            ->all();
-
         $eligible = Exercise::query()
             ->where('is_active', true)
             ->get()
@@ -417,9 +417,9 @@ class TrainingEngine
             // fuera de los 3 niveles — no es candidato para ESTA sesión.
         }
 
-        $primaryTier = $this->sortCandidates($primaryTier, $profile, $recentlyUsedExerciseIds);
-        $secondaryTier = $this->sortCandidates($secondaryTier, $profile, $recentlyUsedExerciseIds);
-        $generalTier = $this->sortCandidates($generalTier, $profile, $recentlyUsedExerciseIds);
+        $primaryTier = $this->sortCandidates($primaryTier, $profile, $recentSessions);
+        $secondaryTier = $this->sortCandidates($secondaryTier, $profile, $recentSessions);
+        $generalTier = $this->sortCandidates($generalTier, $profile, $recentSessions);
 
         $exercisesPerSession = $this->exercisesForTargetDuration($profile, $contact->tenant);
 
@@ -492,25 +492,85 @@ class TrainingEngine
     }
 
     /**
-     * @param  array<int, int>  $recentlyUsedExerciseIds
      * @return Collection<int, Exercise>
      */
-    private function sortCandidates(Collection $candidates, TrainingProfile $profile, array $recentlyUsedExerciseIds): Collection
+    private function sortCandidates(Collection $candidates, TrainingProfile $profile, Collection $recentSessions): Collection
     {
-        return $candidates->sort(function (Exercise $a, Exercise $b) use ($profile, $recentlyUsedExerciseIds) {
+        // Score de variedad calculado UNA vez por candidato (no en cada
+        // comparación de sort()) — mismo resultado, menos trabajo repetido.
+        $varietyScores = $candidates->mapWithKeys(
+            fn (Exercise $exercise) => [$exercise->id => $this->varietyScore($exercise->id, $recentSessions)]
+        );
+
+        return $candidates->sort(function (Exercise $a, Exercise $b) use ($profile, $varietyScores) {
             $levelDiff = $this->difficultyMatchRank($a, $profile) <=> $this->difficultyMatchRank($b, $profile);
             if ($levelDiff !== 0) {
                 return $levelDiff;
             }
 
-            $repeatA = in_array($a->id, $recentlyUsedExerciseIds, true) ? 1 : 0;
-            $repeatB = in_array($b->id, $recentlyUsedExerciseIds, true) ? 1 : 0;
-            if ($repeatA !== $repeatB) {
-                return $repeatA <=> $repeatB;
+            $varietyDiff = $varietyScores[$a->id] <=> $varietyScores[$b->id];
+            if ($varietyDiff !== 0) {
+                return $varietyDiff;
             }
 
             return $a->id <=> $b->id;
         })->values();
+    }
+
+    /**
+     * Hito — Exercise Variety & Selection (MVP). Reemplaza la señal binaria
+     * anterior (`ANTI_REPETITION_LOOKBACK_SESSIONS`/`recentlyUsedExerciseIds`)
+     * por un score CONTINUO de exposición reciente:
+     *
+     *     varietyScore = Σ VARIETY_DECAY ^ posición
+     *
+     * calculado EXCLUSIVAMENTE sobre `$recentSessions` — el mismo historial
+     * ligero que `selectExercises()` ya recibía como parámetro, sin ninguna
+     * consulta nueva, sin `TrainingHistoryContextProvider`, sin
+     * `ProgressionEvaluator`, sin `exerciseLog`/`exerciseSets`. `posición`
+     * es el índice dentro de esa colección (0 = sesión más reciente, hasta
+     * 4 = la 5ta, límite dado por `RECENT_SESSIONS_LOOKBACK`, sin cambios)
+     * — ya viene ordenada por `scheduled_at` DESC por la propia query de
+     * `decideNextSession()`, nunca se reordena aquí. Un ejercicio ausente
+     * de esas <=5 sesiones obtiene `0.0`, indistinguible de uno nunca
+     * utilizado — limitación conocida del MVP, no un error (la "memoria"
+     * de variedad no puede ser mayor que la profundidad de `$recentSessions`).
+     *
+     * Cada sesión aporta COMO MÁXIMO un término, sin importar cuántas filas
+     * `WorkoutExercise` con ese mismo `exercise_id` existan dentro de ella
+     * — de ahí el `->unique()`: el score representa exposición POR SESIÓN,
+     * nunca cantidad de filas.
+     *
+     * `scheduled_at`, no `completed_at`: `$recentSessions` ya ordena por
+     * `scheduled_at` (semántica de secuencia de decisiones de
+     * `TrainingEngine`, igual que `mostNeglectedFocus()`) — sin cambios,
+     * ver docs/DECISIONS.md de este hito para el análisis de equivalencia
+     * de orden entre ambos campos.
+     *
+     * Determinista: función pura de `$recentSessions` (ya ordenada por la
+     * query) y `VARIETY_DECAY` (constante fija) — misma entrada, mismo
+     * resultado, siempre. Solo desempata DENTRO de `sortCandidates()`,
+     * después de `difficultyMatchRank` — nunca puede superar esa prioridad
+     * ni el tier de foco (ver docblock de `selectExercises()`).
+     */
+    private function varietyScore(int $exerciseId, Collection $recentSessions): float
+    {
+        $score = 0.0;
+
+        foreach ($recentSessions->values() as $position => $session) {
+            $exerciseIdsInSession = $session->workoutExercises->pluck('exercise_id')->unique();
+
+            if ($exerciseIdsInSession->contains($exerciseId)) {
+                $score += self::VARIETY_DECAY ** $position;
+            }
+        }
+
+        // Redondeo de higiene numérica (no de negocio): la suma de potencias
+        // de un decimal en coma flotante puede producir ruido de
+        // representación (ej. 1.3599999999999999 en vez de 1.36) — se
+        // redondea a 6 decimales, muy por debajo de cualquier diferencia
+        // significativa entre candidatos, nunca afecta el desempate real.
+        return round($score, 6);
     }
 
     /**
