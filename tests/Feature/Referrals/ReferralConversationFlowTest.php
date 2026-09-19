@@ -33,9 +33,16 @@ beforeEach(function () {
  * Mejora UX (ver docs/DECISIONS.md): con wa_display_phone_number
  * configurado, la invitación ya NO se envía como texto plano con la URL
  * cruda — se envía como un mensaje interactivo nativo `cta_url` (botón),
- * vía WhatsAppService::sendCtaUrlMessage(). El código, el número del
- * tenant y el mensaje prellenado (?text=...) siguen viajando exactamente
- * igual que antes, ahora dentro de interactive.action.parameters.url.
+ * vía WhatsAppService::sendCtaUrlMessage(). El código y el mensaje
+ * prellenado (?text=...) siguen viajando exactamente igual que antes,
+ * ahora dentro de interactive.action.parameters.url.
+ *
+ * Corrección post-prueba manual (ver docs/DECISIONS.md): la URL del botón
+ * es `https://wa.me/?text=...` — SIN número — para que WhatsApp deje
+ * elegir a quién reenviárselo (Click to Chat sin destinatario). Un
+ * wa.me/<número>?text=... abriría el chat DIRECTO con ese número, que es
+ * exactamente lo que un hallazgo real de prueba manual detectó como
+ * incorrecto para este caso de uso.
  */
 it('gives a brand-new contact a native CTA URL button (not plain text) when wa_display_phone_number is configured', function () {
     $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573009998877', 'name' => 'WpbotTrainer - Test']);
@@ -46,7 +53,7 @@ it('gives a brand-new contact a native CTA URL button (not plain text) when wa_d
     $code = ReferralCode::where('contact_id', $contact->id)->sole();
 
     $expectedInvitationText = "Hola! Quiero unirme a {$tenant->name} 💪 {$code->code}";
-    $expectedUrl = 'https://wa.me/573009998877?text='.rawurlencode($expectedInvitationText);
+    $expectedUrl = 'https://wa.me/?text='.rawurlencode($expectedInvitationText);
 
     Http::assertSent(function ($request) use ($code, $expectedUrl) {
         $data = $request->data();
@@ -67,25 +74,53 @@ it('keeps the button label within Meta\'s 20-character limit', function () {
 });
 
 /**
- * Aislamiento por tenant: dos tenants con su propio wa_display_phone_number
- * deben producir cada uno la URL con SU PROPIO número — nunca el de otro
- * tenant ni un valor mezclado.
+ * Regresión explícita del hallazgo de prueba manual: la URL del CTA debe
+ * ser exactamente el formato Click-to-Chat "sin destinatario" de Meta
+ * (wa.me/?text=...) — nunca wa.me/<número del tenant>?text=..., que abre
+ * el chat directo con ese número en vez de dejar elegir a quién
+ * reenviárselo el referente.
  */
-it('uses each tenant\'s own wa_display_phone_number in the CTA URL, never mixing tenants', function () {
+it('uses the "no recipient" wa.me Click-to-Chat format — never the tenant phone number — in the CTA URL', function () {
+    $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573113079583']);
+
+    sendReferralTestMessage($tenant, '573001119999', 'mi código');
+
+    Http::assertSent(function ($request) use ($tenant) {
+        $url = data_get($request->data(), 'interactive.action.parameters.url', '');
+
+        return str_contains($url, 'wa.me/?text=')
+            && ! str_contains($url, 'wa.me/'.$tenant->wa_display_phone_number.'?text=');
+    });
+});
+
+/**
+ * Aislamiento por tenant: dos tenants distintos, cada uno con su propio
+ * wa_display_phone_number configurado (usado solo como señal para decidir
+ * si se muestra el CTA — YA NO forma parte de la URL), deben producir cada
+ * uno una invitación con el CÓDIGO propio de SU contacto, nunca el del
+ * otro tenant, y ninguna de las dos URLs debe contener ningún número de
+ * teléfono de tenant.
+ */
+it('isolates each tenant\'s own referral code in the CTA URL, never mixing tenants, and never embeds any tenant phone number', function () {
     $tenantA = Tenant::factory()->create(['wa_display_phone_number' => '573001110001']);
     $tenantB = Tenant::factory()->create(['wa_display_phone_number' => '573002220002']);
 
     sendReferralTestMessage($tenantA, '573005550001', 'mi código');
     sendReferralTestMessage($tenantB, '573005550002', 'mi código');
 
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), 'wa.me/573001110001'));
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), 'wa.me/573002220002'));
+    $contactA = Contact::where('tenant_id', $tenantA->id)->where('customer_phone', '573005550001')->sole();
+    $codeA = ReferralCode::where('contact_id', $contactA->id)->sole();
+    $contactB = Contact::where('tenant_id', $tenantB->id)->where('customer_phone', '573005550002')->sole();
+    $codeB = ReferralCode::where('contact_id', $contactB->id)->sole();
 
-    // Ningún request de un tenant contiene el número del otro.
-    $requestsToTenantAUrl = collect(Http::recorded())
-        ->map(fn ($pair) => data_get($pair[0]->data(), 'interactive.action.parameters.url', ''))
-        ->filter(fn ($url) => str_contains($url, 'wa.me/573001110001'));
-    expect($requestsToTenantAUrl->every(fn ($url) => ! str_contains($url, '573002220002')))->toBeTrue();
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), $codeA->code));
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), $codeB->code));
+
+    // Ninguna URL de ningún tenant contiene ningún número de teléfono de tenant.
+    $allCtaUrls = collect(Http::recorded())
+        ->map(fn ($pair) => data_get($pair[0]->data(), 'interactive.action.parameters.url'))
+        ->filter();
+    expect($allCtaUrls->contains(fn ($url) => str_contains($url, '573001110001') || str_contains($url, '573002220002')))->toBeFalse();
 });
 
 /**

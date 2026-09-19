@@ -95,7 +95,14 @@ class ReferralHandler implements HandlerInterface
         $invitationText = "Hola! Quiero unirme a {$tenant->name} 💪 {$code->code}";
 
         if (! empty($tenant->wa_display_phone_number)) {
-            $invitationUrl = 'https://wa.me/'.$tenant->wa_display_phone_number.'?text='.rawurlencode($invitationText);
+            // Hallazgo real de prueba manual (ver docs/DECISIONS.md): un
+            // wa.me/<número>?text=... abre el chat DIRECTO con ese número —
+            // wa_display_phone_number sigue siendo la señal que decide si
+            // se muestra el CTA, pero la URL del botón NUNCA debe llevar
+            // ningún número, para que WhatsApp deje elegir a QUIÉN
+            // reenviárselo el referente (Click to Chat sin destinatario,
+            // documentado por Meta: wa.me/?text=...).
+            $invitationUrl = 'https://wa.me/?text='.rawurlencode($invitationText);
             $this->replyWithInvitationCta($from, $tenant, $code->code, $invitationUrl);
         } else {
             $lines = ['🎁 Aquí está tu invitación — compártela con tus amigos:'];
