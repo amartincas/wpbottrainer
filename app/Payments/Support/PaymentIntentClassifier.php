@@ -5,17 +5,17 @@ namespace App\Payments\Support;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\IntentClassifierInterface;
-use App\Models\Contact;
-use App\Payments\Enums\PaymentStatus;
 
 /**
  * Clasificación determinista de "¿este mensaje es de Payments?" (Hito 8) —
- * mismo patrón que App\Training\Support\TrainingIntentClassifier: palabras
- * clave + una señal de estado (aquí, un Payment abierto sin resolver) que
- * clasifica como Payment aunque el mensaje no tenga ninguna palabra clave
- * ni texto (ej. el usuario solo envía la foto del comprobante, sin
- * mensaje). Sin esa señal de estado, una imagen sin caption nunca
- * clasificaría como Payment.
+ * solo keywords explícitas en el texto del mensaje.
+ *
+ * Precedencia de Intents (ver docs/DECISIONS.md) — la señal de estado (un
+ * Payment abierto sin resolver, que clasifica como Payment aunque el
+ * mensaje no tenga ninguna palabra clave ni texto) se extrajo a
+ * PaymentContextualIntentClassifier — un classifier separado, registrado en
+ * el último tier del Router, para que una señal explícita de OTRO dominio
+ * (Referral, CustomerCare) nunca pierda frente a este contexto.
  */
 class PaymentIntentClassifier implements IntentClassifierInterface
 {
@@ -35,25 +35,6 @@ class PaymentIntentClassifier implements IntentClassifierInterface
             }
         }
 
-        $contact = Contact::where('tenant_id', $context->tenant->id)
-            ->where('customer_phone', $context->message->from)
-            ->first();
-
-        if ($contact === null) {
-            return null;
-        }
-
-        if ($this->hasOpenPayment($contact)) {
-            return Intent::Payment;
-        }
-
         return null;
-    }
-
-    private function hasOpenPayment(Contact $contact): bool
-    {
-        return $contact->payments()
-            ->whereIn('status', [PaymentStatus::Pending, PaymentStatus::UnderReview])
-            ->exists();
     }
 }

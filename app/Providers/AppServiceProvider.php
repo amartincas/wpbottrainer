@@ -18,6 +18,7 @@ use App\CustomerCare\Support\FaqLikelyIntentClassifier;
 use App\Handlers\FallbackChatHandler;
 use App\Payments\Events\PaymentConfirmed;
 use App\Payments\Handlers\PaymentHandler;
+use App\Payments\Support\PaymentContextualIntentClassifier;
 use App\Payments\Support\PaymentIntentClassifier;
 use App\Referrals\Handlers\ReferralHandler;
 use App\Referrals\Listeners\ApplyReferralRewardOnPaymentConfirmed;
@@ -38,6 +39,7 @@ use App\Training\Onboarding\Requirements\PrimaryFocusRequirement;
 use App\Training\Onboarding\Requirements\SessionsPerWeekRequirement;
 use App\Training\Onboarding\Requirements\TrainingLocationRequirement;
 use App\Training\Support\SafetySignalPreRoutingScreen;
+use App\Training\Support\TrainingContextualIntentClassifier;
 use App\Training\Support\TrainingIntentClassifier;
 use App\Training\Support\TrainingReminderExecutor;
 use Carbon\CarbonImmutable;
@@ -61,24 +63,63 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        // Core messaging Router: ordered list of IntentClassifier classes
-        // (not instances) tried in sequence — the first one that recognizes
-        // the message wins, defaulting to Intent::FallbackChat if none do.
-        // See App\Core\Messaging\Router and docs/DECISIONS.md (D019).
-        // Hito 14 — CustomerServiceEscalationIntentClassifier se prueba
-        // PRIMERO: una petición explícita de ayuda humana debe ganarle a
-        // cualquier colisión accidental de keyword con otro dominio (ej.
-        // "Tengo un problema con el pago" contiene "pago", keyword de
-        // PaymentIntentClassifier — ver docs/DECISIONS.md).
-        // FaqLikelyIntentClassifier se prueba ÚLTIMO, justo antes del
-        // default a FallbackChat — su heurística es deliberadamente amplia
-        // y nunca debe competir con Training/Payment/Referral.
+        // Core messaging Router: ordered TIERS of IntentClassifier classes
+        // (not instances) — un tier se agota completo (todos sus
+        // classifiers devuelven null) antes de intentar el siguiente;
+        // dentro de un tier, el primero que reconoce el mensaje gana. Router
+        // por defecto a Intent::FallbackChat si ningún tier produce nada.
+        // Ver App\Core\Messaging\Router y docs/DECISIONS.md (D019, y la
+        // decisión de precedencia de Intents en 3 tiers).
+        //
+        // Tier 0 — Escalamiento explícito: CustomerServiceEscalationIntentClassifier
+        // se prueba PRIMERO: una petición explícita de ayuda humana debe
+        // ganarle a cualquier colisión accidental de keyword con otro
+        // dominio (ej. "Tengo un problema con el pago" contiene "pago",
+        // keyword de PaymentIntentClassifier — ver docs/DECISIONS.md).
+        //
+        // Tier 1 — Señales EXPLÍCITAS de dominio: Training/Payment/Referral
+        // (solo su mitad de keywords — ver TrainingIntentClassifier/
+        // PaymentIntentClassifier).
+        //
+        // Tier 2 — Señales CONTEXTUALES (solo por estado del Contact, sin
+        // ninguna señal textual): TrainingContextualIntentClassifier/
+        // PaymentContextualIntentClassifier. Un Contact con cualquier estado
+        // contextual de Training/Payment sigue pudiendo expresar
+        // explícitamente OTRA intención (ej. "Quiero invitar a un amigo"
+        // con una WorkoutSession pendiente termina en Referral, no en
+        // Training) — el bug real que esta estructura corrige. Verificado
+        // por IntentPrecedenceArchTest que ningún classifier marcado
+        // ContextualIntentClassifierInterface aparece en el Tier 0/1.
+        //
+        // Tier 3 — FaqLikelyIntentClassifier, en su PROPIO tier, el ÚLTIMO
+        // de todos (hallazgo real durante la validación de esta corrección,
+        // no parte del diseño original): su heurística reconoce palabras
+        // interrogativas sueltas ("que", "qué", "cómo", "cuánto"...), que
+        // aparecen con frecuencia DENTRO de mensajes reales de Training
+        // ("Creo QUE hice 10 repeticiones", "¿CUÁNTO me queda de
+        // membresía?", "¿por QUÉ ese peso?"). Si compartiera el Tier 1 con
+        // Training/Payment/Referral (como se planteó originalmente),
+        // interceptaría esos mensajes ANTES de que el Tier 2 (contextual)
+        // tuviera oportunidad de reconocerlos como Training — regresión
+        // real, detectada por 10 tests preexistentes que empezaron a fallar
+        // (ExecutionReportFlowTest, TrainingHandlerInterruptionTest,
+        // ProductInteractionDuringTrialE2ETest, entre otros). Faq debe
+        // seguir siendo el ÚLTIMO recurso de clasificación textual, después
+        // de que TODA señal de dominio (explícita o contextual) ya haya
+        // tenido su oportunidad — nunca al mismo nivel que ellas. Ver
+        // docs/DECISIONS.md.
         $this->app->singleton(Router::class, fn ($app) => new Router($app, [
-            CustomerServiceEscalationIntentClassifier::class,
-            TrainingIntentClassifier::class,
-            PaymentIntentClassifier::class,
-            ReferralIntentClassifier::class,
-            FaqLikelyIntentClassifier::class,
+            [CustomerServiceEscalationIntentClassifier::class],
+            [
+                TrainingIntentClassifier::class,
+                PaymentIntentClassifier::class,
+                ReferralIntentClassifier::class,
+            ],
+            [
+                TrainingContextualIntentClassifier::class,
+                PaymentContextualIntentClassifier::class,
+            ],
+            [FaqLikelyIntentClassifier::class],
         ]));
 
         // Core messaging PreRoutingScreener (Hito 7, extendido Hito 13,

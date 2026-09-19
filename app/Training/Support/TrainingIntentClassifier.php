@@ -5,10 +5,6 @@ namespace App\Training\Support;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\IntentClassifierInterface;
-use App\Models\Contact;
-use App\Models\Reminder;
-use App\Training\Enums\TrainingAccessStatus;
-use App\Training\Enums\WorkoutSessionStatus;
 
 /**
  * Deterministic classification of "does this message belong to Training?" —
@@ -17,15 +13,14 @@ use App\Training\Enums\WorkoutSessionStatus;
  * LLM-assisted classification (for phrasings the keyword list misses) is a
  * documented future enhancement, not built here — see docs/DECISIONS.md.
  *
- * A Contact already mid-onboarding (an existing but incomplete
- * TrainingProfile) is also routed to training even without a keyword match,
- * so answering an onboarding question ("3 veces por semana") continues the
- * flow instead of falling back to general conversation.
- *
- * Hito 6: the same reasoning extends to a Contact with a pending
- * WorkoutSession — a report like "Sentadilla 10x40" or "ya terminé" rarely
- * contains any of the keywords below, but it is unambiguously a Training
- * message once a workout was actually delivered and is awaiting a report.
+ * Precedencia de Intents (ver docs/DECISIONS.md) — este classifier es
+ * EXCLUSIVAMENTE explícito: solo reconoce keywords en el texto del mensaje.
+ * La clasificación puramente contextual (un Contact mid-onboarding, con una
+ * WorkoutSession pendiente, con acceso activo esperando su primer
+ * entrenamiento, o esperando respuesta a un Reminder) se extrajo a
+ * TrainingContextualIntentClassifier — un classifier separado, registrado en
+ * el último tier del Router, para que una señal explícita de OTRO dominio
+ * (Referral, Payment, CustomerCare) nunca pierda frente a este contexto.
  *
  * Works on already-transcribed text: Ingest (Core) transcribes audio into
  * IngestedMessage->messageBody before Router ever runs, so this classifier
@@ -51,78 +46,6 @@ class TrainingIntentClassifier implements IntentClassifierInterface
             }
         }
 
-        $contact = Contact::where('tenant_id', $context->tenant->id)
-            ->where('customer_phone', $context->message->from)
-            ->first();
-
-        if ($contact === null) {
-            return null;
-        }
-
-        if ($this->hasIncompleteOnboarding($contact)
-            || $this->hasPendingWorkoutSession($contact)
-            || $this->hasActiveAccessAwaitingFirstWorkout($contact)
-            || $this->hasAwaitingReminderResponse($contact)
-        ) {
-            return Intent::Training;
-        }
-
         return null;
-    }
-
-    private function hasIncompleteOnboarding(Contact $contact): bool
-    {
-        $profile = $contact->trainingProfile;
-
-        return $profile !== null && ! $profile->isOnboardingComplete($contact);
-    }
-
-    private function hasPendingWorkoutSession(Contact $contact): bool
-    {
-        return $contact->workoutSessions()
-            ->where('status', WorkoutSessionStatus::Scheduled)
-            ->exists();
-    }
-
-    /**
-     * Hito 8.1 — hallazgo real del E2E comercial: un contacto con acceso
-     * recién activado, sin ninguna WorkoutSession todavía, respondiendo a la
-     * invitación a entrenar ("Sí", "Dale", "Listo") no contiene ninguna
-     * palabra clave de Training ni cae en ninguna otra señal de estado — el
-     * Router caía por defecto a fallback_chat (el chat genérico heredado de
-     * ecommerce), que improvisaba una respuesta sin autoridad real.
-     *
-     * Deliberadamente acotada a este caso concreto (acceso activo + cero
-     * WorkoutSession) — NO es un mecanismo general de "qué se espera del
-     * usuario en cualquier estado conversacional futuro"; eso es una
-     * responsabilidad de un futuro motor de Proactivity/estado
-     * conversacional, no de este clasificador determinista. Ver
-     * docs/DECISIONS.md.
-     */
-    private function hasActiveAccessAwaitingFirstWorkout(Contact $contact): bool
-    {
-        $access = $contact->trainingAccess;
-
-        if ($access === null || $access->status !== TrainingAccessStatus::Active) {
-            return false;
-        }
-
-        return ! $contact->workoutSessions()->exists();
-    }
-
-    /**
-     * Hito 10 (D053) — mismo patrón que `hasActiveAccessAwaitingFirstWorkout()`:
-     * una ventana corta y acotada, no un mecanismo general de "qué se espera
-     * del usuario". Sin esto, la respuesta a un `Reminder` recién disparado
-     * ("sí", "dale") podría perderse en `FallbackChatHandler` — misma clase
-     * de brecha ya documentada para "sesión recién completada" (deuda de
-     * Bloque 9), cerrada aquí para el caso de recordatorios.
-     */
-    private function hasAwaitingReminderResponse(Contact $contact): bool
-    {
-        return Reminder::where('contact_id', $contact->id)
-            ->whereNotNull('awaiting_response_until')
-            ->where('awaiting_response_until', '>', now())
-            ->exists();
     }
 }

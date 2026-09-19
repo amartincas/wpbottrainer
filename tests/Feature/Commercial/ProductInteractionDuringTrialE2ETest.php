@@ -78,18 +78,44 @@ it('Training -> FAQ -> Customer Service, all during a real automatically-granted
     expect($workoutExercise->fresh()->exerciseLog)->not->toBeNull();
 });
 
-it('Ronda 2 (Cambio 6): a referral question answers with the FAQ, never the membership_status stub, when the AI correctly follows the new priority rule', function () {
-    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+/**
+ * Ronda 2 (Cambio 6) — ACTUALIZADO tras la corrección de precedencia de
+ * Intents (ver docs/DECISIONS.md, "Precedencia de Intents: explícito antes
+ * que contextual"). Versión original de este test (pre-corrección): el
+ * Router enrutaba CUALQUIER mensaje a Training sin necesitar ninguna
+ * keyword mientras hubiera una WorkoutSession "en curso"
+ * (TrainingIntentClassifier mezclaba señal explícita y contextual en un
+ * mismo classifier, evaluado antes que Referral) — por eso "¿puedo referir
+ * a alguien?" terminaba dentro de TrainingHandler/CoachService,
+ * respondiendo con la FAQ configurada.
+ *
+ * Con la política ya aprobada, `ReferralIntentClassifier` (Tier 1,
+ * explícito) reconoce la keyword `'referir'` ANTES de que
+ * `TrainingContextualIntentClassifier` (Tier 2) tenga oportunidad de
+ * evaluar la WorkoutSession en curso — el mensaje ahora clasifica como
+ * Intent::Referral, y termina en `ReferralHandler::handleGetInvitation()`
+ * (100% determinista, sin IA), no en la FAQ de Training. Este test verifica
+ * exactamente esa conducta aprobada — la sesión en curso se conserva a
+ * propósito en el fixture para probar que Referral gana AUNQUE ese
+ * contexto de Training esté activo, que es el punto central de la
+ * corrección.
+ *
+ * Nota de deuda pendiente (ver docs/DECISIONS.md): la keyword `'referir'`,
+ * sola y sin frase, no distingue un comando ("quiero referir a alguien")
+ * de una pregunta informativa ("¿puedo referir a alguien?") — ambas
+ * terminan hoy en la misma plantilla fija de invitación. Esto es una
+ * limitación de especificidad de `ReferralIntentClassifier` ya identificada
+ * y documentada, explícitamente fuera del alcance de este hito.
+ */
+it('Ronda 2 (Cambio 6): a referral question is classified as Referral (explicit keyword wins over Training context) and gets the invitation, never the FAQ stub or membership_status', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai', 'wa_display_phone_number' => '573009998877']);
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001150003']);
     TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]);
     app(TrainingAccessAdministrationService::class)->grantAutomaticTrial($contact, 5);
 
-    // Mismo fixture que el primer test de este archivo: una sesión
-    // "en curso" (Scheduled, con su único ejercicio ya reportado) es lo
-    // que hace que el Router (TrainingIntentClassifier::hasPendingWorkoutSession())
-    // enrute ESTE mensaje a Training sin ninguna palabra clave — sin esto,
-    // una pregunta de referidos sin keyword de entrenamiento nunca llegaría
-    // a TrainingHandler/CoachService en absoluto.
+    // Sesión "en curso" (Scheduled, con su único ejercicio ya reportado) —
+    // se conserva a propósito: prueba que Referral gana aunque este
+    // contexto de Training esté activo (ver docblock arriba).
     $exercise = Exercise::factory()->create(['tracking_type' => TrackingType::RepsAndLoad]);
     $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
     $workoutExercise = WorkoutExercise::factory()->create([
@@ -99,31 +125,23 @@ it('Ronda 2 (Cambio 6): a referral question answers with the FAQ, never the memb
     $reportLog = \App\Models\ExerciseLog::factory()->create(['workout_exercise_id' => $workoutExercise->id]);
     \App\Models\ExerciseSet::factory()->create(['exercise_log_id' => $reportLog->id]);
 
-    // Contenido corregido (Cambio 6) — solo dentro de este test, vía
-    // factory; la FAQ real de staging queda fuera de alcance de esta
-    // implementación.
-    $faq = Faq::factory()->create([
-        'tenant_id' => $tenant->id,
-        'question' => '¿Puedo recomendar o referir a mis amigos para que prueben la aplicación?',
-        'answer' => 'Sí, puedes invitar a tus amigos. Escríbeme mi código y te doy tu enlace de invitación personal.',
-    ]);
-
-    // Simula un LLM que ya sigue la nueva regla del prompt: responde con la
-    // FAQ y NUNCA incluye "membership_status" para la misma pregunta.
-    Http::fake([
-        'api.openai.com/v1/chat/completions' => Http::response(['choices' => [['message' => ['content' => json_encode([
-            'safety_signal_text' => null, 'intents' => ['faq_question'], 'training_reply' => null,
-            'faq_match_id' => $faq->id, 'faq_response_text' => 'Sí, puedes invitar a tus amigos. Te doy tu enlace personal.',
-            'customer_service_needed' => false, 'customer_service_message' => null,
-        ])]]]], 200),
-        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
-    ]);
+    // ReferralHandler::handleGetInvitation() es 100% determinista — no
+    // llama a la IA. Solo se fakea el envío saliente de WhatsApp.
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
 
     commercialInteractionMessage($tenant, '573001150003', '¿puedo referir a alguien?');
 
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Te doy tu enlace personal.'));
-    // El stub fijo de membership_status NUNCA debe acompañar la respuesta.
+    $code = \App\Referrals\Models\ReferralCode::where('contact_id', $contact->id)->sole();
+    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), $code->code)
+        && str_contains(data_get($request->data(), 'text.body', ''), 'wa.me/573009998877'));
+    // Ni el stub fijo de membership_status ni ninguna llamada a la IA
+    // deben haber ocurrido — ReferralHandler nunca las usa.
     Http::assertNotSent(fn ($request) => str_contains(data_get($request->data(), 'text.body', ''), 'Todavía no puedo resolver esto directamente'));
+    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'openai.com'));
+
+    // La sesión de Training en curso permanece intacta — ReferralHandler
+    // nunca la toca (aislamiento ya verificado por ReferralIsolationArchTest).
+    expect($session->fresh()->status)->toBe(WorkoutSessionStatus::Scheduled);
 });
 
 it('H16.1 (Cambio 3): marks coach_conversation_reinforced=true only after the AI confirms the reinforcement was actually included in training_reply', function () {

@@ -3,13 +3,17 @@
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\IngestedMessage;
 use App\Core\Messaging\Intent;
-use App\Models\Contact;
 use App\Models\Tenant;
-use App\Models\TrainingAccess;
-use App\Models\TrainingProfile;
-use App\Models\WorkoutSession;
 use App\Training\Support\TrainingIntentClassifier;
 
+/**
+ * Precedencia de Intents (ver docs/DECISIONS.md): TrainingIntentClassifier
+ * es EXCLUSIVAMENTE explícito (solo keywords) desde la corrección de
+ * precedencia — su parte contextual (onboarding incompleto, WorkoutSession
+ * pendiente, acceso activo esperando primer entrenamiento, Reminder
+ * esperando respuesta) se extrajo a TrainingContextualIntentClassifier, ver
+ * TrainingContextualIntentClassifierTest.php.
+ */
 function makeClassifierContext(Tenant $tenant, ?string $body, string $from = '573001112233'): ExecutionContext
 {
     return new ExecutionContext(
@@ -35,92 +39,17 @@ it('declines (returns null) for unrelated messages with no training signal', fun
     expect($classifier->classify(makeClassifierContext($tenant, null)))->toBeNull();
 });
 
-it('keeps classifying as training for a contact mid-onboarding, even without keywords', function () {
+it('never consults Contact/state — declines for a contact mid-onboarding without a keyword (moved to TrainingContextualIntentClassifier)', function () {
+    // Regresión explícita de la extracción: antes de la corrección de
+    // precedencia, este mismo caso clasificaba como Training AQUÍ. Ahora
+    // TrainingIntentClassifier ya no consulta Contact en absoluto — ver
+    // TrainingContextualIntentClassifierTest.php para el comportamiento
+    // contextual real (que se preserva sin cambios, solo en otra clase).
     $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->incomplete()->create(['contact_id' => $contact->id]);
+    $contact = \App\Models\Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    \App\Models\TrainingProfile::factory()->incomplete()->create(['contact_id' => $contact->id]);
 
     $classifier = new TrainingIntentClassifier;
 
-    // Answering "3 veces por semana" has no training keyword at all.
-    expect($classifier->classify(makeClassifierContext($tenant, '3 veces por semana', '573001112233')))->toBe(Intent::Training);
-});
-
-it('does not force training for a contact whose onboarding is already complete', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Hola', '573001112233')))->toBeNull();
-});
-
-// ── hasActiveAccessAwaitingFirstWorkout (Hito 8.1) ──────────────────────
-
-it('forces training for a contact with active access and zero WorkoutSessions, even with no keywords', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    TrainingAccess::factory()->create(['contact_id' => $contact->id]);
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'algo sin ninguna palabra clave', '573001112233')))->toBe(Intent::Training);
-});
-
-it('classifies "Sí" as training right after activation, with no WorkoutSession yet', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    TrainingAccess::factory()->create(['contact_id' => $contact->id]);
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Sí', '573001112233')))->toBe(Intent::Training);
-});
-
-it('classifies "Dale" as training right after activation, with no WorkoutSession yet', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    TrainingAccess::factory()->create(['contact_id' => $contact->id]);
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Dale', '573001112233')))->toBe(Intent::Training);
-});
-
-it('does not apply the first-workout signal for a contact with no TrainingAccess at all', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    // Sin TrainingAccess.
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Sí', '573001112233')))->toBeNull();
-});
-
-it('does not apply the first-workout signal once a WorkoutSession already exists', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    TrainingAccess::factory()->create(['contact_id' => $contact->id]);
-    WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]); // ya tuvo al menos un entrenamiento
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Sí', '573001112233')))->toBeNull();
-});
-
-it('does not apply the first-workout signal when access is not Active (e.g. expired)', function () {
-    $tenant = Tenant::factory()->create();
-    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
-    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
-    TrainingAccess::factory()->expired()->create(['contact_id' => $contact->id]);
-
-    $classifier = new TrainingIntentClassifier;
-
-    expect($classifier->classify(makeClassifierContext($tenant, 'Sí', '573001112233')))->toBeNull();
+    expect($classifier->classify(makeClassifierContext($tenant, '3 veces por semana', '573001112233')))->toBeNull();
 });
