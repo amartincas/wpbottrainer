@@ -9,7 +9,9 @@ use App\Models\Payment;
 use App\Referrals\Models\Referral;
 use App\Referrals\Models\ReferralCode;
 use App\Referrals\Models\ReferralReward;
+use App\Referrals\Support\ReferralCodeGenerator;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 
 /**
  * Cobertura end-to-end del flujo real de Referrals (Hito 13), vía el Job
@@ -25,6 +27,23 @@ function sendReferralTestMessage(Tenant $tenant, string $from, string $body): vo
     app()->call([$job, 'handle']);
 }
 
+/**
+ * Mejora UX "Mensaje 1 vs Mensaje 2" (ver docs/DECISIONS.md) — helpers para
+ * decodificar, en los tests, el contenido REAL de cada capa: la URL del
+ * CTA de A contiene el Mensaje 1 (humano, codificado); el Mensaje 1
+ * contiene, anidado y codificado a su vez, el enlace directo al bot con el
+ * Mensaje 2 (técnico, con el código).
+ */
+function decodeCtaShareableMessage(string $ctaUrl): string
+{
+    return rawurldecode(Str::after($ctaUrl, 'https://wa.me/?text='));
+}
+
+function extractNestedBotLink(string $shareableMessage): string
+{
+    return Str::after($shareableMessage, '👉 Comienza aquí: ');
+}
+
 beforeEach(function () {
     Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
 });
@@ -33,39 +52,61 @@ beforeEach(function () {
  * Mejora UX (ver docs/DECISIONS.md): con wa_display_phone_number
  * configurado, la invitación ya NO se envía como texto plano con la URL
  * cruda — se envía como un mensaje interactivo nativo `cta_url` (botón),
- * vía WhatsAppService::sendCtaUrlMessage(). El código y el mensaje
- * prellenado (?text=...) siguen viajando exactamente igual que antes,
- * ahora dentro de interactive.action.parameters.url.
+ * vía WhatsAppService::sendCtaUrlMessage().
  *
- * Corrección post-prueba manual (ver docs/DECISIONS.md): la URL del botón
- * es `https://wa.me/?text=...` — SIN número — para que WhatsApp deje
- * elegir a quién reenviárselo (Click to Chat sin destinatario). Un
- * wa.me/<número>?text=... abriría el chat DIRECTO con ese número, que es
- * exactamente lo que un hallazgo real de prueba manual detectó como
- * incorrecto para este caso de uso.
+ * "Mensaje 1 vs Mensaje 2" (ver docs/DECISIONS.md) — la URL del CTA de A
+ * (`https://wa.me/?text=...`, Click to Chat SIN destinatario) contiene el
+ * Mensaje 1: humano, con el nombre de A, explica qué es el tenant, y trae
+ * ANIDADO un enlace DIRECTO al bot (`https://wa.me/<número>?text=...`) con
+ * el Mensaje 2 técnico (el que el bot recibirá) — que es el único que
+ * contiene el código. Es lo que A realmente COMPARTE al elegir
+ * destinatarios: WhatsApp reenvía texto plano, sin ningún botón (los
+ * botones interactivos nunca sobreviven un reenvío).
  */
-it('gives a brand-new contact a native CTA URL button (not plain text) when wa_display_phone_number is configured', function () {
-    $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573009998877', 'name' => 'WpbotTrainer - Test']);
+it('gives a brand-new contact a native CTA URL button whose shared content includes their name, an explanation, and a direct bot link with the code', function () {
+    $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573113079583', 'name' => 'WpbotTrainer - Produccion']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233', 'customer_name' => 'Juan']);
 
     sendReferralTestMessage($tenant, '573001112233', 'Dame mi código de referido');
 
-    $contact = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->sole();
     $code = ReferralCode::where('contact_id', $contact->id)->sole();
 
-    $expectedInvitationText = "Hola! Quiero unirme a {$tenant->name} 💪 {$code->code}";
-    $expectedUrl = 'https://wa.me/?text='.rawurlencode($expectedInvitationText);
-
-    Http::assertSent(function ($request) use ($code, $expectedUrl) {
+    Http::assertSent(function ($request) use ($code, $tenant) {
         $data = $request->data();
 
-        return ($data['type'] ?? null) === 'interactive'
-            && data_get($data, 'interactive.type') === 'cta_url'
-            && data_get($data, 'interactive.action.name') === 'cta_url'
-            && data_get($data, 'interactive.action.parameters.display_text') === 'Invitar a un amigo'
-            && data_get($data, 'interactive.action.parameters.url') === $expectedUrl
-            && str_contains(data_get($data, 'interactive.body.text', ''), $code->code)
-            // Nunca debe enviarse como texto plano cuando hay CTA.
-            && ! array_key_exists('text', $data);
+        if (($data['type'] ?? null) !== 'interactive'
+            || data_get($data, 'interactive.type') !== 'cta_url'
+            || data_get($data, 'interactive.action.name') !== 'cta_url'
+            || data_get($data, 'interactive.action.parameters.display_text') !== 'Invitar a un amigo'
+            || array_key_exists('text', $data) // nunca texto plano cuando hay CTA
+        ) {
+            return false;
+        }
+
+        $ctaUrl = data_get($data, 'interactive.action.parameters.url', '');
+
+        // Mensaje 1 (lo que A comparte): "no destinatario" + nombre + explicación.
+        if (! str_starts_with($ctaUrl, 'https://wa.me/?text=')) {
+            return false;
+        }
+        $shareableMessage = decodeCtaShareableMessage($ctaUrl);
+        if (! str_contains($shareableMessage, 'Juan quiere invitarte a')
+            || ! str_contains($shareableMessage, $tenant->name)
+        ) {
+            return false;
+        }
+
+        // Mensaje 2 anidado (lo que el bot recibirá): número real del
+        // tenant + el código intacto.
+        $botLink = extractNestedBotLink($shareableMessage);
+        if (! str_starts_with($botLink, 'https://wa.me/'.$tenant->wa_display_phone_number.'?text=')) {
+            return false;
+        }
+        $prefilledBotMessage = rawurldecode(Str::after($botLink, '?text='));
+
+        return str_contains($prefilledBotMessage, $code->code)
+            // Extraíble por el mecanismo REAL de detección, no solo str_contains.
+            && (new ReferralCodeGenerator)->extractFromText($prefilledBotMessage) === $code->code;
     });
 });
 
@@ -74,34 +115,33 @@ it('keeps the button label within Meta\'s 20-character limit', function () {
 });
 
 /**
- * Regresión explícita del hallazgo de prueba manual: la URL del CTA debe
- * ser exactamente el formato Click-to-Chat "sin destinatario" de Meta
- * (wa.me/?text=...) — nunca wa.me/<número del tenant>?text=..., que abre
- * el chat directo con ese número en vez de dejar elegir a quién
- * reenviárselo el referente.
+ * Fallback determinista de nombre (ver docs/DECISIONS.md): customer_name
+ * NO está garantizado — cualquier Contact puede pedir su código sin haber
+ * pasado por el onboarding de Training que lo asigna. Sin nombre, el
+ * Mensaje 1 usa una frase impersonal, nunca un relleno como "null" o
+ * "Un amigo".
  */
-it('uses the "no recipient" wa.me Click-to-Chat format — never the tenant phone number — in the CTA URL', function () {
+it('falls back to an impersonal intro in the shareable message when the referrer has no customer_name', function () {
     $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573113079583']);
+    Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112255', 'customer_name' => null]);
 
-    sendReferralTestMessage($tenant, '573001119999', 'mi código');
+    sendReferralTestMessage($tenant, '573001112255', 'mi código');
 
-    Http::assertSent(function ($request) use ($tenant) {
-        $url = data_get($request->data(), 'interactive.action.parameters.url', '');
+    Http::assertSent(function ($request) {
+        $shareableMessage = decodeCtaShareableMessage(data_get($request->data(), 'interactive.action.parameters.url', ''));
 
-        return str_contains($url, 'wa.me/?text=')
-            && ! str_contains($url, 'wa.me/'.$tenant->wa_display_phone_number.'?text=');
+        return str_starts_with($shareableMessage, 'Hola! Te están invitando a')
+            && ! str_contains($shareableMessage, 'null');
     });
 });
 
 /**
  * Aislamiento por tenant: dos tenants distintos, cada uno con su propio
- * wa_display_phone_number configurado (usado solo como señal para decidir
- * si se muestra el CTA — YA NO forma parte de la URL), deben producir cada
- * uno una invitación con el CÓDIGO propio de SU contacto, nunca el del
- * otro tenant, y ninguna de las dos URLs debe contener ningún número de
- * teléfono de tenant.
+ * wa_display_phone_number, deben producir cada uno un Mensaje 1 cuyo
+ * enlace anidado apunta a SU PROPIO número, con el código de SU contacto
+ * — nunca mezclados.
  */
-it('isolates each tenant\'s own referral code in the CTA URL, never mixing tenants, and never embeds any tenant phone number', function () {
+it('isolates each tenant\'s own phone number and referral code in the nested bot link, never mixing tenants', function () {
     $tenantA = Tenant::factory()->create(['wa_display_phone_number' => '573001110001']);
     $tenantB = Tenant::factory()->create(['wa_display_phone_number' => '573002220002']);
 
@@ -113,38 +153,37 @@ it('isolates each tenant\'s own referral code in the CTA URL, never mixing tenan
     $contactB = Contact::where('tenant_id', $tenantB->id)->where('customer_phone', '573005550002')->sole();
     $codeB = ReferralCode::where('contact_id', $contactB->id)->sole();
 
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), $codeA->code));
-    Http::assertSent(fn ($request) => str_contains(data_get($request->data(), 'interactive.action.parameters.url', ''), $codeB->code));
-
-    // Ninguna URL de ningún tenant contiene ningún número de teléfono de tenant.
-    $allCtaUrls = collect(Http::recorded())
+    $botLinks = collect(Http::recorded())
         ->map(fn ($pair) => data_get($pair[0]->data(), 'interactive.action.parameters.url'))
-        ->filter();
-    expect($allCtaUrls->contains(fn ($url) => str_contains($url, '573001110001') || str_contains($url, '573002220002')))->toBeFalse();
+        ->filter()
+        ->map(fn ($ctaUrl) => extractNestedBotLink(decodeCtaShareableMessage($ctaUrl)));
+
+    expect($botLinks->contains(fn ($link) => str_starts_with($link, 'https://wa.me/573001110001?text=') && str_contains(rawurldecode($link), $codeA->code)))->toBeTrue();
+    expect($botLinks->contains(fn ($link) => str_starts_with($link, 'https://wa.me/573002220002?text=') && str_contains(rawurldecode($link), $codeB->code)))->toBeTrue();
+    // Ningún enlace de A contiene el número o código de B, y viceversa.
+    expect($botLinks->contains(fn ($link) => str_starts_with($link, 'https://wa.me/573001110001?text=') && str_contains(rawurldecode($link), $codeB->code)))->toBeFalse();
 });
 
 /**
- * URL encoding: el texto prellenado contiene espacios, "!", el emoji 💪 y
- * el código — todos deben seguir codificados exactamente como los produce
- * rawurlencode() (misma función ya usada antes de este cambio, sin
- * reconstrucción manual).
+ * URL encoding en las dos capas: el Mensaje 1 (con nombre, acentos, emoji)
+ * codifica correctamente la URL exterior; el Mensaje 2 anidado (con el
+ * código) codifica correctamente la URL interior — ambas con
+ * rawurlencode(), sin reconstrucción manual.
  */
-it('keeps the exact rawurlencode() output for spaces, punctuation, emoji, and the referral code in the CTA URL', function () {
+it('keeps the exact rawurlencode() output on both the outer (shareable) and nested (bot) URLs', function () {
     $tenant = Tenant::factory()->create(['wa_display_phone_number' => '573009998877', 'name' => 'WpbotTrainer - Produccion']);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112299', 'customer_name' => 'José']);
 
     sendReferralTestMessage($tenant, '573001112299', 'mi código');
 
-    $contact = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573001112299')->sole();
     $code = ReferralCode::where('contact_id', $contact->id)->sole();
 
     $expectedInvitationText = "Hola! Quiero unirme a {$tenant->name} 💪 {$code->code}";
-    $expectedEncoded = rawurlencode($expectedInvitationText);
+    $expectedBotLink = 'https://wa.me/573009998877?text='.rawurlencode($expectedInvitationText);
+    $expectedShareableMessage = "Hola! José quiere invitarte a {$tenant->name}, tu entrenador de ejercicios personalizado 💪\n\n👉 Comienza aquí: {$expectedBotLink}";
+    $expectedCtaUrl = 'https://wa.me/?text='.rawurlencode($expectedShareableMessage);
 
-    Http::assertSent(function ($request) use ($expectedEncoded) {
-        $url = data_get($request->data(), 'interactive.action.parameters.url', '');
-
-        return str_ends_with($url, '?text='.$expectedEncoded);
-    });
+    Http::assertSent(fn ($request) => data_get($request->data(), 'interactive.action.parameters.url') === $expectedCtaUrl);
 });
 
 it('falls back to plain text (no CTA, no link) when the tenant has no wa_display_phone_number configured', function () {

@@ -95,15 +95,27 @@ class ReferralHandler implements HandlerInterface
         $invitationText = "Hola! Quiero unirme a {$tenant->name} 💪 {$code->code}";
 
         if (! empty($tenant->wa_display_phone_number)) {
-            // Hallazgo real de prueba manual (ver docs/DECISIONS.md): un
-            // wa.me/<número>?text=... abre el chat DIRECTO con ese número —
+            // Mejora UX (ver docs/DECISIONS.md) — dos mensajes distintos,
+            // no confundir:
+            //   Mensaje 2 ($invitationText/$botLink): técnico, lo recibe el
+            //     BOT una vez B/C confirman. Contiene el código.
+            //   Mensaje 1 ($shareableMessage): humano, lo que A realmente
+            //     COMPARTE al elegir destinatarios — WhatsApp reenvía texto
+            //     plano, sin ningún botón (los botones interactivos nunca
+            //     sobreviven un reenvío, limitación de la plataforma). Debe
+            //     ser autosuficiente: quién invita, qué es el tenant, y un
+            //     enlace DIRECTO al bot (con número, a diferencia del CTA de
+            //     A) para que B/C solo tengan que pulsar Enviar.
+            //
             // wa_display_phone_number sigue siendo la señal que decide si
-            // se muestra el CTA, pero la URL del botón NUNCA debe llevar
-            // ningún número, para que WhatsApp deje elegir a QUIÉN
-            // reenviárselo el referente (Click to Chat sin destinatario,
-            // documentado por Meta: wa.me/?text=...).
-            $invitationUrl = 'https://wa.me/?text='.rawurlencode($invitationText);
-            $this->replyWithInvitationCta($from, $tenant, $code->code, $invitationUrl);
+            // se muestra el CTA. La URL del CTA de A (Click to Chat SIN
+            // destinatario, hallazgo real de prueba manual — ver
+            // docs/DECISIONS.md) sigue sin número — ahora apunta al Mensaje
+            // 1, no al Mensaje 2.
+            $botLink = 'https://wa.me/'.$tenant->wa_display_phone_number.'?text='.rawurlencode($invitationText);
+            $shareableMessage = $this->buildShareableInvitationMessage($contact, $tenant, $botLink);
+            $ctaUrl = 'https://wa.me/?text='.rawurlencode($shareableMessage);
+            $this->replyWithInvitationCta($from, $tenant, $code->code, $ctaUrl);
         } else {
             $lines = ['🎁 Aquí está tu invitación — compártela con tus amigos:'];
             $lines[] = 'Diles que escriban este mensaje cuando nos escriban:';
@@ -119,6 +131,24 @@ class ReferralHandler implements HandlerInterface
         }
 
         Log::info('REFERRAL_INVITATION_SENT', ['tenant_id' => $tenant->id, 'contact_id' => $contact->id, 'code' => $code->code]);
+    }
+
+    /**
+     * Mensaje 1 (ver docs/DECISIONS.md) — el contenido que A efectivamente
+     * COMPARTE con B/C al tocar el CTA y elegir destinatarios. Nombre del
+     * referente con fallback determinista si `customer_name` no está
+     * disponible (no está garantizado — ver docblock de la clase: cualquier
+     * Contact puede pedir su código sin haber pasado por onboarding).
+     */
+    private function buildShareableInvitationMessage(Contact $contact, Tenant $tenant, string $botLink): string
+    {
+        $referrerName = trim((string) $contact->customer_name);
+
+        $intro = $referrerName !== ''
+            ? "Hola! {$referrerName} quiere invitarte a {$tenant->name}, tu entrenador de ejercicios personalizado 💪"
+            : "Hola! Te están invitando a {$tenant->name}, tu entrenador de ejercicios personalizado 💪";
+
+        return "{$intro}\n\n👉 Comienza aquí: {$botLink}";
     }
 
     /**
@@ -138,7 +168,7 @@ class ReferralHandler implements HandlerInterface
     private function replyWithInvitationCta(string $from, Tenant $tenant, string $code, string $invitationUrl): void
     {
         $bodyText = "🎁 Aquí está tu invitación:\n\n"
-            ."Comparte este botón con tu amigo. Al abrirlo, WhatsApp preparará automáticamente el mensaje para unirse a {$tenant->name}.\n\n"
+            .'Comparte este botón con tu amigo — podrás elegir a quién enviársela.'."\n\n"
             ."Código de referido: {$code}\n\n"
             .'Cuando activen su membresía, ganas días adicionales de entrenamiento. 💪';
 
