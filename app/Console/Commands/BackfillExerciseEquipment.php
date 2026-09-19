@@ -25,6 +25,16 @@ use Illuminate\Console\Command;
  * todo proveedor deba soportar) — se apoya en que el Normalizer resuelto
  * exponga `mapEquipment(?string): array` (hoy solo `YMoveExerciseNormalizer`
  * lo hace); si un proveedor no lo expone, se informa y no se toca nada.
+ *
+ * Hito 15.2 — mismo mecanismo, reutilizado sin crear nada nuevo: corrige
+ * el caso `'bodyweight' => []` que conflacionaba "sin equipo" real con
+ * "bodyweight + aparato/superficie fija" (ver
+ * `YMoveExerciseNormalizer::refineBodyweightEquipment()`). Se pasa el
+ * `provider_metadata` completo de cada fila a `mapEquipment()` porque el
+ * refinamiento necesita leer texto (title/description/instructions/
+ * importantPoints), no solo el string de `equipment`. Solo toca
+ * `exercises.equipment_needed` — nunca `workout_exercises`,
+ * `exercise_snapshot` ni ningún registro de ejecución histórica.
  */
 class BackfillExerciseEquipment extends Command
 {
@@ -55,11 +65,18 @@ class BackfillExerciseEquipment extends Command
 
         foreach ($exercises as $exercise) {
             $rawEquipment = $exercise->provider_metadata['equipment'] ?? null;
-            $recomputed = $normalizer->mapEquipment($rawEquipment);
+            // Hito 15.2 — se pasa el payload completo (mismo shape que en un
+            // sync real) para que el refinamiento de "bodyweight" pueda leer
+            // title/description/instructions/importantPoints. Ver
+            // YMoveExerciseNormalizer::refineBodyweightEquipment().
+            $recomputed = $normalizer->mapEquipment($rawEquipment, $exercise->provider_metadata ?? []);
+            $previous = $exercise->equipment_needed ?? [];
 
-            if ($recomputed !== ($exercise->equipment_needed ?? [])) {
+            if ($recomputed !== $previous) {
                 $exercise->update(['equipment_needed' => $recomputed]);
                 $changed++;
+                $rawLabel = $rawEquipment ?? '(sin valor)';
+                $this->line("  #{$exercise->id} {$exercise->name} [raw='{$rawLabel}']: ".json_encode($previous).' -> '.json_encode($recomputed));
             }
         }
 

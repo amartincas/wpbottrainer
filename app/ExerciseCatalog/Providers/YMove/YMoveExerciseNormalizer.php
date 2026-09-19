@@ -66,6 +66,10 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
      * ("sin equipo") sin que nada lo señalara. `pull-up bar` de YMove usa
      * guion, se preserva tal cual apareció en la auditoría original.
      *
+     * Hito 15.2 — `'bodyweight' => []` es un caso especial: no es un valor
+     * "final" como los otros 24, sino el único que puede refinarse más
+     * (ver `refineBodyweightEquipment()`) antes de resolverse a `[]`.
+     *
      * @var array<string, Equipment[]>
      */
     private const EQUIPMENT_MAP = [
@@ -106,6 +110,49 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
      */
     private const TIME_BASED_KEYWORDS = ['stretch', 'pose', 'hold', 'plank', 'mobility', 'isometric'];
 
+    /**
+     * Hito 15.2 — auditoría real (incidente contact_id=28, exercise_id=710
+     * "Pull Up (Neutral Grip)" servido a una usuaria `home` sin barra de
+     * dominadas): YMove etiqueta como `equipment: "bodyweight"` tanto
+     * ejercicios que genuinamente no requieren nada (Bodyweight Squat,
+     * Plank, Push Ups...) como ejercicios que SÍ exigen un aparato o
+     * superficie fija pese a no sumar carga externa (Pull Up → barra de
+     * dominadas; Bench Dips → banco). YMove no expone ningún campo
+     * estructurado que distinga ambos casos — se comparó `category` y
+     * `exerciseType` entre ejemplos confirmados de cada grupo y no hay
+     * ningún patrón consistente. La única señal disponible es el texto.
+     *
+     * Auditados los 61 ejercicios activos de YMove (Hito 15.2): de 15 con
+     * `equipment` crudo `bodyweight`, solo 2 tienen una frase inequívoca
+     * en su texto (710 → "pull-up bar" en la description; 81 → "bench" en
+     * el name/description) — los otros 13 no mencionan ningún aparato/
+     * superficie y correctamente siguen resolviendo a `[]`.
+     *
+     * Deliberadamente conservador y acotado a frases que ya son claves
+     * reales de EQUIPMENT_MAP (no se inventa vocabulario nuevo): un
+     * término de una sola palabra común como "step" queda fuera a
+     * propósito porque en este mismo catálogo aparece como VERBO ("step
+     * your feet back" en Burpee/Half burpee) — un regex de palabra
+     * completa no alcanza para desambiguar un verbo de un sustantivo en
+     * inglés, y la instrucción explícita es no adivinar ante ambigüedad.
+     * Si evidencia real futura (ej. al revisar el catálogo hoy inactivo)
+     * muestra un caso inequívoco para box/chair/wall/dip station/etc., se
+     * añade aquí una entrada más siguiendo el mismo patrón.
+     *
+     * Ante más de una señal distinta en el mismo texto se devuelven TODAS
+     * (equipment_needed ya admite múltiples valores) en vez de elegir una
+     * arbitrariamente. Ante ninguna señal reconocida se devuelve `[]` — el
+     * ejercicio se preserva como "bodyweight puro", sujeto a la misma
+     * revisión humana que ya aplica al resto del catálogo antes de
+     * `activate()`.
+     *
+     * @var array<string, Equipment>
+     */
+    private const BODYWEIGHT_APPARATUS_SIGNALS = [
+        '/\bpull[- ]up bar\b/i' => Equipment::PullUpBar,
+        '/\bbench\b/i' => Equipment::Bench,
+    ];
+
     public function normalize(ProviderExerciseData $raw): NormalizedExerciseData
     {
         $data = $raw->raw;
@@ -121,7 +168,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
 
         $muscleGroupCoarse = self::MUSCLE_GROUP_COARSE_MAP[$muscleGroupKey] ?? ($muscleGroupKey ?? 'core');
 
-        $equipmentNeeded = $this->mapEquipment($data['equipment'] ?? null);
+        $equipmentNeeded = $this->mapEquipment($data['equipment'] ?? null, $data);
 
         // Pass-through directo — YMove ya devolvió `difficulty: null` en la
         // prueba técnica real (Barbell Hip Thrust); nunca se infiere.
@@ -158,22 +205,64 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
     /**
      * Hito 9.3 (post-deploy) — extraído a método público (antes en línea
      * dentro de normalize()) para que un backfill local (ej.
-     * `exercises:renormalize-equipment`) pueda re-derivar
-     * `equipment_needed` de ejercicios YA sincronizados a partir del
-     * `equipment` crudo que cada fila ya conserva en `provider_metadata`
-     * — sin volver a llamar a YMove. Misma tabla, mismo resultado que
-     * durante un sync real.
+     * `exercises:backfill-equipment`) pueda re-derivar `equipment_needed`
+     * de ejercicios YA sincronizados a partir del `equipment` crudo que
+     * cada fila ya conserva en `provider_metadata` — sin volver a llamar a
+     * YMove. Misma tabla, mismo resultado que durante un sync real.
      *
+     * Hito 15.2 — segundo parámetro opcional (compatible hacia atrás: todo
+     * llamador que solo pasaba el string crudo sigue funcionando igual,
+     * ahora simplemente sin refinamiento de `bodyweight`). Cuando se
+     * provee, es el payload crudo COMPLETO del ejercicio (mismo shape que
+     * `provider_metadata`, ya que es literalmente ese valor en un
+     * backfill) — necesario porque distinguir "bodyweight puro" de
+     * "bodyweight + aparato" exige leer texto (title/description/
+     * instructions/importantPoints), no solo el string de equipment. Ver
+     * `refineBodyweightEquipment()`.
+     *
+     * @param  array<string, mixed>|null  $rawData
      * @return array<int, string> valores de App\Training\Enums\Equipment
      */
-    public function mapEquipment(?string $rawEquipment): array
+    public function mapEquipment(?string $rawEquipment, ?array $rawData = null): array
     {
         $key = mb_strtolower(trim((string) $rawEquipment));
+
+        if ($key === 'bodyweight' && $rawData !== null) {
+            $refined = $this->refineBodyweightEquipment($rawData);
+
+            if ($refined !== []) {
+                return array_map(fn (Equipment $e) => $e->value, $refined);
+            }
+        }
 
         return array_map(
             fn (Equipment $e) => $e->value,
             self::EQUIPMENT_MAP[$key] ?? []
         );
+    }
+
+    /**
+     * @param  array<string, mixed>  $data  payload crudo completo del ejercicio
+     * @return array<int, Equipment>
+     */
+    private function refineBodyweightEquipment(array $data): array
+    {
+        $haystack = mb_strtolower(implode(' ', array_filter([
+            $data['title'] ?? '',
+            $data['description'] ?? '',
+            implode(' ', array_filter($data['instructions'] ?? [], 'is_string')),
+            implode(' ', array_filter($data['importantPoints'] ?? [], 'is_string')),
+        ])));
+
+        $found = [];
+
+        foreach (self::BODYWEIGHT_APPARATUS_SIGNALS as $pattern => $equipment) {
+            if (preg_match($pattern, $haystack) === 1) {
+                $found[] = $equipment;
+            }
+        }
+
+        return $found;
     }
 
     private function inferTrackingType(array $data): TrackingType

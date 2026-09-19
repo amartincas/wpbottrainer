@@ -183,3 +183,125 @@ it('degrades to no-equipment (never crashes) for a raw equipment string outside 
 
     expect($normalized->equipmentNeeded)->toBe([]);
 });
+
+/**
+ * Hito 15.2 — auditoría real (contact_id=28, exercise_id=710 servido a una
+ * usuaria `home` sin barra de dominadas). YMove etiqueta `equipment:
+ * "bodyweight"` tanto para ejercicios sin nada que necesitar como para
+ * ejercicios que exigen un aparato/superficie fija. Ver
+ * YMoveExerciseNormalizer::refineBodyweightEquipment().
+ */
+it('keeps true bodyweight exercises at no-equipment (case 1)', function () {
+    // Caso real del catálogo: id=102 "Bodyweight Squat" — sin ninguna
+    // mención de aparato en title/description/instructions/importantPoints.
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-102', [
+        'id' => 'id-102',
+        'title' => 'Bodyweight Squat',
+        'muscleGroup' => 'quads',
+        'equipment' => 'bodyweight',
+        'description' => 'Stand with feet shoulder-width apart, toes slightly turned out, chest up and core braced.',
+        'instructions' => ['Stand tall with feet shoulder-width apart.', 'Drive through your heels to extend the hips and knees back to standing.'],
+        'importantPoints' => ['Keep your heels flat on the floor throughout the movement.'],
+    ]));
+
+    expect($normalized->equipmentNeeded)->toBe([]);
+});
+
+it('refines a bodyweight exercise that requires a pull-up bar (case 2, real exercise_id=710)', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-710', [
+        'id' => 'id-710',
+        'title' => 'Pull Up (Neutral Grip)',
+        'muscleGroup' => 'back',
+        'equipment' => 'bodyweight',
+        'description' => 'Starting position: Hang from pull-up bar with palms facing each other, shoulder-width apart. Execution: Pull body up until chin clears bar, then lower with control.',
+        'instructions' => ['Grip the bar with palms facing each other', 'Hang with arms fully extended and shoulders engaged'],
+        'importantPoints' => ["Don't let shoulders roll forward at the bottom position"],
+    ]));
+
+    expect($normalized->equipmentNeeded)->toBe(['pull_up_bar']);
+});
+
+it('refines a bodyweight exercise that requires a bench (case 3, real exercise_id=81)', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-81', [
+        'id' => 'id-81',
+        'title' => 'Bench Dips',
+        'muscleGroup' => 'triceps',
+        'equipment' => 'bodyweight',
+        'description' => 'Starting position: Sit on the edge of a bench with hands gripping the edge beside your hips.',
+        'instructions' => ['Grip the edge of the bench with hands shoulder-width apart and slide your hips off the front of the bench.'],
+        'importantPoints' => ['Keep your back close to the bench to reduce shoulder strain.'],
+    ]));
+
+    expect($normalized->equipmentNeeded)->toBe(['bench']);
+});
+
+it('does not let a verb collide with an apparatus noun when refining bodyweight (case 4, false positives)', function () {
+    $normalizer = new YMoveExerciseNormalizer;
+
+    // Caso real: id=121 "Burpee (No jump)" — "step" aparece como verbo
+    // ("Step your right foot back"), no como el aparato "step platform".
+    $burpee = $normalizer->normalize(new ProviderExerciseData('id-121', [
+        'id' => 'id-121',
+        'title' => 'Burpee (No jump)',
+        'muscleGroup' => 'full_body',
+        'equipment' => 'bodyweight',
+        'instructions' => ['Step your right foot back into plank position, then step your left foot back to join it'],
+    ]));
+    expect($burpee->equipmentNeeded)->toBe([]);
+
+    // "tracking" no debe activar "rack".
+    $tracking = $normalizer->normalize(new ProviderExerciseData('id-tracking', [
+        'id' => 'id-tracking', 'title' => 'Something', 'muscleGroup' => 'legs', 'equipment' => 'bodyweight',
+        'importantPoints' => ['Ensure knees track in line with your toes, not caving inward.'],
+    ]));
+    expect($tracking->equipmentNeeded)->toBe([]);
+
+    // "hamstrings" no debe activar "rings".
+    $hamstrings = $normalizer->normalize(new ProviderExerciseData('id-hamstrings', [
+        'id' => 'id-hamstrings', 'title' => 'Hip hinge', 'muscleGroup' => 'legs', 'equipment' => 'bodyweight',
+        'instructions' => ['Lower until you feel tension in the hamstrings, keeping the back straight.'],
+    ]));
+    expect($hamstrings->equipmentNeeded)->toBe([]);
+});
+
+it('still resolves bodyweight to no-equipment when no raw payload is available for refinement (backward-compatible mapEquipment call)', function () {
+    $normalizer = new YMoveExerciseNormalizer;
+
+    expect($normalizer->mapEquipment('bodyweight'))->toBe([]);
+    expect($normalizer->mapEquipment('bodyweight', null))->toBe([]);
+});
+
+/**
+ * Nota sobre "24" vs. "22": la auditoría del catálogo real (Hito 15.2)
+ * confirmó 22 valores crudos DISTINTOS en los 1068 ejercicios de YMove
+ * (activos e inactivos). EQUIPMENT_MAP, en cambio, tiene 24 claves además
+ * de 'bodyweight' (25 en total) — dos más que las 22 auditadas: 'dumbbells'
+ * y 'bands' (plural), alias defensivos preexistentes desde Hito 9.3, nunca
+ * observados como valor crudo real en la auditoría completa del catálogo
+ * (que solo encontró las formas singulares 'dumbbell'/'band'). No son un
+ * error de este hito ni se tocan aquí — este test verifica el mapa TAL
+ * COMO EXISTE HOY (24 claves), no los 22 valores confirmados por auditoría.
+ */
+it('keeps the exact same mapping for the other 24 EQUIPMENT_MAP keys, unaffected by the bodyweight refinement (case 5, regression)', function () {
+    $normalizer = new YMoveExerciseNormalizer;
+
+    $cases = [
+        'barbell' => ['barbell'], 'dumbbell' => ['dumbbells'], 'dumbbells' => ['dumbbells'],
+        'kettlebell' => ['kettlebell'], 'cable' => ['cable_machine'], 'machine' => ['machine'],
+        'band' => ['resistance_bands'], 'bands' => ['resistance_bands'], 'bench' => ['bench'],
+        'pull-up bar' => ['pull_up_bar'], 'medicine ball' => ['medicine_ball'], 'mat' => ['mat'],
+        'chair' => ['chair'], 'box' => ['box'], 'weighted vest' => ['weighted_vest'],
+        'smith machine' => ['smith_machine'], 'stability ball' => ['stability_ball'], 'wall' => ['wall'],
+        'cone' => ['cone'], 'free weights' => ['free_weights'], 'landmine' => ['landmine'],
+        'foam roller' => ['foam_roller'], 'step' => ['step'], 'towel' => ['towel'],
+    ];
+
+    foreach ($cases as $raw => $expected) {
+        // Título deliberadamente genérico (sin ninguna señal de aparato) —
+        // estos 24 valores no pasan por refineBodyweightEquipment() en
+        // absoluto (solo se dispara cuando el valor crudo es 'bodyweight'),
+        // así que el título es irrelevante para el resultado esperado.
+        expect($normalizer->mapEquipment($raw, ['title' => 'Some generic exercise title']))
+            ->toBe($expected, "equipment '{$raw}' no debería verse afectado por el refinamiento de bodyweight");
+    }
+});
