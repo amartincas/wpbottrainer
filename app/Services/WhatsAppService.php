@@ -216,6 +216,114 @@ class WhatsAppService
     }
 
     /**
+     * Send a native WhatsApp interactive "Call To Action URL" message — a
+     * button with custom text ($buttonText) that opens $url when tapped,
+     * without exposing the raw URL in the message body (Hito: mejora UX de
+     * invitación de Referral — ver docs/DECISIONS.md).
+     *
+     * This is a standard Cloud API interactive message type, NOT a
+     * WhatsApp Template — it requires no Meta approval and can be sent
+     * within the 24h customer-service session window exactly like
+     * sendMessage(), because it is always a reply to an active
+     * conversation, never a business-initiated notification outside that
+     * window (that case still requires an HSM Template, unrelated to this
+     * method).
+     *
+     * Meta payload reference:
+     * POST https://graph.facebook.com/v20.0/{phone_number_id}/messages
+     * {
+     *   "messaging_product": "whatsapp",
+     *   "recipient_type": "individual",
+     *   "to": "<phone>",
+     *   "type": "interactive",
+     *   "interactive": {
+     *     "type": "cta_url",
+     *     "body": { "text": "<bodyText>" },
+     *     "action": {
+     *       "name": "cta_url",
+     *       "parameters": { "display_text": "<buttonText>", "url": "<url>" }
+     *     }
+     *   }
+     * }
+     *
+     * @param string $to         Recipient phone (E.164, e.g. "573001234567")
+     * @param string $bodyText   Text shown above the button
+     * @param string $buttonText Button label — Meta limits this to 20 characters (caller's responsibility to respect it)
+     * @param string $url        HTTPS URL opened when the button is tapped (can be fully dynamic — no Meta-side registration needed, unlike a Template's URL button)
+     * @param Tenant $tenant     Tenant instance carrying wa_access_token & wa_phone_number_id
+     * @return string|null       WAMID (Meta's message ID) on success, null on failure
+     */
+    public static function sendCtaUrlMessage(string $to, string $bodyText, string $buttonText, string $url, Tenant $tenant): ?string
+    {
+        try {
+            $endpoint = "https://graph.facebook.com/v20.0/{$tenant->wa_phone_number_id}/messages";
+
+            $payload = [
+                'messaging_product' => 'whatsapp',
+                'recipient_type' => 'individual',
+                'to' => $to,
+                'type' => 'interactive',
+                'interactive' => [
+                    'type' => 'cta_url',
+                    'body' => ['text' => $bodyText],
+                    'action' => [
+                        'name' => 'cta_url',
+                        'parameters' => [
+                            'display_text' => $buttonText,
+                            'url' => $url,
+                        ],
+                    ],
+                ],
+            ];
+
+            $response = Http::withToken($tenant->wa_access_token)
+                ->post($endpoint, $payload);
+
+            if ($response->failed()) {
+                Log::error('Error de Meta API (CTA URL)', [
+                    'tenant_id' => $tenant->id,
+                    'status' => $response->status(),
+                    'body' => $response->json()
+                ]);
+            }
+
+            Log::debug('WhatsApp CTA URL message sent', [
+                'tenant_id' => $tenant->id,
+                'to' => $to,
+                'status' => $response->status(),
+                'success' => $response->successful(),
+            ]);
+
+            if (!$response->successful()) {
+                Log::warning('WhatsApp CTA URL message send failed', [
+                    'tenant_id' => $tenant->id,
+                    'to' => $to,
+                    'status' => $response->status(),
+                    'error' => $response->json(),
+                ]);
+                return null;
+            }
+
+            $wamid = data_get($response->json(), 'messages.0.id');
+
+            Log::info('WhatsApp CTA URL message sent successfully', [
+                'tenant_id' => $tenant->id,
+                'to' => $to,
+                'wamid' => $wamid,
+            ]);
+
+            return $wamid;
+        } catch (\Exception $e) {
+            Log::error('WhatsApp CTA URL message send error', [
+                'tenant_id' => $tenant->id,
+                'to' => $to,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
      * Test WhatsApp connection with provided credentials
      *
      * @param string $phoneNumberId WhatsApp Phone Number ID
