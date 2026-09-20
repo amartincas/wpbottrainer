@@ -19,6 +19,7 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
     'summary',
     'is_processed',
     'bot_active',
+    'referral_introduction_sent_at',
 ])]
 class Contact extends Model
 {
@@ -29,6 +30,7 @@ class Contact extends Model
         return [
             'is_processed' => 'boolean',
             'bot_active' => 'boolean',
+            'referral_introduction_sent_at' => 'datetime',
         ];
     }
 

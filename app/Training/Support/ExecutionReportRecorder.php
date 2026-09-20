@@ -7,6 +7,7 @@ use App\Models\ExerciseSet;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Events\WorkoutSessionCompleted;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -220,6 +221,11 @@ class ExecutionReportRecorder
         Log::info($stillUnreported ? 'TRAINING_SESSION_PARTIALLY_COMPLETED' : 'TRAINING_SESSION_COMPLETED', [
             'workout_session_id' => $session->id,
         ]);
+
+        // Referral Introduction — único punto de despacho de este evento,
+        // atómico con la escritura que lo hace verdadero. Ver
+        // App\Training\Events\WorkoutSessionCompleted.
+        WorkoutSessionCompleted::dispatch($session);
 
         return true;
     }

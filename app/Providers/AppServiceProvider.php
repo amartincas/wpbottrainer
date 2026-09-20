@@ -22,9 +22,11 @@ use App\Payments\Support\PaymentContextualIntentClassifier;
 use App\Payments\Support\PaymentIntentClassifier;
 use App\Referrals\Handlers\ReferralHandler;
 use App\Referrals\Listeners\ApplyReferralRewardOnPaymentConfirmed;
+use App\Referrals\Listeners\SendReferralIntroductionOnWorkoutCompleted;
 use App\Referrals\Support\ReferralAttributionPreRoutingScreen;
 use App\Referrals\Support\ReferralIntentClassifier;
 use App\Training\Context\CoachContextProvider;
+use App\Training\Events\WorkoutSessionCompleted;
 use App\Training\Handlers\TrainingHandler;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
@@ -259,6 +261,12 @@ class AppServiceProvider extends ServiceProvider
         // directo (no hay EventServiceProvider en este proyecto todavía) —
         // App\Payments no se toca ni se entera de que este listener existe.
         Event::listen(PaymentConfirmed::class, ApplyReferralRewardOnPaymentConfirmed::class);
+
+        // Referral Introduction — mismo patrón exacto que el registro de
+        // arriba: App\Training no se toca ni se entera de que este listener
+        // existe (el evento es genérico, del dominio Training; el listener
+        // vive en App\Referrals y decide qué hacer con él).
+        Event::listen(WorkoutSessionCompleted::class, SendReferralIntroductionOnWorkoutCompleted::class);
 
         // Register Livewire components
         Livewire::component('whats-app-chat-center', \App\Livewire\WhatsAppChatCenter::class);
