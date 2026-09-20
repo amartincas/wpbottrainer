@@ -87,6 +87,27 @@ it('A: Training contextual (pending workout) + Referral explícito -> Referral',
     expect($intent)->toBe(Intent::Referral);
 });
 
+/**
+ * Reproducción exacta de un hallazgo real de staging (ver docs/DECISIONS.md):
+ * Contact con onboarding incompleto Y WorkoutSession pendiente A LA VEZ
+ * (ambas condiciones contextuales de Training activas simultáneamente,
+ * estado real confirmado del contacto que reportó el caso) enviando
+ * "Quiero referenciar un amigo" — antes de agregar las frases de
+ * "referenciar" a ReferralIntentClassifier, esto clasificaba como
+ * Training y terminaba en el stub fijo de "membership_status"
+ * (ConversationTurnResolver::COMMERCIAL_STUB). Debe ganar Referral.
+ */
+it('reproduces the real staging case: incomplete onboarding + pending workout together + "Quiero referenciar un amigo" -> Referral', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233']);
+    TrainingProfile::factory()->incomplete()->create(['contact_id' => $contact->id]);
+    WorkoutSession::factory()->create(['contact_id' => $contact->id]); // default: Scheduled
+
+    $intent = app(Router::class)->route(precedenceContext($tenant, 'Quiero referenciar un amigo', '573001112233'));
+
+    expect($intent)->toBe(Intent::Referral);
+});
+
 it('B: Training contextual (pending workout) + Payment explícito -> Payment', function () {
     $tenant = Tenant::factory()->create();
     makeContactWithPendingWorkoutSession($tenant, '573001112233');

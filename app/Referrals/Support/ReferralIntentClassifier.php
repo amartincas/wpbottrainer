@@ -30,6 +30,16 @@ class ReferralIntentClassifier implements IntentClassifierInterface
         // ReferralHandler porque solo el Handler, no el Classifier,
         // reconocía la frase).
         'cuántos referidos', 'cuantos referidos', 'cuántos he referido', 'cuantos he referido',
+        // Hallazgo real de staging: "referenciar" (variante coloquial de
+        // "referir" en español colombiano) no coincidía con ninguna
+        // keyword — el mensaje caía en el contexto de Training (Tier 2) en
+        // vez de Referral (Tier 1). Se agregan frases específicas, NO un
+        // "referenciar" suelto — deliberado, para no ampliar la deuda
+        // semántica ya conocida de "referir" (verbo aislado sin frase no
+        // distingue comando de pregunta informativa, ej. "¿puedo
+        // referir/referenciar a alguien?") a una segunda palabra. Ver
+        // docs/DECISIONS.md.
+        'referenciar un amigo', 'referenciar a un amigo', 'quiero referenciar',
     ];
 
     public function classify(ExecutionContext $context): ?Intent
