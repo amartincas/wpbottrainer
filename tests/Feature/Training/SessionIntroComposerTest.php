@@ -97,6 +97,43 @@ it('caps the number of real muscles mentioned to 3, in the order the exercises w
     expect($text)->not->toContain('pecho'); // 4to músculo distinto, fuera del cap de 3
 });
 
+it('Hito R1/R2/R3 — excludes Preparation/Cooldown from both the exercise count and the real-focus line, but still includes their time in the duration estimate', function () {
+    $session = introSession();
+    // Preparación con un músculo bien distinto (nunca debe aparecer en la
+    // línea de foco, ni contar en "💪 N ejercicios") — sets/rest/duración
+    // realistas de un ejercicio de apoyo (ver TrainingEngine::prescribeSupportExercise()).
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'order' => 1,
+        'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation,
+        'exercise_snapshot' => ['name' => 'Movilidad de tobillo', 'primary_muscle' => 'calves'],
+        'prescribed_sets' => 1, 'prescribed_reps' => null, 'prescribed_load' => null,
+        'prescribed_duration_seconds' => 90, 'rest_seconds' => 0,
+    ]);
+    workoutExerciseWithMuscle($session, 2, 'shoulders');
+    workoutExerciseWithMuscle($session, 3, 'quads');
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'order' => 4,
+        'phase' => \App\Training\Enums\WorkoutExercisePhase::Cooldown,
+        'exercise_snapshot' => ['name' => 'Estiramiento de espalda', 'primary_muscle' => 'back'],
+        'prescribed_sets' => 1, 'prescribed_reps' => null, 'prescribed_load' => null,
+        'prescribed_duration_seconds' => 90, 'rest_seconds' => 0,
+    ]);
+
+    $text = sessionIntroComposer()->compose($session->fresh('workoutExercises'));
+
+    // Solo los 2 Main cuentan y solo sus músculos aparecen — nunca
+    // "pantorrillas" (Preparación) ni "espalda" (Cooldown).
+    expect($text)->toContain('💪 2 ejercicios');
+    expect($text)->toContain('Hoy trabajaremos hombros y cuádriceps.');
+    expect($text)->not->toContain('pantorrillas');
+    expect($text)->not->toContain('espalda');
+
+    // Duración SÍ suma las 3 fases: 2×540s (Main, default de
+    // WorkoutExerciseFactory: 3 series×(120+60)s) + 2×90s (apoyo) = 1260s
+    // = 21 min.
+    expect($text)->toContain('⏱️ Duración aproximada: 21 minutos');
+});
+
 it('deduplicates repeated real muscles instead of counting them twice toward the cap', function () {
     $session = introSession();
     workoutExerciseWithMuscle($session, 1, 'quads');

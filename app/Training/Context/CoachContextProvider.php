@@ -16,8 +16,8 @@ use App\Models\Tenant;
 use App\Models\WhatsAppMessage;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
-use App\Training\Enums\HistoryExerciseOutcome;
 use App\Training\Enums\TrackingType;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\HistorySetEntry;
 use App\Training\Support\ProgressionEvaluation;
@@ -160,19 +160,16 @@ class CoachContextProvider implements ContextProviderInterface
     }
 
     /**
-     * Mismo criterio de derivación de outcome que D049 (sin ExerciseLog ->
-     * Unreported; con log y sin sets -> Skipped; con log y sets -> Performed)
-     * — ver docblock de la clase.
+     * Hito R1/R2/R3 — el outcome ya no se deriva aquí de forma independiente:
+     * `WorkoutExercise::historicalOutcome()` es la única fuente de esta
+     * derivación (mismo criterio que D049 para Main; `Delivered` para
+     * Preparation/Cooldown — ver docblock de ese método).
      */
     private function buildExerciseSnapshot(WorkoutExercise $workoutExercise): CoachExerciseSnapshot
     {
         $log = $workoutExercise->exerciseLog;
 
-        $outcome = match (true) {
-            $log === null => HistoryExerciseOutcome::Unreported,
-            $log->exerciseSets->isEmpty() => HistoryExerciseOutcome::Skipped,
-            default => HistoryExerciseOutcome::Performed,
-        };
+        $outcome = $workoutExercise->historicalOutcome();
 
         $sets = $log?->exerciseSets
             ->map(fn (ExerciseSet $set) => new HistorySetEntry(
@@ -185,6 +182,7 @@ class CoachContextProvider implements ContextProviderInterface
         return new CoachExerciseSnapshot(
             exerciseId: $workoutExercise->exercise_id,
             name: $workoutExercise->exercise_snapshot['name'] ?? '',
+            phase: $workoutExercise->phase,
             prescribedSets: $workoutExercise->prescribed_sets,
             prescribedReps: $workoutExercise->prescribed_reps,
             prescribedLoad: $workoutExercise->prescribed_load !== null ? (float) $workoutExercise->prescribed_load : null,
@@ -204,6 +202,11 @@ class CoachContextProvider implements ContextProviderInterface
     }
 
     /**
+     * Hito R1/R2/R3 — la progresión es EXCLUSIVA del bloque principal:
+     * Preparation/Cooldown nunca piden reporte estructurado (ver
+     * `WorkoutExercise::requiresExecutionReport()`), así que no tiene
+     * sentido evaluar progresión de carga/reps sobre ellos.
+     *
      * @return array<int, ProgressionEvaluation>
      */
     private function evaluateProgressionsFor(?CoachSessionSnapshot $currentSession, TrainingHistoryContext $historyContext): array
@@ -216,6 +219,10 @@ class CoachContextProvider implements ContextProviderInterface
 
         foreach ($currentSession->exercises as $exerciseSnapshot) {
             if ($exerciseSnapshot->exerciseId === null) {
+                continue;
+            }
+
+            if ($exerciseSnapshot->phase !== WorkoutExercisePhase::Main) {
                 continue;
             }
 

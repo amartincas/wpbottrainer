@@ -95,6 +95,10 @@ it('persists progressively answered onboarding fields turn by turn, without re-a
     // acumulación progresiva del resto de campos, no en la captura del
     // nombre (que tiene su propia cobertura dedicada).
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '573001112233', 'customer_name' => 'Ana']);
+    // Hito R1/R2/R3 — ver comentario equivalente más arriba en este
+    // archivo: TrainingEngine ya no crea una WorkoutSession sin al menos 1
+    // ejercicio de bloque principal elegible.
+    Exercise::factory()->create(['muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4']);
 
     Http::fake([
         'api.openai.com/v1/chat/completions' => Http::sequence()
@@ -290,6 +294,12 @@ it('Hito 15: grants an automatic Trial and delivers the first WorkoutSession whe
     // dejaría el screening sin responder y el perfil ya NO se consideraría
     // completo bajo el nuevo Registry.
     TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => true]); // complete, no TrainingAccess row
+    // Hito R1/R2/R3 — TrainingEngine ahora exige al menos 1 ejercicio de
+    // bloque principal elegible antes de crear una WorkoutSession (ver
+    // TrainingCatalogInsufficientException); este test verifica el
+    // mecanismo de Trial automático, no el catálogo, así que necesita un
+    // catálogo mínimo real (mismo fixture que el resto de este archivo).
+    Exercise::factory()->create(['muscle_group' => 'chest', 'name' => 'Flexiones', 'video_url' => 'https://videos.example.test/pushup.mp4']);
 
     Http::fake([
         // Onboarding ya está completo (perfil pre-sembrado), así que la

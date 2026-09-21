@@ -31,6 +31,7 @@ use App\Training\Enums\SafetyStatus;
 use App\Training\Enums\SessionCloseIntent;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingAccessStatus;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Onboarding\OnboardingConversationComposer;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
@@ -48,9 +49,11 @@ use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\SessionCloseMessageComposer;
 use App\Training\Support\SessionIntroComposer;
+use App\Training\Support\SupportPhaseConfirmationDetector;
 use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\TrialEndedMessageComposer;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
@@ -129,6 +132,18 @@ class TrainingHandler implements HandlerInterface
 {
     private const ACCESS_REQUIRED_MESSAGE = 'Tu perfil ya está listo. 💪 Para comenzar a entrenar necesitas activar '
         .'tu acceso. Escribe "quiero pagar" para ver las opciones.';
+
+    /**
+     * Hito R1/R2/R3 — mostrado cuando `TrainingEngine::decideNextSession()`
+     * lanza `TrainingCatalogInsufficientException` (catálogo elegible sin
+     * ningún ejercicio de bloque principal para este perfil/ubicación/
+     * equipamiento). Deliberadamente un mensaje DISTINTO de
+     * `ACCESS_REQUIRED_MESSAGE`: el acceso comercial del contacto es
+     * válido, el problema es de contenido, no de acceso — nunca sugiere
+     * "activa tu acceso" para esto.
+     */
+    private const CATALOG_INSUFFICIENT_MESSAGE = 'Por ahora no tengo suficientes ejercicios disponibles para armar '
+        .'tu rutina con tu perfil actual. Ya avisé a nuestro equipo — te escribo en cuanto esté resuelto.';
 
     /**
      * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
@@ -301,6 +316,7 @@ class TrainingHandler implements HandlerInterface
         private readonly TrialEndedMessageComposer $trialEndedComposer,
         private readonly SessionCloseMessageComposer $sessionCloseComposer,
         private readonly SessionIntroComposer $sessionIntroComposer,
+        private readonly SupportPhaseConfirmationDetector $supportConfirmationDetector,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -527,6 +543,40 @@ class TrainingHandler implements HandlerInterface
         // (jamás reenvía la rutina por una pregunta que no es un reporte).
         $activeSessionFragment = $this->buildContext($context, 'active_workout_session');
         $reportableExercises = $activeSessionFragment->data['unreported_exercises'] ?? [];
+        $pendingSupportExercise = $activeSessionFragment->data['pending_support_exercise'] ?? null;
+
+        // 4a. Hito R1/R2/R3 — confirmación EXPLÍCITA para avanzar más allá
+        // de un ejercicio de apoyo (Preparation/Cooldown) ya entregado, que
+        // nunca pide reporte estructurado (ver
+        // WorkoutExercise::requiresExecutionReport()). Safety (paso 1) ya se
+        // evaluó arriba, antes que este o cualquier otro detector del turno.
+        //
+        // Deliberadamente INCONDICIONAL a `$reportableExercises` — no
+        // "solo cuando esté vacío": `unreported_exercises` (arriba) lista
+        // TODO Main sin ExerciseLog en la sesión, incluidos los que
+        // TODAVÍA NO se han entregado (mismo criterio heredado de antes de
+        // este hito, ver docblock de ActiveWorkoutSessionContextProvider) —
+        // mientras un Preparation está pendiente de confirmación, el/los
+        // Main de la sesión casi siempre están así, así que exigir la
+        // lista vacía haría que este paso nunca se ejecutara para
+        // Preparation en la práctica. El invariante real de entrega
+        // progresiva garantiza que solo hay UN frente a la vez — si
+        // `pendingSupportExercise` no es null, ESE es el frente real,
+        // sin importar qué otros Main aún no entregados aparezcan en la
+        // lista. 100% determinista, sin IA: SupportPhaseConfirmationDetector
+        // nunca acepta una pregunta o un mensaje libre como confirmación —
+        // ese caso cae, sin cambios, al paso 4 siguiente (que sabe
+        // responder preguntas vía su propio `training_reply`) o al paso 5.
+        if ($pendingSupportExercise !== null && $body !== ''
+            && $this->supportConfirmationDetector->isExplicitConfirmation($body)) {
+            $workoutExercise = WorkoutExercise::find($pendingSupportExercise['workout_exercise_id']);
+
+            if ($workoutExercise !== null) {
+                $this->advancePastSupportExercise($workoutExercise, $from, $tenant, $freshContact);
+
+                return;
+            }
+        }
 
         if ($activeSessionFragment->data !== null && $reportableExercises !== [] && $body !== '') {
             $coachContext = $this->buildContext($context, 'coach_context')->data;
@@ -598,12 +648,30 @@ class TrainingHandler implements HandlerInterface
             $this->respondToDenial($e->reason, $freshContact, $from, $tenant);
 
             return;
+        } catch (TrainingCatalogInsufficientException $e) {
+            // Hito R1/R2/R3 — catálogo elegible sin ningún ejercicio de
+            // bloque principal: TrainingEngine ya garantizó que NINGUNA
+            // WorkoutSession se creó (la excepción se lanza antes de
+            // WorkoutSession::create()). Acceso comercial válido — nunca se
+            // confunde con ACCESS_REQUIRED_MESSAGE.
+            Log::warning('TRAINING_CATALOG_INSUFFICIENT', [
+                'contact_id' => $freshContact->id,
+                'elapsed_ms' => (int) round((microtime(true) - $engineStartedAt) * 1000),
+            ]);
+
+            $this->reply($from, self::CATALOG_INSUFFICIENT_MESSAGE, $tenant);
+
+            return;
         }
 
         Log::info('TRAINING_ENGINE_DECIDED', [
             'contact_id' => $freshContact->id,
             'workout_session_id' => $session->id,
             'exercise_count' => $session->workoutExercises->count(),
+            // Hito R1/R2/R3 — cuenta EXCLUSIVAMENTE Main, conservando
+            // exercise_count (total de las 3 fases) sin cambios para no
+            // romper ningún dashboard/alerta que ya lo consuma.
+            'main_exercise_count' => $session->workoutExercises->where('phase', WorkoutExercisePhase::Main)->count(),
             'elapsed_ms' => (int) round((microtime(true) - $engineStartedAt) * 1000),
         ]);
 
@@ -687,6 +755,64 @@ class TrainingHandler implements HandlerInterface
             'provider' => $exercise->provider,
             'elapsed_ms' => (int) round((microtime(true) - $videoStartedAt) * 1000),
         ]);
+    }
+
+    /**
+     * Hito R1/R2/R3 — confirmación explícita del usuario para avanzar más
+     * allá de un ejercicio de apoyo (Preparation/Cooldown) ya entregado:
+     * entrega el siguiente `WorkoutExercise` sin entregar (el primero, por
+     * `order`, con `delivered_at === null` — mismo criterio de progresividad
+     * de H16.2, aplicado ahora a las 3 fases) y, si no queda ninguno,
+     * reutiliza `ExecutionReportRecorder::maybeCompleteSession()` para
+     * cerrar la sesión aquí mismo (caso defensivo: en la práctica, entregar
+     * el último ejercicio de apoyo ya la completa dentro de
+     * `deliverExerciseAndMaybeComplete()`, sin esperar esta confirmación).
+     */
+    private function advancePastSupportExercise(WorkoutExercise $workoutExercise, string $from, Tenant $tenant, Contact $contact): void
+    {
+        $session = $workoutExercise->workoutSession;
+        $session->load('workoutExercises.exerciseLog');
+
+        $next = $session->workoutExercises->first(fn (WorkoutExercise $we) => $we->delivered_at === null);
+
+        if ($next !== null) {
+            $this->deliverExerciseAndMaybeComplete($next, $session, $from, $tenant, $contact);
+
+            return;
+        }
+
+        if ($this->reportRecorder->maybeCompleteSession($session)) {
+            $this->reply($from, self::SESSION_COMPLETED_IMPLICIT_MESSAGE, $tenant);
+            $this->offerProactiveReminder(self::PROACTIVE_TRIGGER_SESSION_COMPLETED, $contact, $tenant, $from);
+        }
+    }
+
+    /**
+     * Hito R1/R2/R3 — entrega el siguiente `WorkoutExercise` (reutiliza
+     * `deliverExercise()` sin cambios) y, únicamente cuando ese ejercicio es
+     * de apoyo (Preparation/Cooldown — Main sigue exigiendo un reporte real,
+     * nunca se completa aquí), reevalúa si la sesión completa ya está
+     * resuelta para progresión (`WorkoutExercise::isResolvedForSessionProgression()`)
+     * y, si es así, la cierra reutilizando la MISMA rutina de cierre que ya
+     * usa `ExecutionReportRecorder::record()` — nunca una segunda
+     * implementación. Único punto donde "entregar el último ejercicio de
+     * apoyo" completa la sesión sin esperar una confirmación adicional del
+     * usuario (ver docblock de `advancePastSupportExercise()`).
+     */
+    private function deliverExerciseAndMaybeComplete(WorkoutExercise $next, WorkoutSession $session, string $from, Tenant $tenant, Contact $contact): void
+    {
+        $this->deliverExercise($next, $from, $tenant);
+
+        if ($next->phase === WorkoutExercisePhase::Main) {
+            return;
+        }
+
+        $session->load('workoutExercises.exerciseLog');
+
+        if ($this->reportRecorder->maybeCompleteSession($session)) {
+            $this->reply($from, self::SESSION_COMPLETED_IMPLICIT_MESSAGE, $tenant);
+            $this->offerProactiveReminder(self::PROACTIVE_TRIGGER_SESSION_COMPLETED, $contact, $tenant, $from);
+        }
     }
 
     /**
@@ -921,7 +1047,12 @@ class TrainingHandler implements HandlerInterface
                     'order' => $next->order,
                 ]);
 
-                $this->deliverExercise($next, $from, $tenant);
+                // Hito R1/R2/R3 — "next" puede ser ahora un Preparation/
+                // Cooldown (nunca tiene ExerciseLog, así que el filtro de
+                // $stillUnreported de arriba ya lo incluye sin cambios): si
+                // es el último ejercicio de la sesión, esta llamada la
+                // completa aquí mismo — ver deliverExerciseAndMaybeComplete().
+                $this->deliverExerciseAndMaybeComplete($next, $session, $from, $tenant, $contact);
             }
         }
 

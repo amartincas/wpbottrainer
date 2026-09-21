@@ -70,6 +70,13 @@ it('propagates an unrecognized YMove equipment value all the way to a real ineli
     ]);
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
 
+    // Hito R1/R2/R3 — TrainingEngine ya no crea una WorkoutSession sin al
+    // menos 1 ejercicio de bloque principal elegible; este test verifica
+    // la propagación de "unsupported" hasta la ineligibilidad, no la
+    // disponibilidad de catálogo, así que necesita un candidato real
+    // además del excluido.
+    Exercise::factory()->create(['muscle_group' => 'back', 'equipment_needed' => []]);
+
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
     $engine = new TrainingEngine(
         new TrainingAccessGate,

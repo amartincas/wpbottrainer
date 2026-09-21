@@ -60,6 +60,9 @@ class CoachFactsFormatter
         'performed' => 'realizado',
         'skipped' => 'omitido',
         'unreported' => 'sin reportar',
+        // Hito R1/R2/R3 — exclusivo de preparación/cooldown, que nunca
+        // piden un reporte estructurado: "entregado" nunca "sin reportar".
+        'delivered' => 'entregado',
     ];
 
     /**

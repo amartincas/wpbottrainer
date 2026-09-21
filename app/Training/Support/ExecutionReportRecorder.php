@@ -30,8 +30,14 @@ class ExecutionReportRecorder
     {
         $session->load(['workoutExercises.exerciseLog']);
 
+        // Hito R1/R2/R3 — `requiresExecutionReport()` (solo Main) filtra
+        // ANTES de mirar `exerciseLog`: sin esto, un Preparation/Cooldown
+        // (que nunca tiene `exerciseLog`) podría quedar como "el primero
+        // sin resolver" y `resolveExercise()` le resolvería incorrectamente
+        // un reporte sin nombre explícito — bug real detectado en el
+        // diseño, no solo cosmético.
         $unreported = $session->workoutExercises
-            ->filter(fn (WorkoutExercise $we) => $we->exerciseLog === null)
+            ->filter(fn (WorkoutExercise $we) => $we->requiresExecutionReport() && $we->exerciseLog === null)
             ->values();
 
         $logged = [];
@@ -184,6 +190,13 @@ class ExecutionReportRecorder
     }
 
     /**
+     * Hito R1/R2/R3 — pasa a público para que `TrainingHandler` pueda
+     * re-invocarlo tras entregar un Cooldown final (que se entrega DESPUÉS
+     * de que este método ya corrió una vez dentro de `record()`, en el
+     * mismo turno del último reporte de R1 — ver docblock de
+     * `TrainingHandler::recordExecutionReport()`). Única rutina de cierre
+     * — nunca duplicada en un segundo lugar.
+     *
      * @param  array<int, int>  $excludeFromCompletionIds  H16.2 Fase 1.3 — IDs
      *         de WorkoutExercise con un reporte parcial ESTE turno (ver
      *         isPartialReport()): cuentan como "sin resolver" únicamente para
@@ -193,12 +206,16 @@ class ExecutionReportRecorder
      *         consumidor (CoachContextProvider, SessionCloseIntent, etc.),
      *         que siguen usando `exerciseLog === null` sin este ajuste.
      */
-    private function maybeCompleteSession(WorkoutSession $session, array $excludeFromCompletionIds = []): bool
+    public function maybeCompleteSession(WorkoutSession $session, array $excludeFromCompletionIds = []): bool
     {
         $session->load(['workoutExercises.exerciseLog']);
 
+        // Hito R1/R2/R3 — `isResolvedForSessionProgression()` sustituye a
+        // `exerciseLog === null`: para Main, idéntico (exige ExerciseLog);
+        // para Preparation/Cooldown, basta con `delivered_at` (nunca
+        // tienen ExerciseLog, por diseño — nunca se les exige uno falso).
         $stillUnreported = $session->workoutExercises->contains(
-            fn (WorkoutExercise $we) => $we->exerciseLog === null || in_array($we->id, $excludeFromCompletionIds, true)
+            fn (WorkoutExercise $we) => ! $we->isResolvedForSessionProgression() || in_array($we->id, $excludeFromCompletionIds, true)
         );
 
         // H16.2 Fase 1 (fix de la contradicción "pendientes"+"completada"):

@@ -131,6 +131,48 @@ it('computes ProgressionEvaluation for each exercise of the current session, key
     expect($context->progressionEvaluations[$exercise->id]->exerciseId)->toBe($exercise->id);
 });
 
+it('Hito R1/R2/R3 — progressionEvaluations excludes Preparation/Cooldown exercises, even though they appear in currentSession.exercises', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000010']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $mainExercise = Exercise::factory()->create(['name' => 'Sentadilla']);
+    $warmupExercise = Exercise::factory()->create(['name' => 'Movilidad de cadera']);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $warmupExercise->id, 'exercise_snapshot' => $warmupExercise->toSnapshot(),
+        'order' => 1, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
+    ]);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $mainExercise->id, 'exercise_snapshot' => $mainExercise->toSnapshot(),
+        'order' => 2, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Main,
+    ]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000010'))->data;
+
+    expect($context->currentSession->exercises)->toHaveCount(2); // ambos siguen presentes, informativos
+    expect($context->progressionEvaluations)->toHaveKey($mainExercise->id);
+    expect($context->progressionEvaluations)->not->toHaveKey($warmupExercise->id);
+});
+
+it('Hito R1/R2/R3 — historicalOutcome() drives CoachExerciseSnapshot->outcome: Delivered for a shown Preparation/Cooldown, never Performed/Skipped', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000011']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $warmupExercise = Exercise::factory()->create(['name' => 'Movilidad de cadera']);
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'exercise_id' => $warmupExercise->id, 'exercise_snapshot' => $warmupExercise->toSnapshot(),
+        'order' => 1, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
+    ]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000011'))->data;
+
+    expect($context->currentSession->exercises[0]->outcome)->toBe(HistoryExerciseOutcome::Delivered);
+    expect($context->currentSession->exercises[0]->phase)->toBe(\App\Training\Enums\WorkoutExercisePhase::Preparation);
+});
+
 it('trackingType comes from Exercise::tracking_type, never inferred from prescribedDurationSeconds (correction after Bloque 9 review)', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000009']);

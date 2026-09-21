@@ -15,7 +15,9 @@ use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
@@ -706,10 +708,16 @@ it('never selects an Unsupported-equipment exercise for a Gym profile declaring 
     ]);
 
     $unsupported = Exercise::factory()->create(['muscle_group' => 'back', 'equipment_needed' => ['unsupported']]);
+    // Hito R1/R2/R3 — TrainingEngine ya no crea una WorkoutSession sin al
+    // menos 1 ejercicio de bloque principal elegible; este test verifica
+    // exclusión, no disponibilidad de catálogo, así que necesita un
+    // candidato real además del excluido.
+    $realExercise = Exercise::factory()->create(['muscle_group' => 'back', 'equipment_needed' => []]);
 
     $session = trainingEngine()->decideNextSession($contact);
 
     expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($realExercise->id);
 });
 
 it('never selects an Unsupported-equipment exercise for an Outdoor profile (regression: already excluded, now covered explicitly)', function () {
@@ -720,10 +728,13 @@ it('never selects an Unsupported-equipment exercise for an Outdoor profile (regr
     ]);
 
     $unsupported = Exercise::factory()->create(['muscle_group' => 'legs', 'equipment_needed' => ['unsupported']]);
+    // Hito R1/R2/R3 — ver comentario equivalente arriba en este archivo.
+    $realExercise = Exercise::factory()->create(['muscle_group' => 'legs', 'equipment_needed' => []]);
 
     $session = trainingEngine()->decideNextSession($contact);
 
     expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($realExercise->id);
 });
 
 it('never selects an Unsupported-equipment exercise for a profile with enumerated equipment (never fully_equipped)', function () {
@@ -734,10 +745,13 @@ it('never selects an Unsupported-equipment exercise for a profile with enumerate
     ]);
 
     $unsupported = Exercise::factory()->create(['muscle_group' => 'shoulders', 'equipment_needed' => ['unsupported']]);
+    // Hito R1/R2/R3 — ver comentario equivalente arriba en este archivo.
+    $realExercise = Exercise::factory()->create(['muscle_group' => 'shoulders', 'equipment_needed' => []]);
 
     $session = trainingEngine()->decideNextSession($contact);
 
     expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($realExercise->id);
 });
 
 it('still selects a real, known-equipment exercise for a fully_equipped profile — the legitimate bypass keeps working', function () {
@@ -839,7 +853,14 @@ it('derives the exercise count from Tenant.target_session_duration_minutes — n
 })->with([
     '30 min (9 min/ejercicio en general_fitness) -> 3' => [30, 3],
     '45 min (9 min/ejercicio en general_fitness) -> 5' => [45, 5],
-    '60 min (9 min/ejercicio en general_fitness) -> 7' => [60, 7],
+    // Hito R1/R2/R3 — a partir de 60 min, planSupportBudget() reserva
+    // presupuesto de TIEMPO para Preparación/Cooldown (2+2 ejercicios
+    // objetivo a 90s c/u) ANTES de calcular la cantidad de Main — el
+    // catálogo de este test no tiene ningún ejercicio warmup/mobility/
+    // cooldown/stretching, así que ese presupuesto queda sin llenar
+    // (0 Preparación + 0 Cooldown reales), pero el budget de Main sigue
+    // siendo 54 min (60 - 6 min reservados), no 60 — de ahí 6, no 7.
+    '60 min (mainBudget=54min tras reservar apoyo) -> 6' => [60, 6],
 ]);
 
 it('the focus guarantee ceil(N/2) holds correctly across every dynamically-computed exercise count', function (int $targetMinutes, int $expectedCount, int $expectedMinFocusSlots) {
@@ -868,7 +889,10 @@ it('the focus guarantee ceil(N/2) holds correctly across every dynamically-compu
     '4 ejercicios -> ceil(4/2)=2 de foco' => [35, 4, 2],
     '5 ejercicios -> ceil(5/2)=3 de foco' => [45, 5, 3],
     '6 ejercicios -> ceil(6/2)=3 de foco' => [54, 6, 3],
-    '7 ejercicios -> ceil(7/2)=4 de foco' => [60, 7, 4],
+    // Hito R1/R2/R3 — ver comentario equivalente en el test de arriba
+    // ("derives the exercise count..."): a 60 min, mainBudget=54min ->
+    // Main=6, no 7.
+    '6 ejercicios (mainBudget=54min) -> ceil(6/2)=3 de foco' => [60, 6, 3],
 ]);
 
 it('when the eligible catalog has fewer exercises than the target duration requests, the session simply has fewer — never invented, never relaxed eligibility', function () {
@@ -892,4 +916,133 @@ it('when the eligible catalog has fewer exercises than the target duration reque
     Log::shouldHaveReceived('info')
         ->withArgs(fn (string $message) => $message === 'TRAINING_DURATION_TARGET_UNREACHABLE')
         ->once();
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Hito R1/R2/R3 — Preparación/Cooldown (support phases)
+// ─────────────────────────────────────────────────────────────────────────
+
+it('assigns the approved Preparation/Cooldown target counts per duration bracket when the catalog has enough support-typed candidates', function (int $targetMinutes, int $expectedPrep, int $expectedCooldown) {
+    $contact = makeReadyContact();
+    $contact->tenant()->update(['target_session_duration_minutes' => $targetMinutes]);
+
+    // Catálogo abundante en los 3 roles — nunca el cuello de botella de
+    // este test, que solo quiere probar el reparto de conteos objetivo.
+    for ($i = 0; $i < 8; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'chest']);
+    }
+    for ($i = 0; $i < 3; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['warmup']]);
+    }
+    for ($i = 0; $i < 3; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['cooldown']]);
+    }
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    $prepCount = $session->workoutExercises->where('phase', WorkoutExercisePhase::Preparation)->count();
+    $cooldownCount = $session->workoutExercises->where('phase', WorkoutExercisePhase::Cooldown)->count();
+    $mainCount = $session->workoutExercises->where('phase', WorkoutExercisePhase::Main)->count();
+
+    expect($prepCount)->toBe($expectedPrep);
+    expect($cooldownCount)->toBe($expectedCooldown);
+    expect($mainCount)->toBeGreaterThan(0);
+
+    // Orden global continuo Preparation -> Main -> Cooldown, nunca
+    // intercalado ni reiniciado por fase.
+    $phasesInOrder = $session->workoutExercises->sortBy('order')->pluck('phase')->map(fn ($p) => $p->value)->all();
+    $expectedSequence = array_merge(
+        array_fill(0, $prepCount, 'preparation'),
+        array_fill(0, $mainCount, 'main'),
+        array_fill(0, $cooldownCount, 'cooldown'),
+    );
+    expect($phasesInOrder)->toBe($expectedSequence);
+})->with([
+    '15 min -> 1 prep / 1 cooldown' => [15, 1, 1],
+    '30 min -> 1 prep / 1 cooldown' => [30, 1, 1],
+    '45 min -> 1 prep / 2 cooldown' => [45, 1, 2],
+    '60 min -> 2 prep / 2 cooldown' => [60, 2, 2],
+]);
+
+it('never lets the support budget push the Main budget below the 70% floor, even with an abundant support catalog', function (int $targetMinutes) {
+    $contact = makeReadyContact();
+    $contact->tenant()->update(['target_session_duration_minutes' => $targetMinutes]);
+
+    for ($i = 0; $i < 8; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'chest']);
+    }
+    for ($i = 0; $i < 4; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['warmup']]);
+    }
+    for ($i = 0; $i < 4; $i++) {
+        Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['cooldown']]);
+    }
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    $supportCount = $session->workoutExercises->whereIn('phase', [WorkoutExercisePhase::Preparation, WorkoutExercisePhase::Cooldown])->count();
+    $totalSeconds = $targetMinutes * 60;
+
+    // Guardrail ALGEBRAICO de planSupportBudget(): el presupuesto de apoyo
+    // (90s por ejercicio) nunca excede el 30% del total, sin importar
+    // cuántos candidatos reales existan.
+    expect($supportCount * 90)->toBeLessThanOrEqual($totalSeconds * 0.30);
+})->with([15, 30, 45, 60, 90]);
+
+it('never selects the same Exercise for both Main and a support phase in the same session', function () {
+    $contact = makeReadyContact();
+    $contact->tenant()->update(['target_session_duration_minutes' => 30]);
+
+    // Único candidato elegible en todo el catálogo, Y de tipo warmup: si
+    // R1 lo toma (único disponible), el pool de Preparación (excluyendo
+    // IDs ya usados) debe quedar vacío, no duplicarlo.
+    $onlyExercise = Exercise::factory()->create(['muscle_group' => 'chest', 'exercise_type' => ['warmup']]);
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    expect($session->workoutExercises)->toHaveCount(1);
+    expect($session->workoutExercises->first()->exercise_id)->toBe($onlyExercise->id);
+    expect($session->workoutExercises->first()->phase)->toBe(WorkoutExercisePhase::Main);
+});
+
+it('throws TrainingCatalogInsufficientException and creates no WorkoutSession row when the catalog has zero eligible Main-phase exercises', function () {
+    $contact = makeReadyContact();
+    // Catálogo completamente vacío — ni un solo Exercise activo.
+
+    expect(fn () => trainingEngine()->decideNextSession($contact->fresh()))
+        ->toThrow(TrainingCatalogInsufficientException::class);
+
+    expect(WorkoutSession::where('contact_id', $contact->id)->count())->toBe(0);
+});
+
+it('single-slot fallback: prioritizes Preparation over Cooldown when both have real candidates', function () {
+    $contact = makeReadyContact();
+    // 6 min -> maxSupportSlots=1 (floor(6*60*0.30/90)=1), con ambos
+    // conteos objetivo en 1 — exactamente el caso "un solo cupo" de la
+    // Corrección 2 aprobada.
+    $contact->tenant()->update(['target_session_duration_minutes' => 6]);
+
+    Exercise::factory()->create(['muscle_group' => 'chest']);
+    Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['warmup']]);
+    Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['cooldown']]);
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Preparation)->count())->toBe(1);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Cooldown)->count())->toBe(0);
+});
+
+it('single-slot fallback: uses Cooldown when Preparation has no real candidates in the catalog', function () {
+    $contact = makeReadyContact();
+    $contact->tenant()->update(['target_session_duration_minutes' => 6]);
+
+    Exercise::factory()->create(['muscle_group' => 'chest']);
+    // Sin ningún warmup/mobility en el catálogo — Preparación no tiene
+    // candidatos reales, así que el único cupo pasa a Cooldown.
+    Exercise::factory()->create(['muscle_group' => 'shoulders', 'exercise_type' => ['cooldown']]);
+
+    $session = trainingEngine()->decideNextSession($contact->fresh());
+
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Preparation)->count())->toBe(0);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Cooldown)->count())->toBe(1);
 });

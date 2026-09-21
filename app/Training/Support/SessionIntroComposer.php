@@ -3,6 +3,7 @@
 namespace App\Training\Support;
 
 use App\Models\WorkoutSession;
+use App\Training\Enums\WorkoutExercisePhase;
 
 /**
  * Introducción de una WorkoutSession — describe la sesión que YA fue
@@ -33,7 +34,12 @@ class SessionIntroComposer
 
     public function compose(WorkoutSession $session): string
     {
-        $exerciseCount = $session->workoutExercises->count();
+        // Hito R1/R2/R3 — el conteo/foco que se comunica es EXCLUSIVAMENTE
+        // del bloque principal (Preparation/Cooldown son apoyo, no lo que el
+        // usuario entiende por "tu entrenamiento de hoy"). La duración
+        // estimada, en cambio, SÍ suma las 3 fases — ver DurationEstimator,
+        // sin cambios: el tiempo real que toma la sesión completa.
+        $exerciseCount = $session->workoutExercises->where('phase', WorkoutExercisePhase::Main)->count();
         $estimatedMinutes = (int) round($this->durationEstimator->estimateSessionSeconds($session) / 60);
         $focusLine = $this->focusLine($session);
 
@@ -110,6 +116,7 @@ class SessionIntroComposer
     private function realMuscleFocusLabel(WorkoutSession $session): ?string
     {
         $labels = $session->workoutExercises
+            ->where('phase', WorkoutExercisePhase::Main)
             ->pluck('exercise_snapshot.primary_muscle')
             ->filter()
             ->map(fn (string $muscle) => ExerciseMessageFormatter::MUSCLE_LABELS[$muscle] ?? null)

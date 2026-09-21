@@ -456,3 +456,47 @@ it('never calls any AI provider to compose the nudge', function () {
 
     Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.openai.com'));
 });
+
+// ── Hito R1/R2/R3 — R2/R3 nunca generan nudge ──────────────────────────────
+
+it('never nudges a delivered-and-past-threshold Preparation/Cooldown exercise — it never requires an ExerciseLog', function (\App\Training\Enums\WorkoutExercisePhase $phase) {
+    $tenant = Tenant::factory()->create(['exercise_nudge_after_minutes' => 30]);
+    $contact = nudgeMakeContact($tenant, '573001112233');
+    nudgeOpenWindowFor($tenant, '573001112233');
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id]);
+    // Muy por encima del umbral y sin ExerciseLog (nunca lo tendrá, por
+    // diseño) — bajo el criterio pre-hito ("sin ExerciseLog") esto sería
+    // candidato; UnreportedExerciseDetector lo excluye explícitamente por
+    // no exigir reporte estructurado (ver requiresExecutionReport()).
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'order' => 1, 'phase' => $phase, 'delivered_at' => now()->subMinutes(40),
+    ]);
+
+    Http::fake();
+    Artisan::call('training:nudge-unreported-exercises');
+
+    Http::assertNothingSent();
+})->with([
+    'Preparation' => [\App\Training\Enums\WorkoutExercisePhase::Preparation],
+    'Cooldown' => [\App\Training\Enums\WorkoutExercisePhase::Cooldown],
+]);
+
+it('nudges the Main exercise past the threshold even when a Preparation exercise precedes it, already resolved', function () {
+    $tenant = Tenant::factory()->create(['exercise_nudge_after_minutes' => 30]);
+    $contact = nudgeMakeContact($tenant, '573001112233');
+    nudgeOpenWindowFor($tenant, '573001112233');
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id]);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'order' => 1,
+        'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation, 'delivered_at' => now()->subMinutes(45),
+    ]);
+    WorkoutExercise::factory()->create([
+        'workout_session_id' => $session->id, 'order' => 2,
+        'phase' => \App\Training\Enums\WorkoutExercisePhase::Main, 'delivered_at' => now()->subMinutes(40),
+    ]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+    Artisan::call('training:nudge-unreported-exercises');
+
+    Http::assertSentCount(1);
+});

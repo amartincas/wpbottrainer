@@ -4,6 +4,7 @@ namespace App\Training\Context;
 
 use App\Training\Enums\HistoryExerciseOutcome;
 use App\Training\Enums\TrackingType;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Support\HistorySetEntry;
 
 /**
@@ -26,6 +27,7 @@ final readonly class CoachExerciseSnapshot
     public function __construct(
         public ?int $exerciseId,
         public string $name,
+        public WorkoutExercisePhase $phase,
         public ?int $prescribedSets,
         public ?int $prescribedReps,
         public ?float $prescribedLoad,

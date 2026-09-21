@@ -14,6 +14,7 @@ use App\Training\Enums\ProgressionDecision;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingLocation;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\DurationEstimator;
 use App\Training\Support\HistoryExerciseEntry;
@@ -23,6 +24,7 @@ use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\TrainingHistoryContext;
 use App\Training\Support\TrainingHistoryContextProvider;
 use Illuminate\Support\Collection;
@@ -73,6 +75,53 @@ class TrainingEngine
      * Ajustable sin migración, igual que `GOAL_DEFAULTS`.
      */
     private const VARIETY_DECAY = 0.6;
+
+    /**
+     * Hito R1/R2/R3 — decaimiento de variedad para preparación/cooldown,
+     * DISTINTO del de R1 (`VARIETY_DECAY`), nunca el mismo valor. `0.0`
+     * para Preparation ("variedad mínima/consistente", Decisión #6 del
+     * diseño aprobado): un calentamiento repetido sesión tras sesión es
+     * deseable, no un defecto — con decay=0.0, `0.0 ** posición` solo
+     * penaliza repetir EXACTAMENTE el ejercicio de la sesión
+     * inmediatamente anterior (posición 0, donde `0.0**0=1.0`), nunca más
+     * atrás. `0.3` para Cooldown ("ventana corta", Decisión #7): memoria
+     * más corta que R1 pero no nula.
+     */
+    private const PREPARATION_VARIETY_DECAY = 0.0;
+
+    private const COOLDOWN_VARIETY_DECAY = 0.3;
+
+    /**
+     * Hito R1/R2/R3 — estimación de producto para un ejercicio de
+     * preparación/cooldown: un solo bloque continuo, sin series ni
+     * descanso estructurado (a diferencia de R1, que sí los tiene vía
+     * `numericPrescriptionFor()`). Misma naturaleza que
+     * `AVERAGE_SET_EXECUTION_SECONDS` de `DurationEstimator` — heurística
+     * ajustable sin migración, NUNCA una verdad fisiológica.
+     */
+    private const SUPPORT_EXERCISE_DURATION_SECONDS = 90;
+
+    /**
+     * Hito R1/R2/R3 — PISO mínimo (nunca una distribución exacta) del
+     * presupuesto de tiempo total para el bloque principal (R1). Actúa
+     * como guardrail defensivo: con los objetivos de conteo ya aprobados
+     * (ver `planSupportBudget()`) y `SUPPORT_EXERCISE_DURATION_SECONDS`
+     * actual, R1 normalmente recibe bastante más del 70% — este piso solo
+     * se activa si la configuración cambia en el futuro.
+     */
+    private const MIN_MAIN_BUDGET_RATIO = 0.70;
+
+    /**
+     * Hito R1/R2/R3 — vocabulario base de cada fase de apoyo, verificado
+     * contra el catálogo real (Audit funcional de roles): un ejercicio
+     * entra al pool de una fase si su `exercise_type` intersecta este
+     * conjunto — nunca una regla de dos niveles "condicional solo si
+     * acompaña a base" (esa formulación se demostró redundante: se reduce
+     * exactamente a esta intersección simple).
+     */
+    private const PREPARATION_TYPES = ['warmup', 'mobility'];
+
+    private const COOLDOWN_TYPES = ['cooldown', 'stretching'];
 
     private const DIFFICULTY_ORDER = [
         'beginner' => 0,
@@ -143,6 +192,9 @@ class TrainingEngine
      *
      * @throws TrainingAccessDeniedException si el Gate bloquea el acceso
      *         (sin acceso comercial vigente, o perfil marcado por seguridad).
+     * @throws TrainingCatalogInsufficientException si el catálogo elegible
+     *         no produce ni un solo ejercicio de bloque principal (Main) —
+     *         ninguna WorkoutSession se crea en ese caso.
      */
     public function decideNextSession(Contact $contact): WorkoutSession
     {
@@ -176,12 +228,53 @@ class TrainingEngine
 
         $focus = $this->decideFocus($profile, $recentSessions);
 
-        $exercises = $this->selectExercises($profile, $focus, $recentSessions, $contact);
+        // Hito R1/R2/R3 — UNA sola lectura del catálogo elegible,
+        // reutilizada por las 3 fases (evita 3 consultas completas
+        // idénticas). `isEligible()` no depende de la fase — mismo filtro
+        // de seguridad/equipo para R1/R2/R3, sin excepción.
+        $eligiblePool = Exercise::query()
+            ->where('is_active', true)
+            ->get()
+            ->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+
+        [$targetPrepCount, $targetCooldownCount, $maxSupportSlots, $mainBudgetMinutes] = $this->planSupportBudget($contact->tenant);
+
+        // R1 selecciona PRIMERO (autoridad de prescripción, Decisión #8 del
+        // diseño aprobado) — nunca se ve limitado por lo que R2/R3 tomen.
+        $mainExercises = $this->selectExercises($profile, $focus, $recentSessions, $contact, $eligiblePool, $mainBudgetMinutes);
+
+        // Una WorkoutSession NUNCA se crea sin al menos 1 ejercicio de
+        // bloque principal — se lanza ANTES de WorkoutSession::create(),
+        // así que ninguna fila llega a persistirse.
+        if ($mainExercises->isEmpty()) {
+            throw new TrainingCatalogInsufficientException;
+        }
+
+        $usedIds = $mainExercises->pluck('id');
+
+        // Preparación: hasta targetPrepCount, acotado por maxSupportSlots.
+        $prepExercises = $this->selectPreparationExercises(
+            $profile, $recentSessions, min($targetPrepCount, $maxSupportSlots),
+            $eligiblePool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
+        );
+        $usedIds = $usedIds->merge($prepExercises->pluck('id'));
+
+        // Cooldown: se queda con lo que Preparación no usó del presupuesto
+        // de slots — implementa "si solo hay capacidad para 1, priorizar
+        // Preparation; si Preparation no tiene candidatos reales, el slot
+        // libre pasa a Cooldown" de forma natural (sin chequeo previo de
+        // existencia: Preparación ya devolvió lo que realmente encontró).
+        $remainingSlots = max(0, $maxSupportSlots - $prepExercises->count());
+        $cooldownExercises = $this->selectCooldownExercises(
+            $profile, $recentSessions, min($targetCooldownCount, $remainingSlots),
+            $eligiblePool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
+        );
 
         // Bloque 8 (D051): el contexto histórico se construye UNA sola vez
         // por generación, después de que la selección de ejercicios ya está
         // cerrada — nunca para el pool completo de candidatos, solo para los
-        // pocos ya seleccionados que se prescribirán a continuación.
+        // pocos ya seleccionados que se prescribirán a continuación. Solo
+        // R1 lo usa (R2/R3 nunca invocan ProgressionEvaluator).
         $historyContext = $this->historyProvider->build($contact);
 
         // Bloque 3 — Fundación Temporal (ver docs/DECISIONS.md D046):
@@ -213,8 +306,22 @@ class TrainingEngine
             ),
         ]);
 
-        foreach ($exercises as $index => $exercise) {
-            $this->prescribeExercise($session, $exercise, $index + 1, $historyContext, $profile);
+        // Orden GLOBAL y continuo: Preparation → Main → Cooldown — nunca se
+        // reinicia por fase. La ENTREGA (TrainingHandler, por `order`) usa
+        // exactamente este orden; la SELECCIÓN (arriba) fue en un orden
+        // distinto (R1 primero), sin relación entre ambos conceptos.
+        $order = 1;
+
+        foreach ($prepExercises as $exercise) {
+            $this->prescribeSupportExercise($session, $exercise, $order++, WorkoutExercisePhase::Preparation);
+        }
+
+        foreach ($mainExercises as $exercise) {
+            $this->prescribeExercise($session, $exercise, $order++, $historyContext, $profile);
+        }
+
+        foreach ($cooldownExercises as $exercise) {
+            $this->prescribeSupportExercise($session, $exercise, $order++, WorkoutExercisePhase::Cooldown);
         }
 
         $profile->update(['next_focus' => $this->nextInRotation($focus, $profile->split_type)]);
@@ -289,10 +396,17 @@ class TrainingEngine
      * los grupos musculares realmente registrados en su exercise_snapshot —
      * nunca desde el Exercise actual (ver docs/DECISIONS.md, inmutabilidad
      * histórica). No requiere una columna "focus" adicional en WorkoutSession.
+     *
+     * Hito R1/R2/R3 — filtrado a `phase===Main`: un warmup/cooldown con
+     * `muscle_group` real (ej. "shoulders") NUNCA debe contaminar la
+     * detección de foco usada para la rotación de continuidad
+     * (`mostNeglectedFocus()`/`decideFocus()`) — solo el bloque principal
+     * define "qué se entrenó" para efectos de rotación.
      */
     private function focusOf(WorkoutSession $session): ?string
     {
         $muscleGroups = $session->workoutExercises
+            ->where('phase', WorkoutExercisePhase::Main)
             ->pluck('exercise_snapshot.muscle_group')
             ->filter()
             ->unique()
@@ -383,14 +497,19 @@ class TrainingEngine
      * resultante simplemente tiene menos ejercicios, nunca ejercicios
      * inventados ni relajación de elegibilidad.
      *
+     * Hito R1/R2/R3 — recibe `$eligiblePool` (ya filtrado por `isEligible()`)
+     * y `$targetMinutes` en vez de calcularlos internamente: evita repetir
+     * la misma consulta del catálogo tres veces (una por fase) y permite
+     * que el presupuesto de tiempo de R1 se calcule una sola vez en
+     * `decideNextSession()`, considerando el reparto con Preparación/
+     * Cooldown. Cero cambio de comportamiento respecto a la selección
+     * anterior — mismo contenido, misma fuente, solo se evita recalcularla.
+     *
      * @return Collection<int, Exercise>
      */
-    private function selectExercises(TrainingProfile $profile, string $focus, Collection $recentSessions, Contact $contact): Collection
+    private function selectExercises(TrainingProfile $profile, string $focus, Collection $recentSessions, Contact $contact, Collection $eligiblePool, float $targetMinutes): Collection
     {
-        $eligible = Exercise::query()
-            ->where('is_active', true)
-            ->get()
-            ->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+        $eligible = $eligiblePool;
 
         $primaryFocus = $profile->primary_focus ?? [];
         $secondaryFocus = $profile->secondary_focus ?? [];
@@ -422,7 +541,7 @@ class TrainingEngine
         $secondaryTier = $this->sortCandidates($secondaryTier, $profile, $recentSessions);
         $generalTier = $this->sortCandidates($generalTier, $profile, $recentSessions);
 
-        $exercisesPerSession = $this->exercisesForTargetDuration($profile, $contact->tenant);
+        $exercisesPerSession = $this->exercisesForTargetDuration($profile, $contact->tenant, $targetMinutes);
 
         $focusSlotsAvailable = $primaryTier->count() + $secondaryTier->count();
         $minFocusSlots = (int) ceil($exercisesPerSession / 2);
@@ -478,8 +597,15 @@ class TrainingEngine
      * de producto — protegen contra una configuración de Tenant fuera de
      * rango llegando por cualquier vía que no sea el formulario de Filament
      * (que ya valida 15-90 minutos en la UI).
+     *
+     * Hito R1/R2/R3 — `$targetMinutesOverride`: cuando se provee (desde
+     * `planSupportBudget()`), sustituye a `Tenant.target_session_duration_minutes`
+     * como fuente de los minutos objetivo — la FÓRMULA interna no cambia en
+     * absoluto, solo de dónde viene el número de minutos que recibe. `null`
+     * (default) preserva exactamente el comportamiento anterior a este
+     * hito para cualquier llamador que no lo provea.
      */
-    private function exercisesForTargetDuration(TrainingProfile $profile, Tenant $tenant): int
+    private function exercisesForTargetDuration(TrainingProfile $profile, Tenant $tenant, ?float $targetMinutesOverride = null): int
     {
         $goalDefaults = self::GOAL_DEFAULTS[$profile->goal?->value] ?? self::GOAL_DEFAULTS['general_fitness'];
 
@@ -487,35 +613,186 @@ class TrainingEngine
             $goalDefaults['sets'], $goalDefaults['rest_seconds'], null,
         );
 
-        $exercises = (int) round(($tenant->target_session_duration_minutes * 60) / $estimatedSecondsPerExercise);
+        $targetMinutes = $targetMinutesOverride ?? $tenant->target_session_duration_minutes;
+        $exercises = (int) round(($targetMinutes * 60) / $estimatedSecondsPerExercise);
 
         return max(self::MIN_EXERCISES_PER_SESSION, min(self::MAX_EXERCISES_PER_SESSION, $exercises));
     }
 
     /**
+     * Hito R1/R2/R3 — reparto del presupuesto de tiempo total entre las 3
+     * fases, con garantía ALGEBRAICA (no solo descriptiva) de que R1 nunca
+     * recibe menos de `MIN_MAIN_BUDGET_RATIO` (70%): `$plannedSupportSeconds`
+     * nunca excede `$maxSupportBudgetSeconds` (el techo del 30%), así que
+     * `$mainBudgetMinutes = $totalSeconds - $plannedSupportSeconds` nunca
+     * baja del piso, por construcción.
+     *
+     * Los conteos OBJETIVO (`$targetPrepCount`/`$targetCooldownCount`) usan
+     * el extremo superior de las franjas ya aprobadas (15min→1/1,
+     * 30min→1/1, 45min→1/2, 60min→2/2) — el reparto REAL puede quedar por
+     * debajo si el catálogo no tiene suficientes candidatos (best-effort,
+     * ver `decideNextSession()`), pero el presupuesto de TIEMPO de R1 se
+     * calcula con el objetivo, nunca con la disponibilidad real — mismo
+     * principio ya usado por `exercisesForTargetDuration()` para R1 mismo
+     * (estima hacia adelante, antes de que los ejercicios reales existan).
+     *
+     * `$maxSupportSlots` es el techo de cuántos ejercicios de apoyo caben
+     * en el 30% — se usa para acotar las CANTIDADES solicitadas a
+     * `selectPreparationExercises()`/`selectCooldownExercises()`, no solo
+     * para el cálculo de tiempo.
+     *
+     * @return array{0: int, 1: int, 2: int, 3: float} [targetPrepCount, targetCooldownCount, maxSupportSlots, mainBudgetMinutes]
+     */
+    private function planSupportBudget(Tenant $tenant): array
+    {
+        $minutes = (float) $tenant->target_session_duration_minutes;
+        $totalSeconds = $minutes * 60;
+        $maxSupportBudgetSeconds = $totalSeconds * (1 - self::MIN_MAIN_BUDGET_RATIO);
+
+        $targetPrepCount = $minutes >= 60 ? 2 : 1;
+        $targetCooldownCount = $minutes >= 45 ? 2 : 1;
+
+        $maxSupportSlots = (int) floor($maxSupportBudgetSeconds / self::SUPPORT_EXERCISE_DURATION_SECONDS);
+
+        $targetSupportSeconds = ($targetPrepCount + $targetCooldownCount) * self::SUPPORT_EXERCISE_DURATION_SECONDS;
+        $plannedSupportSeconds = min($targetSupportSeconds, $maxSupportBudgetSeconds);
+        $mainBudgetMinutes = ($totalSeconds - $plannedSupportSeconds) / 60;
+
+        return [$targetPrepCount, $targetCooldownCount, $maxSupportSlots, $mainBudgetMinutes];
+    }
+
+    /**
+     * Hito R1/R2/R3 — compartido por selectPreparationExercises()/
+     * selectCooldownExercises(): misma elegibilidad (ya aplicada en
+     * `$eligiblePool`, recibida ya excluyendo los ids usados por otras
+     * fases de esta misma sesión — evita que el mismo Exercise se
+     * seleccione dos veces), distinto vocabulario permitido
+     * (`$allowedExerciseTypes`) y distinta ventana de variedad según fase
+     * (ver `sortCandidates()`).
+     *
+     * El foco es aquí una preferencia DÉBIL — TODO candidato elegible +
+     * tipo-válido entra al resultado posible, nunca se excluye por no
+     * matchear `primary_focus`/`secondary_focus` (a diferencia de
+     * `selectExercises()`, R1, donde el foco SÍ es un filtro real). Ver
+     * `sortCandidates()`/`focusScore()`.
+     *
      * @return Collection<int, Exercise>
      */
-    private function sortCandidates(Collection $candidates, TrainingProfile $profile, Collection $recentSessions): Collection
+    private function selectSupportExercises(
+        TrainingProfile $profile,
+        Collection $recentSessions,
+        int $count,
+        Collection $eligiblePool,
+        array $allowedExerciseTypes,
+        WorkoutExercisePhase $phase,
+    ): Collection {
+        if ($count <= 0) {
+            return collect();
+        }
+
+        $candidates = $eligiblePool->filter(
+            fn (Exercise $exercise) => array_intersect($exercise->exercise_type ?? [], $allowedExerciseTypes) !== []
+        );
+
+        return $this->sortCandidates($candidates, $profile, $recentSessions, $phase)
+            ->take($count)
+            ->values();
+    }
+
+    private function selectPreparationExercises(TrainingProfile $profile, Collection $recentSessions, int $count, Collection $eligiblePool): Collection
     {
+        return $this->selectSupportExercises($profile, $recentSessions, $count, $eligiblePool, self::PREPARATION_TYPES, WorkoutExercisePhase::Preparation);
+    }
+
+    private function selectCooldownExercises(TrainingProfile $profile, Collection $recentSessions, int $count, Collection $eligiblePool): Collection
+    {
+        return $this->selectSupportExercises($profile, $recentSessions, $count, $eligiblePool, self::COOLDOWN_TYPES, WorkoutExercisePhase::Cooldown);
+    }
+
+    /**
+     * Hito R1/R2/R3 — `$phase` (default `Main`, preserva exactamente el
+     * comportamiento anterior a este hito para R1, que nunca pasa este
+     * parámetro explícitamente):
+     * - `Main`: comparador SIN CAMBIOS — difficultyMatchRank() →
+     *   varietyScore() → id.
+     * - `Preparation`/`Cooldown`: comparador nuevo — varietyScore() →
+     *   focusScore() → id. El foco NUNCA es el primer criterio (a
+     *   diferencia del filtrado por tiers de R1) — es una preferencia
+     *   DÉBIL que solo desempata cuando la variedad ya está empatada; la
+     *   variedad domina siempre que exista una diferencia real. Sin
+     *   `difficultyMatchRank()` — no es un criterio pedido para estas
+     *   fases (`difficulty` no es obligatorio en R2/R3).
+     *
+     * @return Collection<int, Exercise>
+     */
+    private function sortCandidates(Collection $candidates, TrainingProfile $profile, Collection $recentSessions, WorkoutExercisePhase $phase = WorkoutExercisePhase::Main): Collection
+    {
+        $decay = match ($phase) {
+            WorkoutExercisePhase::Preparation => self::PREPARATION_VARIETY_DECAY,
+            WorkoutExercisePhase::Cooldown => self::COOLDOWN_VARIETY_DECAY,
+            WorkoutExercisePhase::Main => self::VARIETY_DECAY,
+        };
+
         // Score de variedad calculado UNA vez por candidato (no en cada
         // comparación de sort()) — mismo resultado, menos trabajo repetido.
         $varietyScores = $candidates->mapWithKeys(
-            fn (Exercise $exercise) => [$exercise->id => $this->varietyScore($exercise->id, $recentSessions)]
+            fn (Exercise $exercise) => [$exercise->id => $this->varietyScore($exercise->id, $recentSessions, $decay)]
         );
 
-        return $candidates->sort(function (Exercise $a, Exercise $b) use ($profile, $varietyScores) {
-            $levelDiff = $this->difficultyMatchRank($a, $profile) <=> $this->difficultyMatchRank($b, $profile);
-            if ($levelDiff !== 0) {
-                return $levelDiff;
-            }
+        if ($phase === WorkoutExercisePhase::Main) {
+            return $candidates->sort(function (Exercise $a, Exercise $b) use ($profile, $varietyScores) {
+                $levelDiff = $this->difficultyMatchRank($a, $profile) <=> $this->difficultyMatchRank($b, $profile);
+                if ($levelDiff !== 0) {
+                    return $levelDiff;
+                }
 
+                $varietyDiff = $varietyScores[$a->id] <=> $varietyScores[$b->id];
+                if ($varietyDiff !== 0) {
+                    return $varietyDiff;
+                }
+
+                return $a->id <=> $b->id;
+            })->values();
+        }
+
+        $focusScores = $candidates->mapWithKeys(
+            fn (Exercise $exercise) => [$exercise->id => $this->focusScore($exercise, $profile)]
+        );
+
+        return $candidates->sort(function (Exercise $a, Exercise $b) use ($varietyScores, $focusScores) {
             $varietyDiff = $varietyScores[$a->id] <=> $varietyScores[$b->id];
             if ($varietyDiff !== 0) {
                 return $varietyDiff;
             }
 
+            // Descendente: focusScore=1 (coincide con el foco declarado)
+            // antes que focusScore=0 — solo como desempate, nunca antes.
+            $focusDiff = $focusScores[$b->id] <=> $focusScores[$a->id];
+            if ($focusDiff !== 0) {
+                return $focusDiff;
+            }
+
             return $a->id <=> $b->id;
         })->values();
+    }
+
+    /**
+     * Hito R1/R2/R3 — preferencia DÉBIL de foco para Preparación/Cooldown:
+     * `1` si el ejercicio coincide con `primary_focus`∪`secondary_focus`
+     * del perfil, `0` si no. Nunca excluye (a diferencia de los tiers de
+     * R1) — solo usado como desempate en `sortCandidates()`, después de la
+     * variedad.
+     */
+    private function focusScore(Exercise $exercise, TrainingProfile $profile): int
+    {
+        $muscles = array_values(array_filter(array_merge(
+            [$exercise->primary_muscle?->value],
+            $exercise->secondary_muscles ?? []
+        )));
+
+        $declaredFocus = array_merge($profile->primary_focus ?? [], $profile->secondary_focus ?? []);
+
+        return array_intersect($muscles, $declaredFocus) !== [] ? 1 : 0;
     }
 
     /**
@@ -554,7 +831,7 @@ class TrainingEngine
      * después de `difficultyMatchRank` — nunca puede superar esa prioridad
      * ni el tier de foco (ver docblock de `selectExercises()`).
      */
-    private function varietyScore(int $exerciseId, Collection $recentSessions): float
+    private function varietyScore(int $exerciseId, Collection $recentSessions, float $decay = self::VARIETY_DECAY): float
     {
         $score = 0.0;
 
@@ -562,7 +839,7 @@ class TrainingEngine
             $exerciseIdsInSession = $session->workoutExercises->pluck('exercise_id')->unique();
 
             if ($exerciseIdsInSession->contains($exerciseId)) {
-                $score += self::VARIETY_DECAY ** $position;
+                $score += $decay ** $position;
             }
         }
 
@@ -671,11 +948,41 @@ class TrainingEngine
             'workout_session_id' => $session->id,
             'exercise_id' => $exercise->id,
             'order' => $order,
+            'phase' => WorkoutExercisePhase::Main,
             'prescribed_sets' => $progression['sets'],
             'prescribed_reps' => $progression['reps'],
             'prescribed_load' => $progression['load'],
             'prescribed_duration_seconds' => $progression['duration_seconds'],
             'rest_seconds' => $progression['rest_seconds'],
+            'exercise_snapshot' => $exercise->toSnapshot(),
+        ]);
+    }
+
+    /**
+     * Hito R1/R2/R3 — prescripción de Preparación/Cooldown: NUNCA invoca
+     * `ProgressionEvaluator`/`numericPrescriptionFor()` (Decisión #6/#7 del
+     * diseño aprobado) — mismo `WorkoutExercise::create()` que R1, con
+     * valores fijos en vez de progresión histórica. `prescribed_sets=1`/
+     * `rest_seconds=0` (nunca `null`): `DurationEstimator::
+     * estimateExerciseSeconds(int $sets, int $restSeconds, ?int $duration)`
+     * exige ambos como `int` no-nullable — pasar `null` produciría un
+     * `TypeError` la primera vez que se estime la duración de la sesión
+     * (ej. `SessionIntroComposer`). `1`/`0` representan fielmente "un solo
+     * bloque continuo, sin descanso estructurado", sin inventar un segundo
+     * motor de prescripción.
+     */
+    private function prescribeSupportExercise(WorkoutSession $session, Exercise $exercise, int $order, WorkoutExercisePhase $phase): WorkoutExercise
+    {
+        return WorkoutExercise::create([
+            'workout_session_id' => $session->id,
+            'exercise_id' => $exercise->id,
+            'order' => $order,
+            'phase' => $phase,
+            'prescribed_sets' => 1,
+            'prescribed_reps' => null,
+            'prescribed_load' => null,
+            'prescribed_duration_seconds' => self::SUPPORT_EXERCISE_DURATION_SECONDS,
+            'rest_seconds' => 0,
             'exercise_snapshot' => $exercise->toSnapshot(),
         ]);
     }
