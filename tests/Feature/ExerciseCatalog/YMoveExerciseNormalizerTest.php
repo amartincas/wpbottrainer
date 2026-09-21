@@ -2,9 +2,12 @@
 
 use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\ExerciseCatalog\Providers\YMove\YMoveExerciseNormalizer;
+use App\Training\Enums\Equipment;
+use App\Training\Enums\ExerciseType;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\TrackingType;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Hito 9.1: casos derivados de la auditoría REAL de la prueba técnica de
@@ -176,12 +179,22 @@ it('maps the full official YMove equipment vocabulary, not just the original 11'
     }
 });
 
-it('degrades to no-equipment (never crashes) for a raw equipment string outside even the full official vocabulary', function () {
+/**
+ * Hito Provider-Agnostic Normalization — CAMBIO DE COMPORTAMIENTO deliberado.
+ * Antes de este hito, este mismo test esperaba `[]` ("sin equipo") para un
+ * valor de equipo desconocido — ese era exactamente el bug que Audit #3/#4
+ * encontraron: un ejercicio que SÍ exige equipo (pero de un tipo que el
+ * normalizer no reconoce) quedaba indistinguible de uno genuinamente sin
+ * equipo, apareciendo como "elegible" para un usuario sin nada. Ahora un
+ * valor desconocido produce `Equipment::Unsupported`, nunca `[]`.
+ */
+it('marks a raw equipment string outside the vocabulary as Unsupported, never as no-equipment', function () {
     $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-y', [
         'id' => 'id-y', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'a brand new gadget ymove never told us about',
     ]));
 
-    expect($normalized->equipmentNeeded)->toBe([]);
+    expect($normalized->equipmentNeeded)->toBe(['unsupported']);
+    expect($normalized->equipmentNeeded)->not->toBe([]);
 });
 
 /**
@@ -274,15 +287,25 @@ it('still resolves bodyweight to no-equipment when no raw payload is available f
 /**
  * Nota sobre "24" vs. "22": la auditoría del catálogo real (Hito 15.2)
  * confirmó 22 valores crudos DISTINTOS en los 1068 ejercicios de YMove
- * (activos e inactivos). EQUIPMENT_MAP, en cambio, tiene 24 claves además
- * de 'bodyweight' (25 en total) — dos más que las 22 auditadas: 'dumbbells'
- * y 'bands' (plural), alias defensivos preexistentes desde Hito 9.3, nunca
- * observados como valor crudo real en la auditoría completa del catálogo
- * (que solo encontró las formas singulares 'dumbbell'/'band'). No son un
- * error de este hito ni se tocan aquí — este test verifica el mapa TAL
- * COMO EXISTE HOY (24 claves), no los 22 valores confirmados por auditoría.
+ * (activos e inactivos). Estas 24 claves (además de 'bodyweight') son dos
+ * más que las 22 auditadas: 'dumbbells' y 'bands' (plural), alias
+ * defensivos preexistentes desde Hito 9.3, nunca observados como valor
+ * crudo real en la auditoría completa del catálogo (que solo encontró las
+ * formas singulares 'dumbbell'/'band'). No son un error de este hito ni se
+ * tocan aquí.
+ *
+ * Hito Provider-Agnostic Normalization — corrección de una afirmación
+ * desactualizada que este mismo docblock tenía: decía que EQUIPMENT_MAP
+ * "tiene 24 claves además de bodyweight (25 en total)" como si fuera el
+ * total completo del mapa — eso dejó de ser cierto en cuanto este hito
+ * agregó 10 claves más (rings/dip bar/bosu/plate/suspension trainer/battle
+ * rope/mini band/trap bar/ez bar/push-up handles), llevando el mapa a 34
+ * claves además de bodyweight (35 en total). Este test sigue verificando
+ * ESPECÍFICAMENTE estas 24 claves originales (un subconjunto deliberado,
+ * no "todo el mapa") — las 10 nuevas tienen su propio test dedicado
+ * ('maps the 10 newly-supported YMove equipment values...', arriba).
  */
-it('keeps the exact same mapping for the other 24 EQUIPMENT_MAP keys, unaffected by the bodyweight refinement (case 5, regression)', function () {
+it('keeps the exact same mapping for these 24 original EQUIPMENT_MAP keys, unaffected by the bodyweight refinement (case 5, regression)', function () {
     $normalizer = new YMoveExerciseNormalizer;
 
     $cases = [
@@ -304,4 +327,215 @@ it('keeps the exact same mapping for the other 24 EQUIPMENT_MAP keys, unaffected
         expect($normalizer->mapEquipment($raw, ['title' => 'Some generic exercise title']))
             ->toBe($expected, "equipment '{$raw}' no debería verse afectado por el refinamiento de bodyweight");
     }
+});
+
+// ── Hito Provider-Agnostic Normalization ────────────────────────────────
+
+/**
+ * Audit #4 — clasificación caso por caso de los 11 valores reales de
+ * equipment antes sin mapeo, verificada contra ejemplos reales del
+ * catálogo vivo. 6 son objetos físicamente distintos (casos nuevos de
+ * Equipment), 3 son variantes con pérdida de granularidad aceptada
+ * (mapeados a un valor existente), 1 se trata como accesorio de confort
+ * (sin equipo), y 1 (ab wheel) queda deliberadamente fuera del mapa.
+ */
+it('maps the 10 newly-supported YMove equipment values to their domain decision', function () {
+    $normalizer = new YMoveExerciseNormalizer;
+
+    $cases = [
+        // Objeto físico distinto → caso nuevo de Equipment.
+        'rings' => ['rings'],
+        'dip bar' => ['dip_bar'],
+        'bosu' => ['bosu'],
+        'plate' => ['plate'],
+        'suspension trainer' => ['suspension_trainer'],
+        'battle rope' => ['battle_rope'],
+        // Variante de equipo ya representado, pérdida aceptada.
+        'mini band' => ['resistance_bands'],
+        'trap bar' => ['barbell'],
+        'ez bar' => ['barbell'],
+        // Accesorio de confort — no cambia la demanda real del movimiento.
+        'push-up handles' => [],
+    ];
+
+    foreach ($cases as $raw => $expected) {
+        expect($normalizer->mapEquipment($raw, ['title' => 'Some exercise']))
+            ->toBe($expected, "equipment '{$raw}' debería mapear a ".json_encode($expected));
+    }
+});
+
+it('leaves "ab wheel" deliberately unmapped, falling through to Unsupported like any other unknown value', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-abwheel', [
+        'id' => 'id-abwheel', 'title' => 'Kneeling Ab Wheel Rollout', 'muscleGroup' => 'core', 'equipment' => 'ab wheel',
+    ]));
+
+    expect($normalized->equipmentNeeded)->toBe([Equipment::Unsupported->value]);
+});
+
+it('logs EXERCISE_EQUIPMENT_UNSUPPORTED with identifying context when equipment falls back to Unsupported', function () {
+    Log::spy();
+
+    (new YMoveExerciseNormalizer)->mapEquipment('a totally new gadget', [
+        'id' => 'provider-id-123', 'title' => 'Mystery Move',
+    ]);
+
+    Log::shouldHaveReceived('warning')->once()->withArgs(
+        fn (string $message, array $context) => $message === 'EXERCISE_EQUIPMENT_UNSUPPORTED'
+            && $context['provider_exercise_id'] === 'provider-id-123'
+            && $context['exercise_name'] === 'Mystery Move'
+            && $context['raw_equipment'] === 'a totally new gadget'
+    );
+});
+
+it('never logs EXERCISE_EQUIPMENT_UNSUPPORTED for a genuinely known value, including bodyweight', function () {
+    Log::spy();
+
+    (new YMoveExerciseNormalizer)->mapEquipment('bodyweight', ['title' => 'Push Ups']);
+    (new YMoveExerciseNormalizer)->mapEquipment('dumbbells', ['title' => 'Dumbbell Curl']);
+
+    Log::shouldNotHaveReceived('warning');
+});
+
+/**
+ * Audit #4 — 14 aliases seguros verificados contra ejemplos reales del
+ * catálogo (ej. "quadriceps" → Dumbbell Goblet Squat / Wall Sit, claramente
+ * cuádriceps). Cada uno mapea a un MuscleFocus YA EXISTENTE — ningún caso
+ * nuevo se agrega al enum para esto.
+ */
+it('maps the 14 newly-supported YMove muscleGroup aliases to an existing MuscleFocus', function () {
+    $cases = [
+        'quadriceps' => MuscleFocus::Quads,
+        'full body' => MuscleFocus::FullBody,
+        'lats' => MuscleFocus::Back,
+        'erector_spinae' => MuscleFocus::Back,
+        'lower_back' => MuscleFocus::Back,
+        'glute_med' => MuscleFocus::Glutes,
+        'lower_abs' => MuscleFocus::Abs,
+        'obliques' => MuscleFocus::Abs,
+        'rectus_abdominis' => MuscleFocus::Abs,
+        'upper_chest' => MuscleFocus::Chest,
+        'lower_chest' => MuscleFocus::Chest,
+        'front_deltoids' => MuscleFocus::Shoulders,
+        'lateral_deltoids' => MuscleFocus::Shoulders,
+        'rear_deltoids' => MuscleFocus::Shoulders,
+    ];
+
+    foreach ($cases as $raw => $expected) {
+        $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-mg', [
+            'id' => 'id-mg', 'title' => 'Something', 'muscleGroup' => $raw, 'equipment' => 'bodyweight',
+        ]));
+
+        expect($normalized->primaryMuscle)->toBe($expected, "muscleGroup '{$raw}' debería mapear a {$expected->value}");
+    }
+});
+
+it('never forces an ambiguous muscleGroup value into an existing MuscleFocus — stays null', function () {
+    $ambiguous = ['legs', 'forearms', 'forearm_flexors', 'brachioradialis', 'hip_flexors', 'neck', 'abductors', 'adductors', 'tibialis_anterior', 'lower_traps', 'middle_traps'];
+
+    foreach ($ambiguous as $raw) {
+        $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-amb', [
+            'id' => 'id-amb', 'title' => 'Something', 'muscleGroup' => $raw, 'equipment' => 'bodyweight',
+        ]));
+
+        expect($normalized->primaryMuscle)->toBeNull("muscleGroup '{$raw}' no debería forzarse a ningún MuscleFocus");
+    }
+});
+
+/**
+ * Audit #4 — YMove pone en `muscleGroup` valores que en realidad son un
+ * dato de OTRO campo (equipment) mal ubicado, o una categoría de
+ * sistema/tipo — nunca un músculo real. Nunca deben convertirse en un
+ * MuscleFocus, sin importar cuán "conocido" suene el string.
+ */
+it('never converts invalid provider data (bodyweight/ketllebell/smith-machine/cardio as muscleGroup) into a muscle', function () {
+    $invalidValues = ['bodyweight', 'ketllebell', 'kettlebell-exercises', 'smith-machine', 'cardio', 'cardiovascular_system'];
+
+    foreach ($invalidValues as $raw) {
+        $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-inv', [
+            'id' => 'id-inv', 'title' => 'Something', 'muscleGroup' => $raw, 'equipment' => 'dumbbell',
+        ]));
+
+        expect($normalized->primaryMuscle)->toBeNull("'{$raw}' es un dato inválido del proveedor, nunca debería convertirse en músculo");
+    }
+});
+
+it('logs invalid provider muscleGroup data distinctly (info/invalid) from a merely unsupported value (info/unsupported)', function () {
+    Log::spy();
+
+    (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-x1', [
+        'id' => 'id-x1', 'title' => 'Smith Machine Squats', 'muscleGroup' => 'smith-machine', 'equipment' => 'machine',
+    ]));
+    (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-x2', [
+        'id' => 'id-x2', 'title' => 'Some Leg Move', 'muscleGroup' => 'legs', 'equipment' => 'bodyweight',
+    ]));
+
+    Log::shouldHaveReceived('info')->withArgs(
+        fn (string $message, array $context) => $message === 'EXERCISE_MUSCLE_GROUP_INVALID' && $context['raw_muscle_group'] === 'smith-machine'
+    )->once();
+
+    Log::shouldHaveReceived('info')->withArgs(
+        fn (string $message, array $context) => $message === 'EXERCISE_MUSCLE_GROUP_UNSUPPORTED' && $context['raw_muscle_group'] === 'legs'
+    )->once();
+});
+
+/**
+ * exercise_type ahora pasa por un vocabulario propio de dominio
+ * (App\Training\Enums\ExerciseType), nunca un pass-through crudo del
+ * proveedor — un valor no reconocido se descarta, nunca se inventa un
+ * caso de enum nuevo para conservarlo.
+ */
+it('normalizes known exerciseType values into the domain ExerciseType vocabulary', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-et', [
+        'id' => 'id-et', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'bodyweight',
+        'exerciseType' => ['strength', 'balance', 'functional', 'core', 'mobility', 'cardio', 'calisthenics', 'stretching', 'yoga', 'plyometric', 'isometric', 'warmup', 'rehabilitation', 'hiit', 'cooldown'],
+    ]));
+
+    expect($normalized->exerciseType)->toBe([
+        ExerciseType::Strength->value, ExerciseType::Balance->value, ExerciseType::Functional->value, ExerciseType::Core->value,
+        ExerciseType::Mobility->value, ExerciseType::Cardio->value, ExerciseType::Calisthenics->value, ExerciseType::Stretching->value,
+        ExerciseType::Yoga->value, ExerciseType::Plyometric->value, ExerciseType::Isometric->value, ExerciseType::Warmup->value,
+        ExerciseType::Rehabilitation->value, ExerciseType::Hiit->value, ExerciseType::Cooldown->value,
+    ]);
+});
+
+it('discards an unrecognized exerciseType value instead of fabricating a new category', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-et2', [
+        'id' => 'id-et2', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'bodyweight',
+        'exerciseType' => ['strength', 'a brand new type ymove invented'],
+    ]));
+
+    expect($normalized->exerciseType)->toBe([ExerciseType::Strength->value]);
+    expect($normalized->exerciseType)->not->toContain('a brand new type ymove invented');
+});
+
+it('logs discarded exerciseType values once per exercise (aggregated), not once per value', function () {
+    Log::spy();
+
+    (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-et3', [
+        'id' => 'id-et3', 'title' => 'Something', 'muscleGroup' => 'back', 'equipment' => 'bodyweight',
+        'exerciseType' => ['strength', 'made up type one', 'made up type two'],
+    ]));
+
+    Log::shouldHaveReceived('info')->withArgs(
+        fn (string $message, array $context) => $message === 'EXERCISE_TYPE_UNSUPPORTED'
+            && $context['raw_exercise_type_discarded'] === ['made up type one', 'made up type two']
+    )->once();
+});
+
+/**
+ * secondary_muscles usa el MISMO MUSCLE_GROUP_MAP que primary_muscle — un
+ * valor soportado (incluidos los 14 aliases nuevos) se conserva, uno no
+ * soportado se filtra silenciosamente (comportamiento ya existente,
+ * verificado aquí explícitamente) sin inventarse como otra categoría.
+ */
+it('preserves supported secondary muscles and filters out unsupported ones without inventing a category', function () {
+    $normalized = (new YMoveExerciseNormalizer)->normalize(new ProviderExerciseData('id-sm', [
+        'id' => 'id-sm', 'title' => 'Something', 'muscleGroup' => 'chest', 'equipment' => 'barbell',
+        'secondaryMuscles' => ['triceps', 'lats', 'serratus_anterior', 'front_deltoids'],
+    ]));
+
+    // 'triceps' (directo) y 'lats'/'front_deltoids' (aliases nuevos)
+    // sobreviven; 'serratus_anterior' (sin mapeo) se filtra, nunca se
+    // convierte en otro músculo.
+    expect($normalized->secondaryMuscles)->toBe([MuscleFocus::Triceps, MuscleFocus::Back, MuscleFocus::Shoulders]);
 });

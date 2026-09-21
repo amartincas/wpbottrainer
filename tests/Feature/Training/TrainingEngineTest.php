@@ -669,6 +669,91 @@ it('does not restrict a gym or home profile the same way — outdoor is the only
     expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($needsBarbell->id);
 });
 
+// ── Hito Provider-Agnostic Normalization — Equipment::Unsupported ─────────
+
+/**
+ * Hallazgo crítico (revisión de diseño): equipment_fully_equipped=true era
+ * un OR que nunca inspeccionaba el contenido de equipment_needed — un
+ * ejercicio con equipo NO reconocido por el normalizer ("unsupported")
+ * habría sido tratado como elegible para cualquier perfil "tengo de todo".
+ * Estos 5 casos prueban la corrección de isEligible() end-to-end, vía el
+ * mismo punto de entrada público que usan todos los demás tests de esta
+ * suite (decideNextSession()), nunca llamando al método privado
+ * directamente.
+ */
+it('never selects an Unsupported-equipment exercise for a Home profile declaring equipment_fully_equipped', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Home,
+        'equipment_fully_equipped' => true,
+        'available_equipment' => [],
+    ]);
+
+    $unsupported = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => ['unsupported']]);
+    $bodyweight = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => []]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+    $selectedIds = $session->workoutExercises->pluck('exercise_id')->all();
+
+    expect($selectedIds)->not->toContain($unsupported->id);
+    expect($selectedIds)->toContain($bodyweight->id);
+});
+
+it('never selects an Unsupported-equipment exercise for a Gym profile declaring equipment_fully_equipped', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Gym,
+        'equipment_fully_equipped' => true,
+        'available_equipment' => [],
+    ]);
+
+    $unsupported = Exercise::factory()->create(['muscle_group' => 'back', 'equipment_needed' => ['unsupported']]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+});
+
+it('never selects an Unsupported-equipment exercise for an Outdoor profile (regression: already excluded, now covered explicitly)', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Outdoor,
+        'equipment_fully_equipped' => true,
+        'available_equipment' => [],
+    ]);
+
+    $unsupported = Exercise::factory()->create(['muscle_group' => 'legs', 'equipment_needed' => ['unsupported']]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+});
+
+it('never selects an Unsupported-equipment exercise for a profile with enumerated equipment (never fully_equipped)', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Home,
+        'equipment_fully_equipped' => false,
+        'available_equipment' => ['dumbbells'],
+    ]);
+
+    $unsupported = Exercise::factory()->create(['muscle_group' => 'shoulders', 'equipment_needed' => ['unsupported']]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->not->toContain($unsupported->id);
+});
+
+it('still selects a real, known-equipment exercise for a fully_equipped profile — the legitimate bypass keeps working', function () {
+    $contact = makeReadyContact([
+        'training_location' => TrainingLocation::Gym,
+        'equipment_fully_equipped' => true,
+        'available_equipment' => [],
+    ]);
+
+    $knownEquipment = Exercise::factory()->create(['muscle_group' => 'chest', 'equipment_needed' => ['dumbbells']]);
+
+    $session = trainingEngine()->decideNextSession($contact);
+
+    expect($session->workoutExercises->pluck('exercise_id')->all())->toContain($knownEquipment->id);
+});
+
 it('prioritizes an exercise matching only secondary_focus over the general pool, with no primary_focus match available', function () {
     // Aísla secondary_focus: primary_focus=[] (sin candidatos posibles en
     // ese nivel, por diseño), secondary_focus=[chest] es la única señal de

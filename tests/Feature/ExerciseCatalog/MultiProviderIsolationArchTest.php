@@ -34,3 +34,19 @@ it('never mentions "ymove" anywhere in TrainingEngine or TrainingHandler, litera
     expect(mb_strtolower($trainingHandlerSource))->not->toContain('ymove');
     expect(mb_strtolower($mediaResolverCallerButOwnFile))->not->toContain('ymove');
 });
+
+/**
+ * Hito Provider-Agnostic Normalization — cierra el círculo del lado del
+ * VOCABULARIO de dominio (no solo del motor que lo consume): Equipment,
+ * ExerciseType y MuscleFocus son 100% propios de WpbotTrainer, nunca deben
+ * mencionar YMove, sin importar cuántos casos nuevos se agreguen.
+ */
+it('never mentions "ymove" anywhere in the domain vocabulary enums (Equipment, ExerciseType, MuscleFocus)', function () {
+    $equipmentSource = file_get_contents(app_path('Training/Enums/Equipment.php'));
+    $exerciseTypeSource = file_get_contents(app_path('Training/Enums/ExerciseType.php'));
+    $muscleFocusSource = file_get_contents(app_path('Training/Enums/MuscleFocus.php'));
+
+    expect(mb_strtolower($equipmentSource))->not->toContain('ymove');
+    expect(mb_strtolower($exerciseTypeSource))->not->toContain('ymove');
+    expect(mb_strtolower($muscleFocusSource))->not->toContain('ymove');
+});

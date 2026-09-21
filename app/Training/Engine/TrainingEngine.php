@@ -8,6 +8,7 @@ use App\Models\Tenant;
 use App\Models\TrainingProfile;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
+use App\Training\Enums\Equipment;
 use App\Training\Enums\HistoryExerciseOutcome;
 use App\Training\Enums\ProgressionDecision;
 use App\Training\Enums\SplitType;
@@ -621,17 +622,32 @@ class TrainingEngine
             return false;
         }
 
+        $equipmentNeeded = $exercise->equipment_needed ?? [];
+
+        // Hito Provider-Agnostic Normalization — Equipment::Unsupported
+        // significa "un proveedor declaró un requisito de equipamiento que
+        // el dominio todavía no puede representar", NUNCA "sin equipo" ni
+        // "equipo real que un usuario con todo razonablemente tendría". Se
+        // evalúa ANTES que cualquier otro camino de elegibilidad —
+        // deliberadamente por delante de equipment_fully_equipped, que de
+        // otro modo (era un OR que nunca inspecciona el contenido del
+        // array) lo trataría como elegible sin más. Ningún ejercicio
+        // Active/pending_review actual tiene este valor (Audit #3) — esta
+        // rama es 100% aditiva, no cambia el comportamiento de nada
+        // existente, solo define correctamente el vocabulario nuevo.
+        if (in_array(Equipment::Unsupported->value, $equipmentNeeded, true)) {
+            return false;
+        }
+
         // Hito 9.0: training_location no tenía ningún consumidor real —
         // "outdoor" es la única ubicación con una consecuencia dura y
         // honesta de modelar: lo que el usuario POSEE (available_equipment/
         // equipment_fully_equipped) no es lo mismo que lo que tiene CONSIGO
         // en un parque. Un ejercicio que exige equipo queda inelegible sin
         // importar esos dos campos.
-        if ($profile->training_location === TrainingLocation::Outdoor && $exercise->equipment_needed !== []) {
+        if ($profile->training_location === TrainingLocation::Outdoor && $equipmentNeeded !== []) {
             return false;
         }
-
-        $equipmentNeeded = $exercise->equipment_needed ?? [];
 
         if ($equipmentNeeded === [] || $profile->equipment_fully_equipped === true) {
             return true;

@@ -6,9 +6,11 @@ use App\ExerciseCatalog\Contracts\ExerciseNormalizerInterface;
 use App\ExerciseCatalog\DTOs\NormalizedExerciseData;
 use App\ExerciseCatalog\DTOs\ProviderExerciseData;
 use App\Training\Enums\Equipment;
+use App\Training\Enums\ExerciseType;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\TrackingType;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Hito 9.1 — traduce el shape crudo de YMove al vocabulario cerrado de
@@ -42,6 +44,50 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         'triceps' => MuscleFocus::Triceps,
         'abs' => MuscleFocus::Abs,
         'full_body' => MuscleFocus::FullBody,
+
+        // Hito Provider-Agnostic Normalization (Audit #4) — 14 aliases
+        // verificados contra ejemplos reales del catálogo vivo: cada uno
+        // es un sub-músculo/variante de formato de un MuscleFocus YA
+        // existente, con pérdida de granularidad aceptada explícitamente
+        // (ej. "lats" es parte de la espalda, no un foco nuevo). Ningún
+        // caso nuevo se agregó a MuscleFocus para esto — el dominio no
+        // adopta automáticamente la granularidad del proveedor.
+        'quadriceps' => MuscleFocus::Quads,
+        'full body' => MuscleFocus::FullBody, // variante de formato (espacio) de "full_body"
+        'lats' => MuscleFocus::Back,
+        'erector_spinae' => MuscleFocus::Back,
+        'lower_back' => MuscleFocus::Back,
+        'glute_med' => MuscleFocus::Glutes,
+        'lower_abs' => MuscleFocus::Abs,
+        'obliques' => MuscleFocus::Abs,
+        'rectus_abdominis' => MuscleFocus::Abs,
+        'upper_chest' => MuscleFocus::Chest,
+        'lower_chest' => MuscleFocus::Chest,
+        'front_deltoids' => MuscleFocus::Shoulders,
+        'lateral_deltoids' => MuscleFocus::Shoulders,
+        'rear_deltoids' => MuscleFocus::Shoulders,
+    ];
+
+    /**
+     * Hito Provider-Agnostic Normalization (Audit #4) — valores que YMove
+     * devuelve en el campo `muscleGroup` pero que NO son un músculo:
+     * duplican un concepto de OTRO campo (equipment: "bodyweight"/
+     * "ketllebell"[sic]/"kettlebell-exercises"/"smith-machine") o son una
+     * categoría de sistema/tipo, no de foco muscular ("cardio"/
+     * "cardiovascular_system" — más cercano a `exercise_type`). Nunca se
+     * fuerzan a un `MuscleFocus` — se tratan y loguean como dato
+     * INVÁLIDO del proveedor, explícitamente distinto de un valor
+     * simplemente no soportado todavía (ver mapMuscleGroup()).
+     *
+     * @var string[]
+     */
+    private const INVALID_MUSCLE_GROUP_VALUES = [
+        'bodyweight',
+        'ketllebell',
+        'kettlebell-exercises',
+        'smith-machine',
+        'cardio',
+        'cardiovascular_system',
     ];
 
     /**
@@ -66,9 +112,17 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
      * ("sin equipo") sin que nada lo señalara. `pull-up bar` de YMove usa
      * guion, se preserva tal cual apareció en la auditoría original.
      *
-     * Hito 15.2 — `'bodyweight' => []` es un caso especial: no es un valor
-     * "final" como los otros 24, sino el único que puede refinarse más
-     * (ver `refineBodyweightEquipment()`) antes de resolverse a `[]`.
+     * Hito 15.2 — `'bodyweight' => []` es un caso especial: a diferencia de
+     * cualquier otra clave de este mapa (final, sin más transformación), es
+     * la única que puede refinarse más (ver `refineBodyweightEquipment()`)
+     * antes de resolverse a `[]`.
+     *
+     * Hito Provider-Agnostic Normalization — 10 claves más (ver el bloque
+     * al final de este array) para 6 objetos de equipo genuinamente
+     * nuevos en el dominio + 3 alias con pérdida aceptada + 1 tratado como
+     * "sin equipo" — ver docs/DECISIONS.md, Audit #4. Cualquier clave que
+     * SIGA sin existir aquí (ej. 'ab wheel', deliberadamente) cae en el
+     * fallback de `mapEquipment()`: `Equipment::Unsupported`, nunca `[]`.
      *
      * @var array<string, Equipment[]>
      */
@@ -98,6 +152,30 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         'foam roller' => [Equipment::FoamRoller],
         'step' => [Equipment::Step],
         'towel' => [Equipment::Towel],
+
+        // Hito Provider-Agnostic Normalization (Audit #4) — 10 valores
+        // reales del catálogo vivo de YMove, antes sin mapeo (caían
+        // silenciosamente en `equipment_needed=[]` vía el fallback de
+        // mapEquipment(), ver ese método). Clasificación decidida caso por
+        // caso (ver docs/DECISIONS.md), nunca "agregar todo lo nuevo":
+        // rings/dip bar/bosu/plate/suspension trainer/battle rope son
+        // objetos físicamente distintos de cualquier valor ya existente →
+        // casos nuevos de Equipment; mini band/trap bar/ez bar son
+        // variantes de equipo ya representado, con pérdida de granularidad
+        // aceptada; push-up handles se trata como accesorio de confort que
+        // no cambia la demanda real del movimiento (equivalente a sin
+        // equipo). `ab wheel` se deja deliberadamente FUERA de este mapa
+        // (volumen mínimo, 1 ejercicio) — cae en el fallback `Unsupported`.
+        'rings' => [Equipment::Rings],
+        'dip bar' => [Equipment::DipBar],
+        'bosu' => [Equipment::Bosu],
+        'plate' => [Equipment::Plate],
+        'suspension trainer' => [Equipment::SuspensionTrainer],
+        'battle rope' => [Equipment::BattleRope],
+        'mini band' => [Equipment::ResistanceBands],
+        'trap bar' => [Equipment::Barbell],
+        'ez bar' => [Equipment::Barbell],
+        'push-up handles' => [],
     ];
 
     /**
@@ -158,7 +236,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         $data = $raw->raw;
 
         $muscleGroupKey = $data['muscleGroup'] ?? null;
-        $primaryMuscle = $muscleGroupKey !== null ? (self::MUSCLE_GROUP_MAP[$muscleGroupKey] ?? null) : null;
+        $primaryMuscle = $this->mapMuscleGroup($muscleGroupKey, $raw->providerExerciseId, $data['title'] ?? null);
 
         $secondaryMuscles = collect($data['secondaryMuscles'] ?? [])
             ->map(fn ($m) => self::MUSCLE_GROUP_MAP[$m] ?? null)
@@ -195,7 +273,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
             // humano lo cura después.
             commonMistakes: [],
             breathingCue: null,
-            exerciseType: array_values(array_filter($data['exerciseType'] ?? [], 'is_string')),
+            exerciseType: $this->mapExerciseType($data['exerciseType'] ?? [], $raw->providerExerciseId, $data['title'] ?? null),
             videoDurationSeconds: $data['videoDurationSecs'] ?? null,
             rawMetadata: $data,
             hasVideo: isset($data['hasVideo']) ? (bool) $data['hasVideo'] : null,
@@ -235,10 +313,114 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
             }
         }
 
-        return array_map(
-            fn (Equipment $e) => $e->value,
-            self::EQUIPMENT_MAP[$key] ?? []
-        );
+        // Hito Provider-Agnostic Normalization — distinción explícita entre
+        // "clave conocida cuyo valor es []" (ej. 'bodyweight' genuino, 'push-up
+        // handles') y "clave que este normalizer nunca ha visto". Antes de este
+        // hito ambos casos usaban `?? []` y eran indistinguibles — un ejercicio
+        // que SÍ exigía equipo (ej. 'rings', histórico) podía terminar
+        // representado igual que uno genuinamente sin equipo. `array_key_exists`
+        // en vez de `??` es la única forma de separarlos correctamente.
+        if (! array_key_exists($key, self::EQUIPMENT_MAP)) {
+            Log::warning('EXERCISE_EQUIPMENT_UNSUPPORTED', [
+                'provider' => 'ymove',
+                'provider_exercise_id' => $rawData['id'] ?? null,
+                'exercise_name' => $rawData['title'] ?? null,
+                'raw_equipment' => $rawEquipment,
+                'normalized_key' => $key,
+            ]);
+
+            return [Equipment::Unsupported->value];
+        }
+
+        return array_map(fn (Equipment $e) => $e->value, self::EQUIPMENT_MAP[$key]);
+    }
+
+    /**
+     * Hito Provider-Agnostic Normalization — mismo criterio que
+     * mapEquipment(): un `muscleGroup` desconocido nunca se convierte en
+     * un `MuscleFocus` inventado, y se distingue explícitamente un dato
+     * INVÁLIDO del proveedor (ver INVALID_MUSCLE_GROUP_VALUES — YMove puso
+     * ahí algo que no es un músculo en absoluto) de un valor simplemente
+     * NO SOPORTADO todavía (una zona real que nuestro vocabulario de 11
+     * focos no distingue con esa granularidad, ej. "legs"/"forearms").
+     * Ambos resultan en `null` — la diferencia es solo observabilidad
+     * (nivel y razón del log), nunca el valor persistido: a diferencia de
+     * `equipment_needed` (donde `[]` SÍ tiene consecuencias de elegibilidad,
+     * ver TrainingEngine::isEligible()), `primary_muscle=null` ya es
+     * tratado de forma segura por `TrainingEngine::selectExercises()` (el
+     * ejercicio simplemente no entra en ningún tier de foco) — no hace
+     * falta un sentinel de dominio nuevo para esto.
+     */
+    private function mapMuscleGroup(?string $muscleGroupKey, string $providerExerciseId, ?string $exerciseName): ?MuscleFocus
+    {
+        if ($muscleGroupKey === null) {
+            return null;
+        }
+
+        if (isset(self::MUSCLE_GROUP_MAP[$muscleGroupKey])) {
+            return self::MUSCLE_GROUP_MAP[$muscleGroupKey];
+        }
+
+        if (in_array($muscleGroupKey, self::INVALID_MUSCLE_GROUP_VALUES, true)) {
+            Log::info('EXERCISE_MUSCLE_GROUP_INVALID', [
+                'provider' => 'ymove',
+                'provider_exercise_id' => $providerExerciseId,
+                'exercise_name' => $exerciseName,
+                'raw_muscle_group' => $muscleGroupKey,
+            ]);
+
+            return null;
+        }
+
+        Log::info('EXERCISE_MUSCLE_GROUP_UNSUPPORTED', [
+            'provider' => 'ymove',
+            'provider_exercise_id' => $providerExerciseId,
+            'exercise_name' => $exerciseName,
+            'raw_muscle_group' => $muscleGroupKey,
+        ]);
+
+        return null;
+    }
+
+    /**
+     * Hito Provider-Agnostic Normalization — traduce el `exerciseType[]`
+     * crudo de YMove al vocabulario propio (`ExerciseType`), nunca un
+     * pass-through del string del proveedor (a diferencia del
+     * comportamiento anterior). Un valor no reconocido se descarta — nunca
+     * se inventa un caso de enum nuevo solo para "no perder el dato" (el
+     * dato crudo completo ya sobrevive en `provider_metadata`, ver
+     * Exercise::$provider_metadata). Un solo log agregado por ejercicio
+     * (no uno por valor) para no generar ruido en una sincronización
+     * completa del catálogo.
+     *
+     * @param  array<int, mixed>  $rawTypes
+     * @return array<int, string> valores de App\Training\Enums\ExerciseType
+     */
+    private function mapExerciseType(array $rawTypes, string $providerExerciseId, ?string $exerciseName): array
+    {
+        $mapped = [];
+        $discarded = [];
+
+        foreach (array_filter($rawTypes, 'is_string') as $raw) {
+            $type = ExerciseType::tryFrom($raw);
+
+            if ($type !== null) {
+                $mapped[] = $type->value;
+            } else {
+                $discarded[] = $raw;
+            }
+        }
+
+        if ($discarded !== []) {
+            Log::info('EXERCISE_TYPE_UNSUPPORTED', [
+                'provider' => 'ymove',
+                'provider_exercise_id' => $providerExerciseId,
+                'exercise_name' => $exerciseName,
+                'raw_exercise_type_discarded' => $discarded,
+            ]);
+        }
+
+        return $mapped;
     }
 
     /**
