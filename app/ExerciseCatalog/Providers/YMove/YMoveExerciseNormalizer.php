@@ -237,12 +237,7 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
 
         $muscleGroupKey = $data['muscleGroup'] ?? null;
         $primaryMuscle = $this->mapMuscleGroup($muscleGroupKey, $raw->providerExerciseId, $data['title'] ?? null);
-
-        $secondaryMuscles = collect($data['secondaryMuscles'] ?? [])
-            ->map(fn ($m) => self::MUSCLE_GROUP_MAP[$m] ?? null)
-            ->filter()
-            ->values()
-            ->all();
+        $secondaryMuscles = $this->mapSecondaryMuscles($data['secondaryMuscles'] ?? []);
 
         $muscleGroupCoarse = self::MUSCLE_GROUP_COARSE_MAP[$muscleGroupKey] ?? ($muscleGroupKey ?? 'core');
 
@@ -350,8 +345,14 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
      * tratado de forma segura por `TrainingEngine::selectExercises()` (el
      * ejercicio simplemente no entra en ningún tier de foco) — no hace
      * falta un sentinel de dominio nuevo para esto.
+     *
+     * Hito Backfill controlado — método público (mismo criterio ya
+     * establecido por `mapEquipment()`) para que un backfill local pueda
+     * re-derivar `primary_muscle` de ejercicios ya sincronizados a partir
+     * del `muscleGroup` crudo que cada fila ya conserva en
+     * `provider_metadata`, sin volver a llamar al proveedor.
      */
-    private function mapMuscleGroup(?string $muscleGroupKey, string $providerExerciseId, ?string $exerciseName): ?MuscleFocus
+    public function mapMuscleGroup(?string $muscleGroupKey, string $providerExerciseId, ?string $exerciseName): ?MuscleFocus
     {
         if ($muscleGroupKey === null) {
             return null;
@@ -380,6 +381,31 @@ class YMoveExerciseNormalizer implements ExerciseNormalizerInterface
         ]);
 
         return null;
+    }
+
+    /**
+     * Hito Backfill controlado — extraído a método público (antes en línea
+     * dentro de `normalize()`) por el mismo motivo que `mapMuscleGroup()`:
+     * que un backfill local pueda re-derivar `secondary_muscles` sin
+     * duplicar el mapa. Usa el MISMO `MUSCLE_GROUP_MAP` que `primary_muscle`
+     * — un valor soportado (incluidos los 14 aliases de este hito) se
+     * conserva, uno no soportado se filtra silenciosamente (nunca se
+     * inventa una categoría ni se loguea aquí — a diferencia de
+     * `primary_muscle`, `secondary_muscles` es plural y de menor impacto en
+     * selección; perder un elemento de varios no deja al ejercicio sin
+     * ninguna señal, así que no se justificó el mismo nivel de
+     * observabilidad).
+     *
+     * @param  array<int, mixed>  $rawSecondaryMuscles
+     * @return array<int, MuscleFocus>
+     */
+    public function mapSecondaryMuscles(array $rawSecondaryMuscles): array
+    {
+        return collect($rawSecondaryMuscles)
+            ->map(fn ($m) => self::MUSCLE_GROUP_MAP[$m] ?? null)
+            ->filter()
+            ->values()
+            ->all();
     }
 
     /**
