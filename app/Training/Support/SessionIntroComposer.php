@@ -73,18 +73,33 @@ class SessionIntroComposer
      * visible, en ningún caso.
      *
      * Único caso especial: `split_type=full_body` sin `primary_focus` ni
-     * `secondary_focus` declarados — ahí no hay ningún foco, ni pretendido
-     * ni real, que describir: "todo el cuerpo" es simplemente la verdad.
+     * `secondary_focus` declarados NI `requested_focus` puntual (Hito B1.3.2)
+     * — ahí no hay ningún foco, ni pretendido ni real ni solicitado, que
+     * describir: "todo el cuerpo" es simplemente la verdad.
      *
      * En cualquier otro caso, la introducción describe los músculos que la
      * sesión REALMENTE contiene — ver `realMuscleFocusLabel()`.
+     *
+     * Hito B1.3.2 — `requested_focus` (petición puntual de ESTA sesión, ver
+     * `RequestedFocusGroup`) SOLO se usa aquí para decidir si corresponde el
+     * atajo de "todo el cuerpo" — nunca como fuente textual del foco en sí.
+     * Con `requested_focus` presente, el flujo sigue exactamente igual hacia
+     * `realMuscleFocusLabel()`, que ya describe los músculos REALES de los
+     * Main ya seleccionados por `TrainingEngine` — sin importar si la
+     * cobertura fue total, parcial o inexistente (`requested_focus_coverage`
+     * deliberadamente NO se consulta aquí: esta corrección es puramente
+     * sobre CUÁNDO activar el atajo, nunca sobre QUÉ texto producir).
+     * Mismo patrón defensivo que `primary_focus`/`secondary_focus`: una
+     * clave ausente (snapshot anterior a B1.3) se comporta como `[]`, sin
+     * ningún cambio de comportamiento para sesiones históricas.
      */
     private function focusLine(WorkoutSession $session): ?string
     {
         $snapshot = $session->prescription_context_snapshot ?? [];
         $primaryFocus = $snapshot['primary_focus'] ?? [];
         $secondaryFocus = $snapshot['secondary_focus'] ?? [];
-        $hasExplicitFocus = $primaryFocus !== [] || $secondaryFocus !== [];
+        $requestedFocus = $snapshot['requested_focus'] ?? [];
+        $hasExplicitFocus = $primaryFocus !== [] || $secondaryFocus !== [] || $requestedFocus !== [];
 
         if (! $hasExplicitFocus && ($snapshot['split_type'] ?? null) === 'full_body') {
             return 'Hoy trabajaremos todo el cuerpo.';
