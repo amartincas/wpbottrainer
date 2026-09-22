@@ -173,9 +173,29 @@ class TrainingProfile extends Model
      *         de `WorkoutSession.scheduled_at` (el instante para el que la
      *         sesión está prevista), aunque hoy ambos coincidan porque
      *         `TrainingEngine` no soporta programación anticipada.
+     * @param  array<int, array{key: string, muscles: array<int, string>}>  $requestedFocus
+     *         Hito B1 (Requested Focus) — petición puntual de ESTA sesión
+     *         (nunca `TrainingProfile.primary_focus`/`secondary_focus`, que
+     *         no cambian por esto). `[]` cuando no se solicitó — mismo
+     *         significado que ausencia de clave, nunca un estado distinto.
+     *         Ya serializado a array plano (no `RequestedFocusGroup[]`) por
+     *         quien llama — este modelo no conoce esa clase de dominio.
+     * @param  array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>  $requestedFocusCoverage
+     *         Hito B1 — resultado de honrar (o no) cada grupo de
+     *         `$requestedFocus`, calculado por `TrainingEngine` DESPUÉS de
+     *         la selección final. `[]` cuando no se solicitó. Es la única
+     *         fuente que un futuro Coach debe usar para saber qué realmente
+     *         se cumplió — nunca debe inferirse de otra forma (ver
+     *         `SessionIntroComposer::focusLine()`, mismo criterio ya
+     *         aplicado a `decided_focus`).
      */
-    public function toPrescriptionContextSnapshot(string $decidedFocus, array $activeSafetyTags, \DateTimeInterface $generatedAt): array
-    {
+    public function toPrescriptionContextSnapshot(
+        string $decidedFocus,
+        array $activeSafetyTags,
+        \DateTimeInterface $generatedAt,
+        array $requestedFocus = [],
+        array $requestedFocusCoverage = [],
+    ): array {
         return [
             'schema_version' => 1,
             'goal' => $this->goal?->value,
@@ -183,6 +203,8 @@ class TrainingProfile extends Model
             'primary_focus' => $this->primary_focus ?? [],
             'secondary_focus' => $this->secondary_focus ?? [],
             'decided_focus' => $decidedFocus,
+            'requested_focus' => $requestedFocus,
+            'requested_focus_coverage' => $requestedFocusCoverage,
             'split_type' => $this->split_type->value,
             'training_location' => $this->training_location?->value,
             'available_equipment' => $this->available_equipment ?? [],

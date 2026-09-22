@@ -21,6 +21,7 @@ use App\Training\Support\HistoryExerciseEntry;
 use App\Training\Support\HistorySetEntry;
 use App\Training\Support\ProgressionEvaluation;
 use App\Training\Support\ProgressionEvaluator;
+use App\Training\Support\RequestedFocusGroup;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
@@ -195,9 +196,27 @@ class TrainingEngine
      * @throws TrainingCatalogInsufficientException si el catálogo elegible
      *         no produce ni un solo ejercicio de bloque principal (Main) —
      *         ninguna WorkoutSession se crea en ese caso.
+     *
+     * @param  ?array<int, RequestedFocusGroup>  $requestedFocus  Hito B1
+     *         (Requested Focus) — petición PUNTUAL de esta sesión (ej.
+     *         "pecho y piernas"), ya normalizada por
+     *         `RequestedFocusTermMapper` — nunca texto libre, nunca decidida
+     *         por el LLM. `null` (default) preserva EXACTAMENTE el
+     *         comportamiento anterior a este hito: ningún caller existente
+     *         necesita cambiar. Nunca modifica
+     *         `TrainingProfile.primary_focus`/`secondary_focus`/`next_focus`
+     *         — ver `$autonomousFocus` más abajo, que sigue siendo la única
+     *         fuente de `next_focus`.
      */
-    public function decideNextSession(Contact $contact): WorkoutSession
+    public function decideNextSession(Contact $contact, ?array $requestedFocus = null): WorkoutSession
     {
+        if ($requestedFocus === []) {
+            // Un array vacío es semánticamente idéntico a "no se solicitó
+            // nada" — nunca se trata como un estado distinto (evita, entre
+            // otras cosas, una división por cero en el reparto de slots).
+            $requestedFocus = null;
+        }
+
         $gateResult = $this->accessGate->authorize($contact);
 
         if (! $gateResult->allowed) {
@@ -226,22 +245,47 @@ class TrainingEngine
             ->limit(self::RECENT_SESSIONS_LOOKBACK)
             ->get();
 
-        $focus = $this->decideFocus($profile, $recentSessions);
+        // Hito B1 (Requested Focus) — $autonomousFocus (el foco que la
+        // rotación habría decidido normalmente) SIEMPRE se calcula, exista o
+        // no $requestedFocus: decideFocus() no depende de éste en absoluto
+        // (no lee primary_focus/secondary_focus), así que no hay ningún
+        // costo evitado al omitirlo, y next_focus (al final de este método)
+        // debe poder derivarse de él sin importar qué se usó para elegir los
+        // ejercicios de ESTA sesión.
+        $autonomousFocus = $this->decideFocus($profile, $recentSessions);
 
-        // Hito R1/R2/R3 — UNA sola lectura del catálogo elegible,
-        // reutilizada por las 3 fases (evita 3 consultas completas
-        // idénticas). `isEligible()` no depende de la fase — mismo filtro
-        // de seguridad/equipo para R1/R2/R3, sin excepción.
-        $eligiblePool = Exercise::query()
-            ->where('is_active', true)
-            ->get()
-            ->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+        // Hito R1/R2/R3 — UNA sola lectura del catálogo ACTIVO, reutilizada
+        // por las 3 fases (evita 3 consultas completas idénticas).
+        // `$activePool` (sin filtrar por elegibilidad) se conserva además
+        // para el Hito B1: diagnosticar si un grupo de requested_focus sin
+        // candidatos elegibles se debe a que el catálogo no lo tiene, o a
+        // que Safety/Equipment lo excluyó (ver
+        // selectExercisesForRequestedFocus()) — nunca participa en la
+        // selección real, solo en ese diagnóstico.
+        $activePool = Exercise::query()->where('is_active', true)->get();
+
+        // `isEligible()` no depende de la fase — mismo filtro de seguridad/
+        // equipo para R1/R2/R3, sin excepción.
+        $eligiblePool = $activePool->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
 
         [$targetPrepCount, $targetCooldownCount, $maxSupportSlots, $mainBudgetMinutes] = $this->planSupportBudget($contact->tenant);
 
         // R1 selecciona PRIMERO (autoridad de prescripción, Decisión #8 del
         // diseño aprobado) — nunca se ve limitado por lo que R2/R3 tomen.
-        $mainExercises = $this->selectExercises($profile, $focus, $recentSessions, $contact, $eligiblePool, $mainBudgetMinutes);
+        //
+        // Hito B1 — $requestedFocus === null ejecuta EXACTAMENTE el flujo
+        // anterior a este hito (selectExercises(), sin cambios). Solo cuando
+        // hay una petición puntual se construyen tiers por GRUPO (nunca un
+        // único primaryTier plano — ver docblock de
+        // selectExercisesForRequestedFocus()).
+        if ($requestedFocus === null) {
+            $mainExercises = $this->selectExercises($profile, $autonomousFocus, $recentSessions, $contact, $eligiblePool, $mainBudgetMinutes);
+            $requestedFocusCoverage = [];
+        } else {
+            [$mainExercises, $requestedFocusCoverage] = $this->selectExercisesForRequestedFocus(
+                $profile, $requestedFocus, $autonomousFocus, $recentSessions, $contact, $eligiblePool, $activePool, $mainBudgetMinutes,
+            );
+        }
 
         // Una WorkoutSession NUNCA se crea sin al menos 1 ejercicio de
         // bloque principal — se lanza ANTES de WorkoutSession::create(),
@@ -300,9 +344,13 @@ class TrainingEngine
             'scheduled_at' => $generatedAt,
             'generated_by' => 'training_engine',
             'prescription_context_snapshot' => $profile->toPrescriptionContextSnapshot(
-                $focus,
+                $autonomousFocus,
                 $this->safetyResolver->activeSafetyBodyRegions($profile),
                 $generatedAt,
+                $requestedFocus !== null
+                    ? array_map(fn (RequestedFocusGroup $group) => ['key' => $group->key, 'muscles' => $group->muscles], $requestedFocus)
+                    : [],
+                $requestedFocusCoverage,
             ),
         ]);
 
@@ -324,7 +372,13 @@ class TrainingEngine
             $this->prescribeSupportExercise($session, $exercise, $order++, WorkoutExercisePhase::Cooldown);
         }
 
-        $profile->update(['next_focus' => $this->nextInRotation($focus, $profile->split_type)]);
+        // Hito B1 — REGLA OBLIGATORIA: next_focus deriva EXCLUSIVAMENTE de
+        // $autonomousFocus, nunca de $requestedFocus. requested_focus es una
+        // petición de UNA sesión, no una preferencia persistente — si
+        // avanzara la rotación, una petición puntual de "brazos" hoy
+        // desviaría permanentemente qué le toca entrenar mañana sin que el
+        // usuario lo haya pedido. Ver tests explícitos contra esta regresión.
+        $profile->update(['next_focus' => $this->nextInRotation($autonomousFocus, $profile->split_type)]);
 
         return $session->load('workoutExercises');
     }
@@ -576,6 +630,304 @@ class TrainingEngine
         }
 
         return $selected;
+    }
+
+    /**
+     * Hito B1 (Requested Focus) — equivalente de `selectExercises()` cuando
+     * el usuario pide una sesión puntual (ej. "pecho y piernas"), usado
+     * SOLO cuando `$requestedFocus !== null` (diseño aprobado, Secciones
+     * 6-13). NUNCA colapsa los grupos en un único `primaryTier` plano — cada
+     * `RequestedFocusGroup` es una unidad de intención independiente,
+     * combinada con semántica AND (cada grupo intenta tener representación
+     * propia), mientras que los `MuscleFocus` DENTRO de un mismo grupo (ej.
+     * "piernas" = quads∪hamstrings∪glutes∪calves) siguen siendo OR (ver
+     * `RequestedFocusGroup`).
+     *
+     * Algoritmo (política ya cerrada, no una propuesta):
+     * 1. Candidatos relevantes por grupo, sobre `$eligiblePool` (Safety/
+     *    Equipment ya aplicados, sin excepción) — nunca se relaja
+     *    `isEligible()` por tratarse de una petición explícita.
+     * 2. Slots TEÓRICOS por grupo: `floor(N/G)` + resto repartido a los
+     *    primeros grupos por `key` ASC; si `G > N`, 1 slot a los primeros N
+     *    grupos por `key` ASC, el resto en 0 (`session_too_short`). El orden
+     *    alfabético es SOLO un desempate determinista — nunca representa
+     *    prioridad del usuario ni de entrenamiento (diseño aprobado, Sección
+     *    8).
+     * 3. Slots EFECTIVOS: `min(teórico, candidatos disponibles del grupo)`
+     *    — nunca se reserva más de lo que el catálogo elegible realmente
+     *    tiene; el déficit pasa al pool libre (paso 5).
+     * 4. Reclamo de ejercicios FÍSICAMENTE DISTINTOS: se procesan los grupos
+     *    en `key` ASC, cada uno reclama de su propio tier (ya ordenado por
+     *    `sortCandidates()`, sin cambios) los candidatos que un grupo
+     *    anterior no haya reclamado ya. Un ejercicio relevante para 2 grupos
+     *    nunca ocupa 2 slots reservados — una vez reclamado por un grupo,
+     *    queda retirado del pool para los siguientes.
+     * 5. Pool libre: primero candidatos sobrantes de los propios grupos
+     *    solicitados (unión, sin duplicados, ordenados por
+     *    `sortCandidates()`), después el `generalTier` autónomo
+     *    (`$autonomousFocus`, el mismo mecanismo de rotación de siempre) —
+     *    nunca aleatoriedad, mismos criterios de siempre
+     *    (difficultyMatchRank → varietyScore → id).
+     * 6. Cobertura final: `requestedFocusCoverage()` — calculada DESPUÉS de
+     *    cerrar la selección, sobre la lista completa. Un ejercicio puede
+     *    contar para la cobertura de varios grupos (conteo generoso,
+     *    informativo) sin que eso relaje la reserva por slots del paso 4.
+     *
+     * @param  array<int, RequestedFocusGroup>  $requestedFocus  Orden
+     *         original preservado — usado para la salida (trazabilidad),
+     *         nunca para decidir prioridad de slots (eso es `key` ASC).
+     * @return array{0: Collection<int, Exercise>, 1: array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>}
+     */
+    private function selectExercisesForRequestedFocus(
+        TrainingProfile $profile,
+        array $requestedFocus,
+        string $autonomousFocus,
+        Collection $recentSessions,
+        Contact $contact,
+        Collection $eligiblePool,
+        Collection $activePool,
+        float $targetMinutes,
+    ): array {
+        $exercisesPerSession = $this->exercisesForTargetDuration($profile, $contact->tenant, $targetMinutes);
+        $groupCount = count($requestedFocus);
+
+        // Desempate determinista SOLO por key — nunca por orden de mención
+        // (diseño aprobado, Sección 2/8).
+        $orderedByKey = collect($requestedFocus)->sortBy(fn (RequestedFocusGroup $group) => $group->key)->values();
+
+        // Paso 1: candidatos relevantes por grupo, ya ordenados.
+        $candidatesByKey = [];
+        foreach ($requestedFocus as $group) {
+            $relevant = $eligiblePool->filter(
+                fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
+            );
+            $candidatesByKey[$group->key] = $this->sortCandidates($relevant, $profile, $recentSessions);
+        }
+
+        // Paso 2: slots teóricos.
+        $baseSlots = intdiv($exercisesPerSession, $groupCount);
+        $remainder = $exercisesPerSession % $groupCount;
+        $theoreticalSlots = [];
+
+        foreach ($orderedByKey as $index => $group) {
+            if ($baseSlots >= 1) {
+                $theoreticalSlots[$group->key] = $baseSlots + ($index < $remainder ? 1 : 0);
+            } else {
+                // G > N: 1 slot a los primeros N grupos por key ASC, el
+                // resto queda en 0 (session_too_short, nunca un slot
+                // ficticio).
+                $theoreticalSlots[$group->key] = $index < $exercisesPerSession ? 1 : 0;
+            }
+        }
+
+        // Paso 3: slots efectivos, nunca por encima de la disponibilidad real.
+        $effectiveSlots = [];
+        foreach ($requestedFocus as $group) {
+            $effectiveSlots[$group->key] = min($theoreticalSlots[$group->key], $candidatesByKey[$group->key]->count());
+        }
+
+        // Paso 4: reclamo de ejercicios físicamente distintos, en key ASC.
+        $claimedIds = [];
+        $slotsFilled = [];
+        $reservedByKey = [];
+
+        foreach ($orderedByKey as $group) {
+            $available = $candidatesByKey[$group->key]->reject(
+                fn (Exercise $exercise) => in_array($exercise->id, $claimedIds, true)
+            );
+            $claimed = $available->take($effectiveSlots[$group->key])->values();
+
+            $reservedByKey[$group->key] = $claimed;
+            $slotsFilled[$group->key] = $claimed->count();
+            $claimedIds = array_merge($claimedIds, $claimed->pluck('id')->all());
+        }
+
+        // Selección reservada, en el orden ORIGINAL de $requestedFocus
+        // (trazabilidad) — el orden de reclamo (key ASC) ya cumplió su
+        // único propósito (determinismo del reparto), no necesita
+        // propagarse a la selección final.
+        $reservedSelection = collect();
+        foreach ($requestedFocus as $group) {
+            $reservedSelection = $reservedSelection->concat($reservedByKey[$group->key]);
+        }
+
+        // Paso 5: pool libre.
+        $remainingBudget = $exercisesPerSession - $reservedSelection->count();
+        $freeSelection = collect();
+
+        if ($remainingBudget > 0) {
+            $leftoverFromGroups = collect();
+            foreach ($requestedFocus as $group) {
+                $leftoverFromGroups = $leftoverFromGroups->concat($candidatesByKey[$group->key]);
+            }
+            $leftoverFromGroups = $leftoverFromGroups->unique('id')
+                ->reject(fn (Exercise $exercise) => in_array($exercise->id, $claimedIds, true));
+            $leftoverFromGroups = $this->sortCandidates($leftoverFromGroups, $profile, $recentSessions);
+
+            $fromGroups = $leftoverFromGroups->take($remainingBudget)->values();
+            $freeSelection = $freeSelection->concat($fromGroups);
+            $claimedIds = array_merge($claimedIds, $fromGroups->pluck('id')->all());
+            $remainingBudget -= $fromGroups->count();
+        }
+
+        if ($remainingBudget > 0) {
+            $generalMuscleGroups = explode(',', $autonomousFocus);
+            $generalCandidates = $eligiblePool
+                ->filter(fn (Exercise $exercise) => in_array($exercise->muscle_group, $generalMuscleGroups, true))
+                ->reject(fn (Exercise $exercise) => in_array($exercise->id, $claimedIds, true));
+            $generalCandidates = $this->sortCandidates($generalCandidates, $profile, $recentSessions);
+
+            $freeSelection = $freeSelection->concat($generalCandidates->take($remainingBudget)->values());
+        }
+
+        $selected = $reservedSelection->concat($freeSelection)->take($exercisesPerSession)->values();
+
+        // Mismo criterio que selectExercises(): Collection::take() nunca
+        // inventa — catálogo insuficiente en TOTAL (ortogonal a la
+        // cobertura por grupo) simplemente entrega una sesión más corta.
+        if ($selected->count() < $exercisesPerSession) {
+            Log::info('TRAINING_DURATION_TARGET_UNREACHABLE', [
+                'contact_id' => $contact->id,
+                'tenant_id' => $contact->tenant->id,
+                'target_session_duration_minutes' => $contact->tenant->target_session_duration_minutes,
+                'exercises_requested' => $exercisesPerSession,
+                'exercises_selected' => $selected->count(),
+            ]);
+        }
+
+        $coverage = $this->requestedFocusCoverage(
+            $requestedFocus, $theoreticalSlots, $effectiveSlots, $slotsFilled, $candidatesByKey, $selected, $activePool, $contact,
+        );
+
+        return [$selected, $coverage];
+    }
+
+    /**
+     * Hito B1 — calcula el estado final de cada grupo solicitado, DESPUÉS
+     * de que la selección ya está cerrada (diseño aprobado, Secciones 4/12/
+     * 13). `coverage` es un conteo GENEROSO (un ejercicio puede contar para
+     * varios grupos) — nunca modifica `slots_reserved`/`slots_filled`, que
+     * ya quedaron fijados por la reserva física de `selectExercisesForRequestedFocus()`.
+     *
+     * Estados: `fulfilled` (el grupo alcanzó su reserva teórica),
+     * `partial` (alcanzó algo pero menos de lo teórico), `unavailable`
+     * (nada). Razones (solo cuando no es `fulfilled`): `session_too_short`
+     * (el grupo nunca tuvo slot teórico porque G > N — ver paso 2),
+     * `catalog` (el catálogo activo no tiene, o no tiene suficientes,
+     * candidatos para el grupo) y `safety_or_equipment` (el catálogo SÍ
+     * tiene más candidatos de los que sobrevivieron a `isEligible()` para
+     * este grupo). Esta distinción es puramente DIAGNÓSTICA — nunca
+     * participa en la selección real, que ya cerró usando únicamente
+     * `$eligiblePool`.
+     *
+     * @param  array<int, RequestedFocusGroup>  $requestedFocus
+     * @param  array<string, int>  $theoreticalSlots
+     * @param  array<string, int>  $effectiveSlots
+     * @param  array<string, int>  $slotsFilled
+     * @param  array<string, Collection<int, Exercise>>  $candidatesByKey  Candidatos
+     *         elegibles POR GRUPO (independiente de qué otro grupo haya
+     *         reclamado — la cuenta "cruda" de disponibilidad, usada para el
+     *         diagnóstico catalog/safety_or_equipment; NUNCA `$slotsFilled`,
+     *         que puede ser menor por una colisión de reclamo entre grupos,
+     *         algo que no tiene nada que ver con catálogo ni con Safety).
+     * @param  Collection<int, Exercise>  $selected
+     * @return array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>
+     */
+    private function requestedFocusCoverage(
+        array $requestedFocus,
+        array $theoreticalSlots,
+        array $effectiveSlots,
+        array $slotsFilled,
+        array $candidatesByKey,
+        Collection $selected,
+        Collection $activePool,
+        Contact $contact,
+    ): array {
+        $coverage = [];
+
+        foreach ($requestedFocus as $group) {
+            $theoretical = $theoreticalSlots[$group->key];
+            $reserved = $effectiveSlots[$group->key];
+            $filled = $slotsFilled[$group->key];
+            $eligibleCount = $candidatesByKey[$group->key]->count();
+
+            $finalCoverage = $selected->filter(
+                fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
+            )->count();
+
+            if ($theoretical === 0) {
+                $status = 'unavailable';
+                $reason = 'session_too_short';
+            } elseif ($filled === 0) {
+                $status = 'unavailable';
+                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $activePool);
+
+                Log::info('TRAINING_REQUESTED_FOCUS_UNAVAILABLE', [
+                    'contact_id' => $contact->id,
+                    'group' => $group->key,
+                    'reason' => $reason,
+                ]);
+            } elseif ($filled < $theoretical) {
+                $status = 'partial';
+                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $activePool);
+
+                Log::info('TRAINING_REQUESTED_FOCUS_PARTIAL', [
+                    'contact_id' => $contact->id,
+                    'group' => $group->key,
+                    'slots_reserved' => $reserved,
+                    'slots_filled' => $filled,
+                    'reason' => $reason,
+                ]);
+            } else {
+                $status = 'fulfilled';
+                $reason = null;
+            }
+
+            $coverage[] = [
+                'key' => $group->key,
+                'slots_reserved' => $reserved,
+                'slots_filled' => $filled,
+                'coverage' => $finalCoverage,
+                'status' => $status,
+                'reason' => $reason,
+            ];
+        }
+
+        return $coverage;
+    }
+
+    /**
+     * Hito B1 — diagnóstico `catalog` vs. `safety_or_equipment` (diseño
+     * aprobado, Sección 13): compara cuántos ejercicios ACTIVOS (antes de
+     * `isEligible()`) son relevantes para el grupo contra cuántos
+     * sobrevivieron. Si `isEligible()` excluyó alguno, la razón es
+     * `safety_or_equipment`; si el catálogo activo nunca tuvo ninguno para
+     * empezar, es `catalog`. Puramente diagnóstico — nunca cambia qué se
+     * selecciona.
+     */
+    private function requestedFocusUnavailableReason(RequestedFocusGroup $group, int $eligibleCount, Collection $activePool): string
+    {
+        $catalogCount = $activePool->filter(
+            fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
+        )->count();
+
+        return $catalogCount > $eligibleCount ? 'safety_or_equipment' : 'catalog';
+    }
+
+    /**
+     * Extraído de la lógica duplicada en `selectExercises()`/`focusScore()`
+     * (sin modificarlas) — nuevo helper usado únicamente por el código del
+     * Hito B1, para no repetir por tercera vez la misma construcción de
+     * `[primary_muscle, ...secondary_muscles]`.
+     *
+     * @return array<int, string>
+     */
+    private function exerciseMuscles(Exercise $exercise): array
+    {
+        return array_values(array_filter(array_merge(
+            [$exercise->primary_muscle?->value],
+            $exercise->secondary_muscles ?? []
+        )));
     }
 
     /**
