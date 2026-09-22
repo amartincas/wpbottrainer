@@ -42,6 +42,7 @@ it('validates a fully well-formed report with multiple sets', function () {
         'Sentadilla: 10x40, 10x45, 8x50, me costó bastante',
         [['name' => 'Sentadilla']],
         Tenant::factory()->create(['ai_provider' => 'openai']),
+        frontExerciseName: 'Sentadilla',
     );
 
     expect($result['reports'])->toHaveCount(1);
@@ -63,7 +64,7 @@ it('discards a set with no quantifiable data at all', function () {
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     expect($result['reports'][0]['sets'])->toBe([]);
 });
@@ -77,7 +78,7 @@ it('discards an out-of-range rpe_number', function () {
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     expect($result['reports'][0]['rpe'])->toBeNull();
 });
@@ -91,7 +92,7 @@ it('discards an invalid rpe_category instead of guessing a number', function () 
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     expect($result['reports'][0]['rpe'])->toBeNull();
 });
@@ -105,7 +106,7 @@ it('prefers an explicit rpe_number over a mapped rpe_category', function () {
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('algo', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     expect($result['reports'][0]['rpe'])->toBe(9);
 });
@@ -119,7 +120,7 @@ it('parses session_finished and not_performed as booleans', function () {
         'session_finished' => true,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('no hice sentadilla, ya me voy', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('no hice sentadilla, ya me voy', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['not_performed'])->toBeTrue();
     expect($result['session_finished'])->toBeTrue();
@@ -128,7 +129,7 @@ it('parses session_finished and not_performed as booleans', function () {
 it('returns no reports for an empty message without calling the AI provider', function () {
     Http::fake();
 
-    $result = (new ExecutionReportService)->extractReport('', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     // Bloque 9 (D052): EMPTY_RESULT ahora incluye, de forma aditiva,
     // safety_signal_text/intents/training_reply — mismo comportamiento de
@@ -149,7 +150,7 @@ it('returns no reports when there is nothing reportable, without calling the AI 
 it('degrades to no reports when the AI provider fails, without throwing', function () {
     Http::fake(['api.openai.com/*' => Http::response('Server error', 500)]);
 
-    $result = (new ExecutionReportService)->extractReport('hice sentadilla 10x40', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('hice sentadilla 10x40', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result)->toBe(['reports' => [], 'session_finished' => false, 'safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null]);
 });
@@ -165,7 +166,7 @@ it('validates skip_reason only when not_performed is true', function () {
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('no me dio tiempo', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('no me dio tiempo', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['skip_reason'])->toBe('no_time');
 });
@@ -180,7 +181,7 @@ it('discards skip_reason when not_performed is false, even if the LLM hallucinat
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('hice sentadilla 10x40', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('hice sentadilla 10x40', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['skip_reason'])->toBeNull();
 });
@@ -194,7 +195,7 @@ it('discards an invalid skip_reason value instead of trusting the LLM', function
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('no pude', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('no pude', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['skip_reason'])->toBeNull();
 });
@@ -210,7 +211,7 @@ it('discards an invalid skip_reason value instead of trusting the LLM', function
 it('the prompt explicitly instructs that a bare confirmation like "hecho" must still produce a report, never an empty array', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false]);
 
-    (new ExecutionReportService)->extractReport('hecho', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    (new ExecutionReportService)->extractReport('hecho', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     Http::assertSent(function ($request) {
         $systemPrompt = data_get($request->data(), 'messages.0.content', '');
@@ -229,7 +230,7 @@ it('accepts a report with a null exercise_name and empty sets — the single-pen
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('hecho', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('hecho', [['name' => 'Plancha']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Plancha');
 
     expect($result['reports'])->toHaveCount(1);
     expect($result['reports'][0]['exercise_name'])->toBeNull();
@@ -250,7 +251,7 @@ it('accepts a report with a null exercise_name and empty sets — the single-pen
 it('the prompt explicitly instructs an exact set count matching what the user literally said', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false]);
 
-    (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     Http::assertSent(function ($request) {
         $systemPrompt = data_get($request->data(), 'messages.0.content', '');
@@ -271,7 +272,7 @@ it('"la serie de 10 con 8kg" (singular) is extracted as exactly 1 set — test d
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['sets'])->toHaveCount(1);
     expect($result['reports'][0]['sets'][0])->toBe(['reps' => 10, 'load' => 8.0, 'duration_seconds' => null]);
@@ -291,7 +292,7 @@ it('"3 series de 10" is extracted as exactly 3 identical sets — test de extrac
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('3 series de 10', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('3 series de 10', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['sets'])->toHaveCount(3);
 });
@@ -310,7 +311,7 @@ it('an enumeration "10, 10 y 8" is extracted as exactly 3 sets — test de extra
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('10, 10 y 8', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('10, 10 y 8', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reports'][0]['sets'])->toHaveCount(3);
 });
@@ -333,7 +334,7 @@ it('a genuinely ambiguous bare hour ("a las 7") never produces a usable reminder
         'reminder_time' => '07:00', // el LLM "adivinó" — el código debe descartarlo igual
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reminder_time'])->toBeNull();
 });
@@ -341,7 +342,7 @@ it('a genuinely ambiguous bare hour ("a las 7") never produces a usable reminder
 it('an explicit 24h-format hour ("a las 21") is always preserved, regardless of any period wording', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
 
-    $result = (new ExecutionReportService)->extractReport('recuérdame a las 21', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 21', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reminder_time'])->toBe('21:00');
 });
@@ -349,7 +350,7 @@ it('an explicit 24h-format hour ("a las 21") is always preserved, regardless of 
 it('an explicit AM/PM marker ("a las 9 PM") is preserved — the period indicator in the raw message is what unlocks it', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
 
-    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 PM', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 PM', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reminder_time'])->toBe('21:00');
 });
@@ -357,7 +358,7 @@ it('an explicit AM/PM marker ("a las 9 PM") is preserved — the period indicato
 it('"de la mañana" phrasing is preserved as a valid period indicator', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '07:00']);
 
-    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7 de la mañana', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 7 de la mañana', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reminder_time'])->toBe('07:00');
 });
@@ -365,7 +366,7 @@ it('"de la mañana" phrasing is preserved as a valid period indicator', function
 it('"de la noche" phrasing is preserved as a valid period indicator', function () {
     fakeReportExtraction(['reports' => [], 'session_finished' => false, 'reminder_time' => '21:00']);
 
-    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 de la noche', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('recuérdame a las 9 de la noche', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     expect($result['reminder_time'])->toBe('21:00');
 });
@@ -388,7 +389,7 @@ it('validateSets() never inflates or reduces the count returned by the LLM — i
         'session_finished' => false,
     ]);
 
-    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']));
+    $result = (new ExecutionReportService)->extractReport('la serie de 10 con 8kg', [['name' => 'Sentadilla']], Tenant::factory()->create(['ai_provider' => 'openai']), frontExerciseName: 'Sentadilla');
 
     // El pipeline de validación copia 1:1 lo que la IA devolvió.
     expect($result['reports'][0]['sets'])->toHaveCount(2);

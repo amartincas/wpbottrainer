@@ -543,7 +543,14 @@ class TrainingHandler implements HandlerInterface
         // (jamás reenvía la rutina por una pregunta que no es un reporte).
         $activeSessionFragment = $this->buildContext($context, 'active_workout_session');
         $reportableExercises = $activeSessionFragment->data['unreported_exercises'] ?? [];
-        $pendingSupportExercise = $activeSessionFragment->data['pending_support_exercise'] ?? null;
+        // Corrección post-incidente de staging (#33, hito R1/R2/R3) — ÚNICA
+        // representación de "qué está viendo/resolviendo el usuario ahora
+        // mismo", para cualquier fase — ver
+        // ActiveWorkoutSessionContextProvider::provide()/WorkoutSession::frontExercise().
+        // `requires_report` es la ÚNICA condición usada para decidir entre
+        // el paso 4a (confirmación) y el paso 4 (reporte) — nunca se
+        // reinfiere de listas separadas.
+        $frontExercise = $activeSessionFragment->data['front_exercise'] ?? null;
 
         // 4a. Hito R1/R2/R3 — confirmación EXPLÍCITA para avanzar más allá
         // de un ejercicio de apoyo (Preparation/Cooldown) ya entregado, que
@@ -554,22 +561,20 @@ class TrainingHandler implements HandlerInterface
         // Deliberadamente INCONDICIONAL a `$reportableExercises` — no
         // "solo cuando esté vacío": `unreported_exercises` (arriba) lista
         // TODO Main sin ExerciseLog en la sesión, incluidos los que
-        // TODAVÍA NO se han entregado (mismo criterio heredado de antes de
-        // este hito, ver docblock de ActiveWorkoutSessionContextProvider) —
-        // mientras un Preparation está pendiente de confirmación, el/los
-        // Main de la sesión casi siempre están así, así que exigir la
-        // lista vacía haría que este paso nunca se ejecutara para
-        // Preparation en la práctica. El invariante real de entrega
-        // progresiva garantiza que solo hay UN frente a la vez — si
-        // `pendingSupportExercise` no es null, ESE es el frente real,
-        // sin importar qué otros Main aún no entregados aparezcan en la
-        // lista. 100% determinista, sin IA: SupportPhaseConfirmationDetector
-        // nunca acepta una pregunta o un mensaje libre como confirmación —
-        // ese caso cae, sin cambios, al paso 4 siguiente (que sabe
-        // responder preguntas vía su propio `training_reply`) o al paso 5.
-        if ($pendingSupportExercise !== null && $body !== ''
+        // TODAVÍA NO se han entregado — mientras un Preparation está
+        // pendiente de confirmación, el/los Main de la sesión casi siempre
+        // están así, así que exigir la lista vacía haría que este paso
+        // nunca se ejecutara para Preparation en la práctica. El invariante
+        // real de entrega progresiva garantiza que solo hay UN frente a la
+        // vez — `frontExercise` (ver arriba) es ese frente, sin importar
+        // qué otros Main aún no entregados aparezcan en la lista. 100%
+        // determinista, sin IA: SupportPhaseConfirmationDetector nunca
+        // acepta una pregunta o un mensaje libre como confirmación — ese
+        // caso cae, sin cambios, al paso 4 siguiente (que sabe responder
+        // preguntas vía su propio `training_reply`) o al paso 5.
+        if ($frontExercise !== null && ! $frontExercise['requires_report'] && $body !== ''
             && $this->supportConfirmationDetector->isExplicitConfirmation($body)) {
-            $workoutExercise = WorkoutExercise::find($pendingSupportExercise['workout_exercise_id']);
+            $workoutExercise = WorkoutExercise::find($frontExercise['workout_exercise_id']);
 
             if ($workoutExercise !== null) {
                 $this->advancePastSupportExercise($workoutExercise, $from, $tenant, $freshContact);
@@ -580,9 +585,18 @@ class TrainingHandler implements HandlerInterface
 
         if ($activeSessionFragment->data !== null && $reportableExercises !== [] && $body !== '') {
             $coachContext = $this->buildContext($context, 'coach_context')->data;
-            $result = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant, $coachContext);
+            // Corrección post-incidente de staging (#33) — el frente SOLO
+            // se pasa como identidad de "ejercicio recién mostrado" cuando
+            // realmente requiere reporte (es Main). Si el frente es un
+            // Preparation/Cooldown (el usuario nunca vio ningún Main
+            // todavía, aunque existan Main sin entregar en la sesión), se
+            // pasa `null` — ni ExecutionReportService ni ExecutionReportRecorder
+            // asumen entonces ningún ejercicio por defecto (Reglas 4/5).
+            $frontExerciseName = ($frontExercise !== null && $frontExercise['requires_report']) ? $frontExercise['name'] : null;
+            $frontExerciseId = ($frontExercise !== null && $frontExercise['requires_report']) ? $frontExercise['workout_exercise_id'] : null;
+            $result = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant, $coachContext, $frontExerciseName);
             $resolved = $this->turnResolver->resolve($result);
-            $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body);
+            $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body, $frontExerciseId);
 
             return;
         }
@@ -630,7 +644,19 @@ class TrainingHandler implements HandlerInterface
                 $profile->update(['coach_conversation_reinforced' => true]);
             }
 
-            $shouldDeliverSession = $this->executeTurnActions($resolved, null, $from, $tenant, $freshContact, $profile, $startedAt, $body);
+            // Corrección post-incidente de staging (#33, hito R1/R2/R3,
+            // Regla 11) — se pasa el fragmento REAL de sesión activa, nunca
+            // `null` hardcodeado: antes, `continue_training` con una sesión
+            // activa real (front Support, o front Main sin nada reportable
+            // por nombre) llegaba aquí con `activeSessionData=null`, lo que
+            // hacía que la rama `DeliverSession` de executeTurnActions()
+            // nunca detectara la sesión existente y volviera a llamar
+            // decideNextSession()/reenviara la intro y el primer ejercicio
+            // — el bug exacto reproducido en staging. `RecordExecutionReport`
+            // sigue sin poder activarse desde este camino (CoachService
+            // nunca expone `reports`/`session_finished`), así que pasar el
+            // fragmento real aquí no cambia ningún otro comportamiento.
+            $shouldDeliverSession = $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body);
 
             if (! $shouldDeliverSession) {
                 return;
@@ -684,19 +710,27 @@ class TrainingHandler implements HandlerInterface
         $this->reply($from, $this->sessionIntroComposer->compose($session), $tenant);
 
         // H16.2 Fase 1 — entrega progresiva: se entrega ÚNICAMENTE el primer
-        // ejercicio (order más bajo — ya garantizado por
-        // WorkoutSession::workoutExercises(), ver Modelo) — nunca los N de
-        // una sola vez. El resto se entrega uno a la vez, solo tras un
-        // reporte real del anterior (ver recordExecutionReport()) — sin
-        // ningún estado nuevo persistido: "el siguiente" siempre se deriva
-        // de los WorkoutExercise sin ExerciseLog, ya ordenados por columna.
-        // Guard defensivo (ya existía implícitamente en el bucle anterior,
-        // que simplemente no iteraba nada): una sesión sin ningún ejercicio
-        // elegible (catálogo vacío/sin match) no debe romper el turno.
-        $firstExercise = $session->workoutExercises->first();
+        // ejercicio (order más bajo, ya garantizado por
+        // WorkoutSession::workoutExercises()/nextUndeliveredExercise()) —
+        // nunca los N de una sola vez. El resto se entrega uno a la vez,
+        // solo tras un reporte real o una confirmación explícita del
+        // anterior — sin ningún estado nuevo persistido: "el siguiente"
+        // siempre se deriva de `delivered_at === null` (ver
+        // WorkoutSession::nextUndeliveredExercise(), corrección
+        // post-incidente de staging #33). Guard defensivo (ya existía
+        // implícitamente en el bucle anterior, que simplemente no iteraba
+        // nada): una sesión sin ningún ejercicio elegible (catálogo vacío/
+        // sin match) no debe romper el turno.
+        //
+        // Regla 13 — mismo camino de entrega que el resto del sistema
+        // (`deliverExerciseAndMaybeComplete()`, nunca `deliverExercise()`
+        // bare): nunca puede completar aquí en la práctica (TrainingEngine
+        // garantiza ≥1 Main), pero mantiene una única semántica de entrega
+        // en todo el archivo.
+        $firstExercise = $session->nextUndeliveredExercise();
 
         if ($firstExercise !== null) {
-            $this->deliverExercise($firstExercise, $from, $tenant);
+            $this->deliverExerciseAndMaybeComplete($firstExercise, $session, $from, $tenant, $freshContact);
         }
     }
 
@@ -760,12 +794,14 @@ class TrainingHandler implements HandlerInterface
     /**
      * Hito R1/R2/R3 — confirmación explícita del usuario para avanzar más
      * allá de un ejercicio de apoyo (Preparation/Cooldown) ya entregado:
-     * entrega el siguiente `WorkoutExercise` sin entregar (el primero, por
-     * `order`, con `delivered_at === null` — mismo criterio de progresividad
-     * de H16.2, aplicado ahora a las 3 fases) y, si no queda ninguno,
-     * reutiliza `ExecutionReportRecorder::maybeCompleteSession()` para
-     * cerrar la sesión aquí mismo (caso defensivo: en la práctica, entregar
-     * el último ejercicio de apoyo ya la completa dentro de
+     * entrega el siguiente `WorkoutExercise` sin entregar
+     * (`WorkoutSession::nextUndeliveredExercise()` — corrección
+     * post-incidente de staging #33, NEXT TO DELIVER: nunca `exerciseLog`/
+     * `unreported`/`isResolvedForSessionProgression()`, solo `delivered_at`)
+     * y, si no queda ninguno, reutiliza
+     * `ExecutionReportRecorder::maybeCompleteSession()` para cerrar la
+     * sesión aquí mismo (caso defensivo: en la práctica, entregar el
+     * último ejercicio de apoyo ya la completa dentro de
      * `deliverExerciseAndMaybeComplete()`, sin esperar esta confirmación).
      */
     private function advancePastSupportExercise(WorkoutExercise $workoutExercise, string $from, Tenant $tenant, Contact $contact): void
@@ -773,7 +809,7 @@ class TrainingHandler implements HandlerInterface
         $session = $workoutExercise->workoutSession;
         $session->load('workoutExercises.exerciseLog');
 
-        $next = $session->workoutExercises->first(fn (WorkoutExercise $we) => $we->delivered_at === null);
+        $next = $session->nextUndeliveredExercise();
 
         if ($next !== null) {
             $this->deliverExerciseAndMaybeComplete($next, $session, $from, $tenant, $contact);
@@ -847,8 +883,18 @@ class TrainingHandler implements HandlerInterface
      * cambios).
      *
      * @param  array{workout_session_id: int, unreported_exercises: array}|null  $activeSessionData
-     *         necesario únicamente para `RecordExecutionReport`; `null` en
-     *         el camino sin sesión pendiente, donde esa acción nunca aparece.
+     *         el fragmento REAL de sesión activa (Regla 11, corrección
+     *         post-incidente de staging #33) — `null` ÚNICAMENTE cuando de
+     *         verdad no hay ninguna `WorkoutSession` `Scheduled` para este
+     *         contacto (nunca hardcodeado por el llamador para "simplificar"
+     *         un camino: eso fue precisamente la causa de que `DeliverSession`
+     *         reenviara la sesión ya existente). Usado tanto por
+     *         `RecordExecutionReport` como por `DeliverSession`.
+     * @param  ?int  $frontExerciseId  necesario únicamente para
+     *         `RecordExecutionReport` — el mismo id ya pasado a
+     *         `ExecutionReportService::extractReport()` (ver paso 4 de
+     *         `handle()`). `null` en cualquier otro camino, donde esa
+     *         acción nunca aparece o el frente no requiere reporte.
      */
     private function executeTurnActions(
         ConversationTurnResolved $resolved,
@@ -859,6 +905,7 @@ class TrainingHandler implements HandlerInterface
         TrainingProfile $profile,
         float $startedAt,
         string $body = '',
+        ?int $frontExerciseId = null,
     ): bool {
         $shouldDeliverSession = false;
 
@@ -874,7 +921,7 @@ class TrainingHandler implements HandlerInterface
             }
 
             if ($action->type === ConversationActionType::RecordExecutionReport && $activeSessionData !== null) {
-                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $contact, $startedAt);
+                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $contact, $startedAt, $frontExerciseId);
 
                 continue;
             }
@@ -933,28 +980,36 @@ class TrainingHandler implements HandlerInterface
                     // TrainingEngine no se invoca aquí). Pero "sesión activa"
                     // ya no implica necesariamente "el usuario ya tiene el
                     // ejercicio actual en su chat" — desde P1-A, el ejercicio
-                    // sin ExerciseLog puede no haberse entregado nunca
-                    // (`delivered_at` null). Se resuelve cuál es ese
-                    // ejercicio con el mismo criterio de progresividad ya
-                    // usado en recordExecutionReport()/handle() (el primero
-                    // sin ExerciseLog, ordenado por `order`, garantizado por
-                    // WorkoutSession::workoutExercises()).
-                    $pendingExercise = WorkoutSession::find($activeSessionData['workout_session_id'])
-                        ?->workoutExercises()
-                        ->whereDoesntHave('exerciseLog')
-                        ->first();
+                    // puede no haberse entregado nunca (`delivered_at` null).
+                    //
+                    // Corrección post-incidente de staging (#33, hito
+                    // R1/R2/R3, Reglas 12/13) — `nextUndeliveredExercise()`
+                    // (NEXT TO DELIVER) reemplaza a
+                    // `whereDoesntHave('exerciseLog')->first()`: ese criterio
+                    // antiguo era incompatible con Preparation/Cooldown (que
+                    // NUNCA tienen `exerciseLog`, resueltos o no) — podía
+                    // reseleccionar como "pendiente" un ejercicio de apoyo ya
+                    // entregado/confirmado hace turnos, y (combinado con la
+                    // Regla 11) esta rama ahora sí es alcanzable desde el
+                    // camino de Coach — dejar la deuda técnica aquí habría
+                    // reintroducido el mismo bug por una puerta distinta.
+                    $session = WorkoutSession::find($activeSessionData['workout_session_id']);
+                    $session?->load('workoutExercises.exerciseLog');
+                    $pendingExercise = $session?->nextUndeliveredExercise();
 
-                    if ($pendingExercise !== null && $pendingExercise->delivered_at === null) {
+                    if ($pendingExercise !== null && $session !== null) {
                         // Nunca se le mostró al usuario — se entrega ahora,
-                        // reutilizando deliverExercise() sin ningún cambio
+                        // reutilizando deliverExerciseAndMaybeComplete()
                         // (mismo mecanismo que el primer ejercicio de una
-                        // sesión nueva y que el avance tras un reporte real).
-                        $this->deliverExercise($pendingExercise, $from, $tenant);
+                        // sesión nueva y que el avance tras un reporte/
+                        // confirmación real — nunca una segunda semántica de
+                        // entrega, Regla 13).
+                        $this->deliverExerciseAndMaybeComplete($pendingExercise, $session, $from, $tenant, $contact);
                     } else {
-                        // Ya fue entregado (o, defensivamente, no quedó
-                        // ningún pendiente por resolver en este mismo turno —
-                        // ej. un reporte previo en esta misma acción ya cerró
-                        // todo) — comportamiento D052 sin cambios: nunca se
+                        // Todo lo que existe ya fue entregado — el frente
+                        // real está esperando que el usuario lo resuelva
+                        // (reporte o confirmación), no que se le reenvíe
+                        // nada — comportamiento D052 sin cambios: nunca se
                         // reenvía ni se genera una rutina nueva.
                         $this->reply($from, self::PENDING_SESSION_REMINDER, $tenant);
                     }
@@ -987,13 +1042,17 @@ class TrainingHandler implements HandlerInterface
      *
      * @param  array{reports: array, session_finished: bool}  $report
      * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
+     * @param  ?int  $frontExerciseId  Corrección post-incidente de staging
+     *         (#33) — mismo id ya pasado a `ExecutionReportService`, único
+     *         objetivo válido para un reporte implícito (sin nombre) — ver
+     *         `ExecutionReportRecorder::resolveExercise()`.
      */
-    private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, Contact $contact, float $startedAt): void
+    private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, Contact $contact, float $startedAt, ?int $frontExerciseId = null): void
     {
         Log::info('TRAINING_REPORT_ATTEMPT', ['workout_session_id' => $activeSessionData['workout_session_id']]);
 
         $session = WorkoutSession::find($activeSessionData['workout_session_id']);
-        $outcome = $this->reportRecorder->record($session, $report);
+        $outcome = $this->reportRecorder->record($session, $report, $frontExerciseId);
         $elapsedMs = (int) round((microtime(true) - $startedAt) * 1000);
 
         Log::info($outcome->hasAnyEffect() || $outcome->sessionCompleted ? 'TRAINING_REPORT_SUCCESS' : 'TRAINING_REPORT_INCOMPLETE', [
@@ -1004,54 +1063,70 @@ class TrainingHandler implements HandlerInterface
             'elapsed_ms' => $elapsedMs,
         ]);
 
-        // Estado fresco, necesario tanto para decidir el próximo ejercicio
-        // como para calcular SessionCloseIntent — exerciseSets se necesita
-        // para distinguir Performed de Skipped (mismo criterio ya usado en
+        // Estado fresco — necesario tanto para RESOLUTION (qué sigue sin
+        // resolver, para el cierre explícito) como para calcular
+        // SessionCloseIntent — exerciseSets se necesita para distinguir
+        // Performed de Skipped (mismo criterio ya usado en
         // CoachContextProvider/TrainingHistoryContextProvider).
+        $session->load(['workoutExercises.exerciseLog.exerciseSets']);
+
+        // RESOLUTION (Regla 6) — todo lo que sigue sin resolver para
+        // PROGRESIÓN/CIERRE, usado ÚNICAMENTE para construir los hechos del
+        // cierre explícito (`buildSessionCloseFacts()`) — autoridad única:
+        // `WorkoutExercise::isResolvedForSessionProgression()`, nunca
+        // `exerciseLog===null` aparte (ese criterio dejaba "atrapado" para
+        // siempre a un Preparation/Cooldown ya entregado/confirmado, que
+        // NUNCA tiene ExerciseLog, resuelto o no).
         //
         // H16.2 Fase 1.3 (Caso 1B) — un ejercicio con reporte parcial este
         // turno (menos series que las prescritas) YA tiene ExerciseLog, pero
-        // debe seguir contando como "sin resolver" para decidir si se avanza
-        // o se cierra la sesión — ver ExecutionReportOutcome::$partialExerciseIds
-        // y ExecutionReportRecorder::isPartialReport(). Esto NO cambia el
+        // debe seguir contando como "sin resolver" para esta decisión — ver
+        // ExecutionReportOutcome::$partialExerciseIds y
+        // ExecutionReportRecorder::isPartialReport(). Esto NO cambia el
         // significado de "Unreported" en ningún otro lugar del sistema.
-        $session->load(['workoutExercises.exerciseLog.exerciseSets']);
-        $stillUnreported = $session->workoutExercises
-            ->filter(fn (WorkoutExercise $we) => $we->exerciseLog === null || in_array($we->id, $outcome->partialExerciseIds, true))
+        $stillUnresolved = $session->workoutExercises
+            ->filter(fn (WorkoutExercise $we) => ! $we->isResolvedForSessionProgression() || in_array($we->id, $outcome->partialExerciseIds, true))
             ->values();
 
         $explicitCloseAttempt = ($report['session_finished'] ?? false) === true;
 
         if ($explicitCloseAttempt) {
             $intent = $this->determineSessionCloseIntent($outcome, $session);
-            $facts = $this->buildSessionCloseFacts($intent, $outcome, $stillUnreported, $session, $contact);
+            $facts = $this->buildSessionCloseFacts($intent, $outcome, $stillUnresolved, $session, $contact);
             $this->reply($from, $this->sessionCloseComposer->compose($intent, $facts, $tenant), $tenant);
         } else {
+            // NEXT TO DELIVER (Regla 7) — `WorkoutSession::nextUndeliveredExercise()`,
+            // NUNCA "unreported"/`first()`/`exerciseLog===null`: responde
+            // EXCLUSIVAMENTE "¿qué todavía no se ha mostrado?", una pregunta
+            // distinta de RESOLUTION (arriba). Corrección post-incidente de
+            // staging (#33): el criterio anterior (`exerciseLog===null`)
+            // podía re-seleccionar un Preparation/Cooldown ya entregado como
+            // "el siguiente" para siempre — el bug exacto reproducido en
+            // staging (`TRAINING_EXERCISE_ADVANCED` apuntando al mismo
+            // ejercicio de apoyo repetidamente).
+            $next = $session->nextUndeliveredExercise();
+
             // H16.2 Fase 1.2 — confirmación + transición van en UN solo
             // mensaje (nunca dos `reply()` separados) para que se sienta
             // como una única intervención del coach, no como un recibo
             // seguido de un mensaje administrativo aparte.
-            $this->reply($from, $this->buildReportResponseMessage($outcome, $stillUnreported), $tenant);
+            $this->reply($from, $this->buildReportResponseMessage($outcome, $next), $tenant);
 
             // H16.2 Fase 1 — avanzar al siguiente ejercicio: ÚNICAMENTE tras
             // un reporte REAL ya persistido este turno (`logged !== []`) —
             // una pregunta sola, o un intento que no logró resolverse a
             // ningún ejercicio (solo `clarifications`), NUNCA avanza ni
             // reenvía el ejercicio actual.
-            if ($outcome->logged !== [] && $outcome->clarifications === [] && ! $outcome->sessionCompleted && $stillUnreported->isNotEmpty()) {
-                $next = $stillUnreported->first();
-
+            if ($outcome->logged !== [] && $outcome->clarifications === [] && ! $outcome->sessionCompleted && $next !== null) {
                 Log::info('TRAINING_EXERCISE_ADVANCED', [
                     'workout_session_id' => $session->id,
                     'workout_exercise_id' => $next->id,
                     'order' => $next->order,
                 ]);
 
-                // Hito R1/R2/R3 — "next" puede ser ahora un Preparation/
-                // Cooldown (nunca tiene ExerciseLog, así que el filtro de
-                // $stillUnreported de arriba ya lo incluye sin cambios): si
-                // es el último ejercicio de la sesión, esta llamada la
-                // completa aquí mismo — ver deliverExerciseAndMaybeComplete().
+                // "next" puede ser un Preparation/Cooldown: si es el último
+                // ejercicio de la sesión, esta llamada la completa aquí
+                // mismo — ver deliverExerciseAndMaybeComplete().
                 $this->deliverExerciseAndMaybeComplete($next, $session, $from, $tenant, $contact);
             }
         }
@@ -1073,9 +1148,12 @@ class TrainingHandler implements HandlerInterface
      * ejercicio sin `ExerciseLog` (fix de
      * `ExecutionReportRecorder::maybeCompleteSession()`).
      *
-     * @param  Collection<int, WorkoutExercise>  $stillUnreported
+     * @param  ?WorkoutExercise  $next  NEXT TO DELIVER (Regla 7,
+     *         `WorkoutSession::nextUndeliveredExercise()`) — nunca una lista
+     *         de "sin resolver": este mensaje solo necesita saber si hay un
+     *         siguiente ejercicio real para anunciar la transición.
      */
-    private function buildReportResponseMessage(ExecutionReportOutcome $outcome, Collection $stillUnreported): string
+    private function buildReportResponseMessage(ExecutionReportOutcome $outcome, ?WorkoutExercise $next): string
     {
         $sentences = [];
 
@@ -1089,11 +1167,11 @@ class TrainingHandler implements HandlerInterface
 
         if ($outcome->sessionCompleted) {
             $sentences[] = self::SESSION_COMPLETED_IMPLICIT_MESSAGE;
-        } elseif ($outcome->logged !== [] && $outcome->clarifications === [] && $stillUnreported->isNotEmpty()) {
+        } elseif ($outcome->logged !== [] && $outcome->clarifications === [] && $next !== null) {
             // Misma frase de transición determinista de Fase 1 — ahora
             // enlazada en el MISMO mensaje que la confirmación, en vez de un
             // segundo `reply()` aparte.
-            $sentences[] = $this->exerciseAdvanceTransition($stillUnreported->first());
+            $sentences[] = $this->exerciseAdvanceTransition($next);
         }
 
         return $sentences !== [] ? implode(' ', $sentences) : 'Listo.';

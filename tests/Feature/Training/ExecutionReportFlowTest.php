@@ -51,6 +51,17 @@ function makeSessionWithExercises(Contact $contact, array $exerciseSpecs): array
             'prescribed_reps' => ($spec['tracking_type'] ?? null) === TrackingType::TimeBased ? null : 10,
             'prescribed_load' => null,
             'prescribed_duration_seconds' => ($spec['tracking_type'] ?? null) === TrackingType::TimeBased ? 30 : null,
+            // Corrección post-incidente de staging (#33, hito R1/R2/R3) —
+            // el primer ejercicio (order=1) es, por construcción de este
+            // helper, "el único que la entrega progresiva ha mostrado hasta
+            // ahora" (ver comentarios de los tests que lo usan) — ahora eso
+            // debe ser literalmente cierto: WorkoutSession::frontExercise()
+            // (única fuente de "cuál es el ejercicio actual") se basa en
+            // `delivered_at`, no en la ausencia de ExerciseLog. En
+            // producción esto SIEMPRE es cierto (TrainingHandler entrega el
+            // primer ejercicio de forma síncrona al crear la sesión) — este
+            // helper solo lo hacía implícito antes.
+            'delivered_at' => $order === 0 ? now() : null,
         ], $spec['workout_exercise_overrides'] ?? []));
     }
 

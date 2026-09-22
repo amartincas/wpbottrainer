@@ -56,4 +56,50 @@ class WorkoutSession extends Model
     {
         return $this->hasMany(WorkoutExercise::class)->orderBy('order');
     }
+
+    /**
+     * Corrección post-incidente de staging (#33, hito R1/R2/R3) — la ÚNICA
+     * fuente de "qué está viendo/resolviendo el usuario ahora mismo"
+     * (FRONT EXERCISE). El WorkoutExercise de mayor `order` entre los ya
+     * entregados (`delivered_at !== null`) — nunca `exerciseLog`, nunca
+     * `isResolvedForSessionProgression()`, nunca "primer Main sin log".
+     *
+     * La entrega es estrictamente secuencial (`TrainingHandler` nunca
+     * entrega fuera de `order`, nunca entrega dos ejercicios a la vez sin
+     * que el usuario resuelva/confirme el anterior), así que en cualquier
+     * instante hay como máximo UN WorkoutExercise "entregado y todavía sin
+     * resolver" — y es siempre el de mayor `order` entre los entregados.
+     *
+     * `null` si nada se ha entregado todavía (sesión recién creada, antes
+     * de la primera entrega) — en la práctica esto es transitorio: la
+     * primera entrega ocurre de forma síncrona en la misma creación de la
+     * sesión (ver `TrainingHandler::handle()`).
+     *
+     * Requiere `workoutExercises` cargado o cargable (misma relación,
+     * `orderBy('order')` ya garantizado por `workoutExercises()`).
+     */
+    public function frontExercise(): ?WorkoutExercise
+    {
+        return $this->workoutExercises
+            ->filter(fn (WorkoutExercise $we) => $we->delivered_at !== null)
+            ->sortByDesc('order')
+            ->first();
+    }
+
+    /**
+     * Corrección post-incidente de staging (#33) — responde EXCLUSIVAMENTE
+     * "¿qué WorkoutExercise todavía no se le ha mostrado al usuario?"
+     * (NEXT TO DELIVER) — nunca "¿qué está resuelto?" (esa es
+     * `WorkoutExercise::isResolvedForSessionProgression()`, una pregunta
+     * distinta). Deliberadamente NO usa `exerciseLog`/`historicalOutcome()`/
+     * ninguna noción de "unreported": un WorkoutExercise ya entregado
+     * NUNCA debe volver a aparecer aquí, sin importar si ya fue
+     * reportado/confirmado o no — evita exactamente el bug del incidente
+     * (un Preparation/Cooldown ya entregado, que nunca tiene `exerciseLog`,
+     * siendo re-seleccionado como "siguiente a entregar").
+     */
+    public function nextUndeliveredExercise(): ?WorkoutExercise
+    {
+        return $this->workoutExercises->first(fn (WorkoutExercise $we) => $we->delivered_at === null);
+    }
 }

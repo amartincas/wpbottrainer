@@ -26,7 +26,21 @@ use Illuminate\Support\Facades\Log;
  */
 class ExecutionReportRecorder
 {
-    public function record(WorkoutSession $session, array $extraction): ExecutionReportOutcome
+    /**
+     * @param  ?int  $frontExerciseId  Corrección post-incidente de staging
+     *         (#33, hito R1/R2/R3) — el `WorkoutExercise` id que el
+     *         CONTEXTO DE EJECUCIÓN (`TrainingHandler`, vía
+     *         `WorkoutSession::frontExercise()`) ya determinó como el
+     *         frente actual — el MISMO id que recibió `ExecutionReportService`
+     *         para construir su prompt (ver `TrainingHandler::recordExecutionReport()`).
+     *         Única identidad que `resolveExercise()` usa
+     *         como *fallback* cuando la IA no nombra explícitamente un
+     *         ejercicio — nunca "el primero de `$unreported`". `null`
+     *         cuando el frente no requiere reporte o no hay sesión activa;
+     *         en ese caso un reporte sin nombre explícito NUNCA se
+     *         atribuye a nada.
+     */
+    public function record(WorkoutSession $session, array $extraction, ?int $frontExerciseId = null): ExecutionReportOutcome
     {
         $session->load(['workoutExercises.exerciseLog']);
 
@@ -35,7 +49,9 @@ class ExecutionReportRecorder
         // (que nunca tiene `exerciseLog`) podría quedar como "el primero
         // sin resolver" y `resolveExercise()` le resolvería incorrectamente
         // un reporte sin nombre explícito — bug real detectado en el
-        // diseño, no solo cosmético.
+        // diseño, no solo cosmético. Este pool sigue sirviendo para
+        // matching por NOMBRE explícito (corrección retroactiva) — la
+        // restricción real está en `resolveExercise()`, ver más abajo.
         $unreported = $session->workoutExercises
             ->filter(fn (WorkoutExercise $we) => $we->requiresExecutionReport() && $we->exerciseLog === null)
             ->values();
@@ -45,7 +61,7 @@ class ExecutionReportRecorder
         $partialIds = [];
 
         foreach ($extraction['reports'] as $report) {
-            $resolved = $this->resolveExercise($report['exercise_name'], $unreported);
+            $resolved = $this->resolveExercise($report['exercise_name'], $unreported, $frontExerciseId);
 
             if ($resolved === null) {
                 $clarifications[] = $this->clarificationMessage($report['exercise_name'], $unreported);
@@ -132,7 +148,7 @@ class ExecutionReportRecorder
     /**
      * @param Collection<int, WorkoutExercise> $unreported
      */
-    private function resolveExercise(?string $name, Collection $unreported): ?WorkoutExercise
+    private function resolveExercise(?string $name, Collection $unreported, ?int $frontExerciseId): ?WorkoutExercise
     {
         if ($name !== null) {
             // Nombre explícito que no matchea ningún pendiente real (posible
@@ -143,19 +159,23 @@ class ExecutionReportRecorder
             );
         }
 
-        // H16.2 Fase 1.1 — sin nombre explícito: se asume el ejercicio
-        // ACTUALMENTE PRESENTADO — el primero de $unreported, garantizado
-        // por construcción (WorkoutSession::workoutExercises() está
-        // ordenado por `order`; la entrega progresiva de H16.2 Fase 1 nunca
-        // muestra al usuario un ejercicio que no sea ese) — nunca una
-        // suposición arbitraria entre varios. Antes de la entrega
-        // progresiva esto solo era seguro si quedaba exactamente 1
-        // pendiente; ahora es seguro siempre, porque el usuario nunca ha
-        // visto más de uno a la vez. `first()` sobre una colección vacía ya
-        // devuelve `null` de forma nativa (caso defensivo: un reporte
-        // adicional sin nombre en el mismo mensaje, después de que los
-        // demás pendientes ya se resolvieron en este mismo turno).
-        return $unreported->first();
+        // Corrección post-incidente de staging (#33, hito R1/R2/R3) — sin
+        // nombre explícito, el reporte implícito SOLO puede atribuirse al
+        // FRENTE real ya determinado por el contexto de ejecución (mismo
+        // id que recibió `ExecutionReportService` para construir su
+        // prompt) — NUNCA "el primero de $unreported". Antes de esta
+        // corrección, `$unreported->first()` podía seleccionar un Main que
+        // el usuario nunca vio entregado (el frente real era un
+        // Preparation/Cooldown, excluido de `$unreported` por diseño),
+        // atribuyéndole un reporte real a un ejercicio ajeno — el bug
+        // exacto reproducido en staging. `$frontExerciseId === null`
+        // (frente no requiere reporte, o no hay sesión activa) nunca
+        // inventa un ejercicio: cae a la clarificación existente.
+        if ($frontExerciseId === null) {
+            return null;
+        }
+
+        return $unreported->first(fn (WorkoutExercise $we) => $we->id === $frontExerciseId);
     }
 
     private function persist(WorkoutExercise $workoutExercise, array $report): void

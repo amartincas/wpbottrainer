@@ -40,6 +40,14 @@ function reminderIntegrationSession(Contact $contact): array
     $we = WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id, 'exercise_id' => $exercise->id, 'exercise_snapshot' => $exercise->toSnapshot(),
         'prescribed_sets' => 3, 'prescribed_reps' => 10, 'prescribed_load' => 40,
+        // Corrección post-incidente de staging (#33, hito R1/R2/R3) — el
+        // único ejercicio de esta sesión es "el actualmente mostrado" para
+        // todos los tests que usan este helper; WorkoutSession::frontExercise()
+        // (única fuente de esa identidad) se basa en `delivered_at`, que en
+        // producción SIEMPRE está poblado antes de que el usuario pueda
+        // responder (TrainingHandler entrega el primero de forma síncrona
+        // al crear la sesión).
+        'delivered_at' => now(),
     ]);
 
     return [$session, $we];

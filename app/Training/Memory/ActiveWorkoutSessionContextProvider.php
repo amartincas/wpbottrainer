@@ -20,19 +20,25 @@ use App\Training\Enums\WorkoutSessionStatus;
  * principal (`Main`) sin `ExerciseLog` todavía — Preparación/Cooldown
  * NUNCA aparecen aquí (Hito R1/R2/R3): no piden reporte estructurado, y
  * ofrecerlos como destino de un reporte confundiría al extractor de IA y
- * al usuario. Ver `WorkoutExercise::requiresExecutionReport()`.
+ * al usuario. Ver `WorkoutExercise::requiresExecutionReport()`. Se
+ * conserva EXCLUSIVAMENTE para permitir que un mensaje NOMBRE
+ * explícitamente un Main anterior (corrección retroactiva por nombre) —
+ * nunca como fuente de "cuál es el ejercicio actual".
  *
- * `data['pending_support_exercise']` (nuevo, Hito R1/R2/R3): no-null
- * únicamente cuando el ÚLTIMO `WorkoutExercise` entregado (`delivered_at`
- * no nulo, mayor `order`) es un Preparation/Cooldown, esperando la
- * confirmación explícita del usuario para avanzar (ver `TrainingHandler`/
- * `SupportPhaseConfirmationDetector`). Deliberadamente NO se deriva de
- * `isResolvedForSessionProgression()`: para Preparation/Cooldown ese método
- * ya es `true` en cuanto se entrega (ver su docblock en `WorkoutExercise`),
- * así que usarlo aquí saltaría de largo el ejercicio que el usuario tiene
- * frente a él ahora mismo. `null` si no hay sesión activa, si nada se ha
- * entregado todavía, o si el último entregado es Main (flujo normal de
- * reporte, ver `unreported_exercises` arriba).
+ * `data['front_exercise']` (corrección post-incidente de staging #33,
+ * reemplaza a `pending_support_exercise` — único consumidor era
+ * `TrainingHandler`, actualizado en el mismo cambio): representación
+ * ÚNICA y unificada de "qué está viendo/resolviendo el usuario ahora
+ * mismo", para CUALQUIER fase, no solo apoyo. Se deriva exclusivamente de
+ * `WorkoutSession::frontExercise()` (única fuente de verdad — ver su
+ * docblock): nunca de `exerciseLog`, nunca de
+ * `isResolvedForSessionProgression()`, nunca de "primer Main sin log".
+ * `null` si no hay sesión activa o nada se ha entregado todavía.
+ * `requires_report` distingue Main (`true`, espera `ExecutionReportService`)
+ * de Preparation/Cooldown (`false`, espera `SupportPhaseConfirmationDetector`)
+ * — es la ÚNICA condición que `TrainingHandler` debe usar para decidir qué
+ * detector aplica, en vez de inferirlo de listas separadas que pueden
+ * desincronizarse entre sí.
  */
 class ActiveWorkoutSessionContextProvider implements ContextProviderInterface
 {
@@ -67,30 +73,22 @@ class ActiveWorkoutSessionContextProvider implements ContextProviderInterface
             ->values()
             ->all();
 
-        // El "frente" real de la cola de entrega (Hito R1/R2/R3) NO es "el
-        // primero sin resolver para progresión" — para Preparation/Cooldown,
-        // `isResolvedForSessionProgression()` ya es `true` en cuanto se
-        // entrega (ver docblock de ese método), así que ese criterio
-        // saltaría de largo el ejercicio de apoyo que el usuario tiene
-        // frente a él ahora mismo, esperando su confirmación. El frente real
-        // es, en cambio, el ÚLTIMO ejercicio entregado por `order` — el
-        // siguiente en la cola nunca se entrega hasta que este se confirme
-        // (o, si es Main, hasta que se reporte).
-        $frontExercise = $session->workoutExercises
-            ->filter(fn ($we) => $we->delivered_at !== null)
-            ->sortByDesc('order')
-            ->first();
+        $front = $session->frontExercise();
 
-        $pendingSupportExercise = ($frontExercise !== null && ! $frontExercise->requiresExecutionReport())
-            ? ['workout_exercise_id' => $frontExercise->id, 'phase' => $frontExercise->phase->value]
-            : null;
+        $frontExerciseData = $front !== null ? [
+            'workout_exercise_id' => $front->id,
+            'exercise_id' => $front->exercise_id,
+            'name' => $front->exercise_snapshot['name'] ?? 'Ejercicio',
+            'phase' => $front->phase->value,
+            'requires_report' => $front->requiresExecutionReport(),
+        ] : null;
 
         return new ContextFragment(
             label: 'active_workout_session',
             data: [
                 'workout_session_id' => $session->id,
                 'unreported_exercises' => $exercises,
-                'pending_support_exercise' => $pendingSupportExercise,
+                'front_exercise' => $frontExerciseData,
             ],
             source: 'db',
             confidence: 'confirmed',

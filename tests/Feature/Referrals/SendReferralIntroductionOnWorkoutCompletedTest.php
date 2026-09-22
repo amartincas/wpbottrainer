@@ -260,7 +260,7 @@ it('ExecutionReportRecorder really dispatches WorkoutSessionCompleted when a ses
             'sets' => [['reps' => 10, 'load' => 20, 'duration_seconds' => null]],
             'rpe' => null, 'note' => null, 'uncertain' => false, 'skip_reason' => null,
         ]],
-    ]);
+    ], frontExerciseId: $workoutExercise->id);
 
     Event::assertDispatched(WorkoutSessionCompleted::class, fn ($event) => $event->session->is($session->fresh()));
 });

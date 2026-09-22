@@ -70,6 +70,17 @@ class ExecutionReportService
      * @param array<int, array{name: string}> $reportableExercises exercises
      *        still unreported in the active session — the LLM may only name
      *        one of these; anything else is treated as unresolved.
+     * @param  ?string  $frontExerciseName  Corrección post-incidente de
+     *         staging (#33, hito R1/R2/R3) — el nombre del `WorkoutExercise`
+     *         que el CONTEXTO DE EJECUCIÓN (`TrainingHandler`, vía
+     *         `WorkoutSession::frontExercise()`) ya determinó como "lo que
+     *         se le acaba de mostrar al usuario ahora mismo" — ÚNICA fuente
+     *         de esa identidad, nunca `$reportableExercises[0]`. `null`
+     *         cuando el frente actual NO requiere reporte (es Preparation/
+     *         Cooldown, o no hay sesión activa) — en ese caso, un mensaje
+     *         sin nombre explícito NUNCA se asume como reporte de ningún
+     *         ejercicio (ver `buildPrompt()`); este servicio NUNCA decide
+     *         por su cuenta cuál `WorkoutExercise` es el reportado.
      * @param  ?CoachContext  $coachContext  Bloque 9 (D052) — cuando se
      *         provee, el mismo prompt/llamada también clasifica
      *         interrupciones conversacionales y responde las de dominio
@@ -82,7 +93,7 @@ class ExecutionReportService
      * }>, session_finished: bool, safety_signal_text: ?string,
      *     intents: array<int, string>, training_reply: ?string}
      */
-    public function extractReport(string $messageBody, array $reportableExercises, Tenant $tenant, ?CoachContext $coachContext = null): array
+    public function extractReport(string $messageBody, array $reportableExercises, Tenant $tenant, ?CoachContext $coachContext = null, ?string $frontExerciseName = null): array
     {
         if (trim($messageBody) === '' || $reportableExercises === []) {
             return self::EMPTY_RESULT;
@@ -91,7 +102,7 @@ class ExecutionReportService
         try {
             $ai = AIServiceFactory::make($tenant);
             $history = $coachContext?->recentMessages ?? [];
-            $raw = $ai->getResponse($messageBody, $this->buildPrompt($reportableExercises, $coachContext), $history);
+            $raw = $ai->getResponse($messageBody, $this->buildPrompt($reportableExercises, $coachContext, $frontExerciseName), $history);
 
             return $this->parseJson($raw, $messageBody);
         } catch (\Throwable $e) {
@@ -101,24 +112,29 @@ class ExecutionReportService
         }
     }
 
-    private function buildPrompt(array $reportableExercises, ?CoachContext $coachContext): string
+    private function buildPrompt(array $reportableExercises, ?CoachContext $coachContext, ?string $frontExerciseName): string
     {
         $names = json_encode(array_map(fn ($e) => $e['name'], $reportableExercises));
-        // H16.2 Fase 1.1 — el primero de $reportableExercises es, por
-        // construcción, el ejercicio actualmente presentado (entrega
-        // progresiva, ver TrainingHandler::deliverExercise()) — nunca un
-        // supuesto de esta clase. Ayuda a que la propia extracción acierte
-        // el "exercise_name" explícito más seguido; el código (ver
-        // ExecutionReportRecorder::resolveExercise()) sigue siendo quien
-        // decide de forma determinista cuando la IA no lo determina.
-        $currentExerciseName = $reportableExercises[0]['name'] ?? null;
+
+        // Corrección post-incidente de staging (#33) — `$frontExerciseName`
+        // viene DECIDIDO por el contexto de ejecución (nunca por este
+        // método): antes se asumía `$reportableExercises[0]` como "lo
+        // recién mostrado", lo cual dejó de ser cierto en cuanto el frente
+        // real podía ser un Preparation/Cooldown (excluido de esa lista
+        // por diseño) — eso atribuía reportes reales a un Main equivocado,
+        // que el usuario nunca vio. La instrucción del prompt ahora se
+        // bifurca explícitamente según si HAY o no un Main realmente
+        // mostrado.
+        $currentExerciseInstruction = $frontExerciseName !== null
+            ? "El ejercicio que ACABAS de mostrarle al usuario, ahora mismo, es: \"{$frontExerciseName}\". Si el usuario responde sin mencionar explícitamente un ejercicio distinto de la lista de arriba (ej. \"listo\", \"3 series de 10\", \"10, 10, 8 con 8kg\", \"me costó\"), asume que \"exercise_name\" es ese mismo ejercicio — nunca lo dejes en null solo porque no repitió el nombre."
+            : 'En este momento NO se le ha mostrado al usuario ningún ejercicio de bloque principal para reportar (puede estar viendo un ejercicio de preparación/calentamiento o de vuelta a la calma, que no piden reporte). Si el usuario NO menciona explícitamente el nombre EXACTO de uno de los ejercicios de la lista de arriba, "reports" debe quedar como un arreglo vacío [] — NUNCA asumas por defecto a cuál de la lista se refiere.';
 
         $prompt = <<<PROMPT
 Eres un asistente que EXTRAE de un mensaje de WhatsApp lo que un usuario reporta haber ejecutado de un entrenamiento. NUNCA inventes un valor que el usuario no mencionó explícitamente.
 
 Ejercicios que el usuario podría estar reportando (debes usar el nombre EXACTO de esta lista, o null si no puedes determinar a cuál se refiere): {$names}
 
-El ejercicio que ACABAS de mostrarle al usuario, ahora mismo, es: "{$currentExerciseName}". Si el usuario responde sin mencionar explícitamente un ejercicio distinto de la lista de arriba (ej. "listo", "3 series de 10", "10, 10, 8 con 8kg", "me costó"), asume que "exercise_name" es ese mismo ejercicio — nunca lo dejes en null solo porque no repitió el nombre.
+{$currentExerciseInstruction}
 
 Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta forma exacta:
 {
