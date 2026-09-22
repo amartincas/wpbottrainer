@@ -4,8 +4,13 @@ namespace App\Filament\Resources\Customer\Pages;
 
 use App\Filament\Resources\CustomerResource;
 use App\Models\Contact;
+use App\Models\DeclaredHealthCondition;
 use App\Models\User;
+use App\Training\Enums\BodyRegion;
+use App\Training\Enums\HealthConditionStatus;
+use App\Training\Enums\RestrictionSource;
 use App\Training\Enums\TrainingAccessStatus;
+use App\Training\Support\DeclaredHealthConditionRecorder;
 use App\Training\Support\TrainingAccessAdministrationService;
 use Carbon\Carbon;
 use Filament\Actions\Action;
@@ -168,6 +173,125 @@ class ViewCustomer extends ViewRecord
 
                     Notification::make()->title('Acceso reactivado')->success()->send();
                 }),
+
+            // Hito A (Safety Administration) — las únicas dos transiciones
+            // reales de una DeclaredHealthCondition pending_review, ambas
+            // delegando exactamente en los métodos YA EXISTENTES de
+            // App\Training\Support\DeclaredHealthConditionRecorder (Bloque
+            // 2/5, sin cambios) — esta página nunca reimplementa esa
+            // lógica, solo le da un invocador administrativo real (antes
+            // solo existía la vista de solo lectura en CustomerInfolist).
+            // Mismo criterio de autorización (`is_super_admin`) que las 5
+            // acciones de arriba — no se introduce ningún rol nuevo.
+            Action::make('confirm_health_restriction')
+                ->label('Confirmar restricción')
+                ->color('danger')
+                ->icon('heroicon-o-shield-exclamation')
+                ->visible(fn (Contact $record): bool => (Auth::user()?->is_super_admin ?? false)
+                    && self::pendingHealthConditions($record)->isNotEmpty())
+                ->requiresConfirmation()
+                ->schema(fn (Contact $record) => [
+                    Select::make('declared_health_condition_id')
+                        ->label('Declaración pendiente')
+                        ->options(self::pendingHealthConditionOptions($record))
+                        ->required(),
+                    Select::make('body_region')
+                        ->label('Zona corporal')
+                        ->options(self::bodyRegionOptions())
+                        ->required(),
+                    Select::make('source')
+                        ->label('Origen de la restricción')
+                        ->options(self::restrictionSourceOptions())
+                        ->required(),
+                    Textarea::make('note')->label('Nota (opcional)'),
+                ])
+                ->action(function (Contact $record, array $data): void {
+                    $condition = DeclaredHealthCondition::where('contact_id', $record->id)
+                        ->where('status', HealthConditionStatus::PendingReview)
+                        ->findOrFail($data['declared_health_condition_id']);
+
+                    /** @var User $admin */
+                    $admin = Auth::user();
+                    app(DeclaredHealthConditionRecorder::class)->resolveWithRestriction(
+                        $condition,
+                        BodyRegion::from($data['body_region']),
+                        RestrictionSource::from($data['source']),
+                        $admin,
+                        $data['note'] ?: null,
+                    );
+
+                    Notification::make()->title('Restricción confirmada')->success()->send();
+                }),
+
+            Action::make('resolve_health_condition_without_restriction')
+                ->label('Resolver sin restricción')
+                ->color('gray')
+                ->icon('heroicon-o-check-circle')
+                ->visible(fn (Contact $record): bool => (Auth::user()?->is_super_admin ?? false)
+                    && self::pendingHealthConditions($record)->isNotEmpty())
+                ->requiresConfirmation()
+                ->schema(fn (Contact $record) => [
+                    Select::make('declared_health_condition_id')
+                        ->label('Declaración pendiente')
+                        ->options(self::pendingHealthConditionOptions($record))
+                        ->required(),
+                    Textarea::make('note')->label('Nota (obligatoria)')->required(),
+                ])
+                ->action(function (Contact $record, array $data): void {
+                    $condition = DeclaredHealthCondition::where('contact_id', $record->id)
+                        ->where('status', HealthConditionStatus::PendingReview)
+                        ->findOrFail($data['declared_health_condition_id']);
+
+                    /** @var User $admin */
+                    $admin = Auth::user();
+                    app(DeclaredHealthConditionRecorder::class)
+                        ->resolveWithoutRestriction($condition, $admin, $data['note']);
+
+                    Notification::make()->title('Declaración resuelta sin restricción')->success()->send();
+                }),
         ];
+    }
+
+    /**
+     * @return \Illuminate\Support\Collection<int, DeclaredHealthCondition>
+     */
+    private static function pendingHealthConditions(Contact $record): \Illuminate\Support\Collection
+    {
+        return DeclaredHealthCondition::where('contact_id', $record->id)
+            ->where('status', HealthConditionStatus::PendingReview)
+            ->orderByDesc('declared_at')
+            ->get();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private static function pendingHealthConditionOptions(Contact $record): array
+    {
+        return self::pendingHealthConditions($record)
+            ->mapWithKeys(fn (DeclaredHealthCondition $condition) => [
+                $condition->id => $condition->declared_at->format('Y-m-d').' — '.mb_substr($condition->original_text, 0, 80),
+            ])
+            ->all();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function bodyRegionOptions(): array
+    {
+        return collect(BodyRegion::cases())
+            ->mapWithKeys(fn (BodyRegion $region) => [$region->value => $region->name])
+            ->all();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function restrictionSourceOptions(): array
+    {
+        return collect(RestrictionSource::cases())
+            ->mapWithKeys(fn (RestrictionSource $source) => [$source->value => $source->name])
+            ->all();
     }
 }

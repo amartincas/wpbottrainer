@@ -210,16 +210,32 @@ class FallbackChatHandler implements HandlerInterface
                     'customer_phone' => $from,
                 ]);
             } else {
-                Contact::create([
-                    'tenant_id' => $tenant->id,
-                    'customer_phone' => $from,
-                    'customer_name' => $leadData['customer_name'] ?? null,
-                    'delivery_address_or_location' => $leadData['delivery_address_or_location'] ?? null,
-                    'product_service_name' => $leadData['product_service_name'] ?? null,
-                    'preferred_date_time' => $leadData['preferred_date_time'] ?? null,
-                    'summary' => $messageToSend,
-                    'is_processed' => false,
-                ]);
+                // Hito A (Contact Identity, hallazgo de la prueba E2E real)
+                // — updateOrCreate() en vez de create(): TODOS los demás 8
+                // puntos de creación de Contact en el repositorio ya usan
+                // firstOrCreate()/updateOrCreate() con esta MISMA clave
+                // (tenant_id+customer_phone) — este era el único punto que
+                // insertaba una fila nueva sin verificar existencia previa.
+                // Como Referral/Acquisition/CustomerCare/Payment/Training ya
+                // crean un Contact-stub para TODO mensaje antes de que este
+                // Handler se ejecute (PreRoutingScreener corre siempre
+                // primero), create() aquí SIEMPRE producía un segundo
+                // Contact desconectado de cualquier relación real. NUNCA
+                // firstOrCreate(): a diferencia de ese método, updateOrCreate()
+                // SÍ aplica los datos del lead sobre un Contact-stub ya
+                // existente — firstOrCreate() los habría perdido en
+                // silencio.
+                Contact::updateOrCreate(
+                    ['tenant_id' => $tenant->id, 'customer_phone' => $from],
+                    [
+                        'customer_name' => $leadData['customer_name'] ?? null,
+                        'delivery_address_or_location' => $leadData['delivery_address_or_location'] ?? null,
+                        'product_service_name' => $leadData['product_service_name'] ?? null,
+                        'preferred_date_time' => $leadData['preferred_date_time'] ?? null,
+                        'summary' => $messageToSend,
+                        'is_processed' => false,
+                    ],
+                );
 
                 Log::info('Contact created from WhatsApp conversation', [
                     'tenant_id' => $tenant->id,

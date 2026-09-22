@@ -9,6 +9,11 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'name',
+    // Hito A (Entry/Domain Fallback) — única señal explícita de identidad
+    // de dominio; nullable, nunca inferida. Ver docblock de la migración
+    // `add_primary_domain_to_tenants_table` y de
+    // App\Training\Support\TrainingDomainFallbackClaim.
+    'primary_domain',
     'personality_type',
     'system_prompt',
     'ai_provider',
@@ -43,6 +48,7 @@ class Tenant extends Model
     protected function casts(): array
     {
         return [
+            'primary_domain' => 'string',
             'personality_type' => 'string',
             'ai_provider' => 'string',
             'ai_api_key' => 'encrypted',

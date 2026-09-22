@@ -63,6 +63,88 @@ it('processes an inbound message and creates a Contact when the AI signals compl
     expect($contact->customer_name)->toBe('Juan Perez');
 });
 
+/**
+ * Hito A (Contact Identity, hallazgo de la prueba E2E real) —
+ * FallbackChatHandler::create() nunca verificaba si ya existía un Contact
+ * para el mismo tenant_id+customer_phone (a diferencia de los otros 8
+ * puntos de creación de Contact del repositorio, todos vía firstOrCreate()/
+ * updateOrCreate()) — un Contact-stub creado momentos antes por Referral/
+ * Acquisition/CustomerCare/Payment/Training (PreRoutingScreener corre
+ * siempre primero) quedaba duplicado en vez de actualizado con los datos
+ * reales del lead.
+ */
+it('updates an existing Contact-stub instead of creating a duplicate when the fallback lead completes', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $stub = Contact::create([
+        'tenant_id' => $tenant->id,
+        'customer_phone' => '573001112233',
+        'summary' => 'Registro de Referrals (atribución)',
+        'bot_active' => true,
+    ]);
+
+    Http::fake([
+        'api.openai.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => '¡Gracias por tu compra! [LEAD_COMPLETE]']]]])
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'customer_name' => 'Maria Lopez',
+                'delivery_address_or_location' => null,
+                'product_service_name' => null,
+                'preferred_date_time' => null,
+            ])]]]]),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT124']]], 200),
+    ]);
+
+    $job = new ProcessWhatsAppMessage($tenant, '573001112233', 'Quiero confirmar mi pedido', 'wamid.IN124', 'text');
+    app()->call([$job, 'handle']);
+
+    // Nunca un segundo Contact — el stub se actualiza in situ.
+    expect(Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->count())->toBe(1);
+
+    $updated = $stub->fresh();
+    expect($updated->id)->toBe($stub->id); // mismo id, nunca uno nuevo
+    expect($updated->customer_name)->toBe('Maria Lopez'); // los datos del lead SÍ se escriben (a diferencia de firstOrCreate())
+    expect($updated->summary)->not->toBe('Registro de Referrals (atribución)'); // summary actualizado al cierre real
+});
+
+it('still skips writing a new lead when recentDuplicateContact applies (unchanged guard)', function () {
+    $tenant = Tenant::factory()->create(['ai_provider' => 'openai']);
+    $realLead = Contact::create([
+        'tenant_id' => $tenant->id,
+        'customer_phone' => '573001112233',
+        'summary' => 'Pedido confirmado hace un momento',
+        'customer_name' => 'Carlos Ruiz',
+        'bot_active' => true,
+    ]);
+
+    // El follow-up del usuario ("¿ya va a llegar?") hace que la IA vuelva a
+    // resumir el pedido ya confirmado y reemita [LEAD_COMPLETE] — este es
+    // exactamente el caso real documentado en FallbackChatHandler que
+    // recentDuplicateContact existe para evitar (sin él, cada follow-up
+    // como este crearía un Contact nuevo). Se registra igual el 2do
+    // response de extractLeadDataWithAI() aunque, si el guard funciona,
+    // nunca debería usarse para escribir nada.
+    Http::fake([
+        'api.openai.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => '¡Tu pedido ya está confirmado, te avisaremos cuando llegue! [LEAD_COMPLETE]']]]])
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'customer_name' => 'Carlos Ruiz',
+                'delivery_address_or_location' => null,
+                'product_service_name' => null,
+                'preferred_date_time' => null,
+            ])]]]]),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT125']]], 200),
+    ]);
+
+    $job = new ProcessWhatsAppMessage($tenant, '573001112233', '¿Ya va a llegar?', 'wamid.IN125', 'text');
+    app()->call([$job, 'handle']);
+
+    expect(Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573001112233')->count())->toBe(1);
+    // El guard de recentDuplicateContact sigue evitando la reescritura —
+    // el lead real ya confirmado no se toca con datos de un follow-up.
+    expect($realLead->fresh()->customer_name)->toBe('Carlos Ruiz');
+    expect($realLead->fresh()->summary)->toBe('Pedido confirmado hace un momento');
+});
+
 it('skips AI processing when the bot is disabled for that contact', function () {
     $tenant = Tenant::factory()->create();
 

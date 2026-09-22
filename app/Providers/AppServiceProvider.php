@@ -8,6 +8,7 @@ use App\Core\Alerts\Channels\PersistedAlertChannel;
 use App\Core\Alerts\Channels\WhatsAppAdminAlertChannel;
 use App\Core\Memory\ContextBuilder;
 use App\Core\Messaging\Dispatcher;
+use App\Core\Messaging\DomainFallbackResolver;
 use App\Core\Messaging\Intent;
 use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
@@ -40,8 +41,10 @@ use App\Training\Onboarding\Requirements\PhysicalStatsRequirement;
 use App\Training\Onboarding\Requirements\PrimaryFocusRequirement;
 use App\Training\Onboarding\Requirements\SessionsPerWeekRequirement;
 use App\Training\Onboarding\Requirements\TrainingLocationRequirement;
+use App\Training\Support\HealthScreeningPrecedencePreRoutingScreen;
 use App\Training\Support\SafetySignalPreRoutingScreen;
 use App\Training\Support\TrainingContextualIntentClassifier;
+use App\Training\Support\TrainingDomainFallbackClaim;
 use App\Training\Support\TrainingIntentClassifier;
 use App\Training\Support\TrainingReminderExecutor;
 use Carbon\CarbonImmutable;
@@ -145,9 +148,19 @@ class AppServiceProvider extends ServiceProvider
         // AcquisitionSourcePreRoutingScreen nunca llega a ejecutarse para
         // ese mensaje y la atribución de Meta Ads de ese mensaje se
         // pierde — no se reordena Safety para evitar esto.
+        //
+        // Hito A (Health Screening Precedence) — HealthScreeningPrecedencePreRoutingScreen
+        // va DESPUÉS de SafetySignalPreRoutingScreen (una señal de
+        // emergencia real — dolor de pecho, etc. — siempre gana) y ANTES
+        // de Referral/Acquisition (nunca interfiere con su atribución: la
+        // pregunta de salud solo puede estar pendiente después de que el
+        // onboarding ya avanzó varios turnos, momento en el que la
+        // atribución del primer mensaje ya se resolvió hace tiempo). Ver
+        // App\Training\Support\HealthScreeningPrecedencePreRoutingScreen.
         // See App\Core\Messaging\PreRoutingScreener and docs/DECISIONS.md.
         $this->app->singleton(PreRoutingScreener::class, fn ($app) => new PreRoutingScreener($app, [
             SafetySignalPreRoutingScreen::class,
+            HealthScreeningPrecedencePreRoutingScreen::class,
             ReferralAttributionPreRoutingScreen::class,
             AcquisitionSourcePreRoutingScreen::class,
         ]));
@@ -174,6 +187,20 @@ class AppServiceProvider extends ServiceProvider
             Intent::Payment->value => PaymentHandler::class,
             Intent::Referral->value => ReferralHandler::class,
             Intent::CustomerCare->value => CustomerCareHandler::class,
+        ]));
+
+        // Hito A (Entry/Domain Fallback) — mismo patrón Container-resuelto
+        // que Router/Dispatcher/PreRoutingScreener: mapa de CLASES de
+        // App\Core\Messaging\DomainFallbackClaimInterface, probadas en
+        // orden. Se invoca ÚNICAMENTE cuando Router::route() ya retornó
+        // Intent::FallbackChat (ver App\Jobs\ProcessWhatsAppMessage) —
+        // nunca para todo mensaje, a diferencia de un PreRoutingScreen.
+        // Contiene cero conocimiento de dominio — TrainingDomainFallbackClaim
+        // es la única implementación real hoy, registrada aquí por nombre
+        // exactamente igual que TrainingHandler/TrainingIntentClassifier ya
+        // lo están arriba. Ver App\Core\Messaging\DomainFallbackResolver.
+        $this->app->singleton(DomainFallbackResolver::class, fn ($app) => new DomainFallbackResolver($app, [
+            TrainingDomainFallbackClaim::class,
         ]));
 
         // Core memory ContextBuilder: same Container-resolution pattern as

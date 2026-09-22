@@ -3,8 +3,10 @@
 namespace App\Jobs;
 
 use App\Core\Messaging\Dispatcher;
+use App\Core\Messaging\DomainFallbackResolver;
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\Ingest;
+use App\Core\Messaging\Intent;
 use App\Core\Messaging\PreRoutingScreener;
 use App\Core\Messaging\Router;
 use App\Models\Conversation;
@@ -80,7 +82,7 @@ class ProcessWhatsAppMessage implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(Ingest $ingest, PreRoutingScreener $preRoutingScreener, Router $router, Dispatcher $dispatcher): void
+    public function handle(Ingest $ingest, PreRoutingScreener $preRoutingScreener, Router $router, Dispatcher $dispatcher, DomainFallbackResolver $domainFallbackResolver): void
     {
         // Observabilidad (Hito 7): tiempo total "webhook → respuesta" — desde
         // que este Job arranca (el webhook ya respondió 200 a Meta de forma
@@ -168,6 +170,26 @@ class ProcessWhatsAppMessage implements ShouldQueue
                 'intent' => $intent->value,
                 'elapsed_ms' => (int) round((microtime(true) - $routerStartedAt) * 1000),
             ]);
+
+            // Hito A (Entry/Domain Fallback) — se evalúa ÚNICAMENTE cuando
+            // el Router ya agotó sus 4 Tiers reales y ninguno reconoció el
+            // mensaje (Intent::FallbackChat): cualquier intent específico
+            // (Training explícito/contextual, Payment, Referral,
+            // CustomerCare, FAQ) sigue ganando siempre, sin ningún cambio.
+            // Ver App\Core\Messaging\DomainFallbackResolver.
+            if ($intent === Intent::FallbackChat) {
+                $resolvedIntent = $domainFallbackResolver->resolve($context);
+
+                if ($resolvedIntent !== null) {
+                    Log::info('DOMAIN_FALLBACK_CLAIMED', [
+                        'tenant_id' => $this->tenant->id,
+                        'customer_phone' => $this->from,
+                        'intent' => $resolvedIntent->value,
+                    ]);
+
+                    $intent = $resolvedIntent;
+                }
+            }
 
             $dispatcher->dispatch($context, $intent);
 

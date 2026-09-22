@@ -268,3 +268,33 @@ it('22: an alert delivery failure never blocks the declaration or changes its st
     expect($condition)->not->toBeNull();
     expect($condition->status)->toBe(HealthConditionStatus::PendingReview);
 });
+
+// ── Hito A (regresión real: caso Juan Pablo) — una respuesta explícita de
+// negación ("No, no tengo") durante un SEGUNDO screening (onboarding
+// duplicado, ver Hito A "Entry") jamás debe borrar/invalidar una
+// TrainingRestriction ya confirmada de una declaración anterior real. ──
+
+it('an explicit denial ("ninguna") never touches a pre-existing confirmed TrainingRestriction, even though it closes the screening', function () {
+    $contact = Contact::factory()->create();
+    $profile = TrainingProfile::factory()->create(['contact_id' => $contact->id, 'health_screening_asked' => false]);
+    $existing = TrainingRestriction::factory()->create([
+        'contact_id' => $contact->id,
+        'status' => RestrictionStatus::Confirmed,
+        'body_region' => BodyRegion::Shoulder,
+    ]);
+
+    // Caso A: negación explícita — health_condition_text === '' (nunca null).
+    healthScreeningRequirement()->apply($contact, $profile, emptyHealthScreeningValues([
+        'health_condition_text' => '',
+    ]));
+
+    // El screening se cierra (case A siempre marca health_screening_asked)...
+    expect($profile->fresh()->health_screening_asked)->toBeTrue();
+    // ...pero NUNCA crea una declaración nueva ni toca la restricción ya
+    // confirmada — HealthScreeningRequirement::apply() nunca escribe en
+    // TrainingRestriction, sin importar el contenido de la respuesta.
+    expect(DeclaredHealthCondition::where('contact_id', $contact->id)->count())->toBe(0);
+    $existing->refresh();
+    expect($existing->status)->toBe(RestrictionStatus::Confirmed);
+    expect($existing->body_region)->toBe(BodyRegion::Shoulder);
+});

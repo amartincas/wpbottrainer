@@ -173,6 +173,54 @@ it('never references any TrainingRestriction/DeclaredHealthCondition/SafetyRestr
     expect($source)->not->toContain('DB::');
 });
 
+// ── Hito A — Safety conversational consistency ──────────────────────────
+
+it('the prompt always instructs Coach to never deny a confirmed safety restriction, regardless of context', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+    ]))]);
+
+    (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], 'RESTRICCIONES DE SEGURIDAD YA CONFIRMADAS')
+            && str_contains($systemMessage['content'], 'NUNCA afirmes que el usuario no tiene lesiones, restricciones o condiciones relevantes');
+    });
+});
+
+it('surfaces the confirmed safety restriction as a fact when activeSafetyBodyRegions is non-empty', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => [], 'training_reply' => null,
+    ]))]);
+
+    $historyContext = new TrainingHistoryContext(
+        windowSessionsCount: 0,
+        windowWeeks: 4,
+        sessions: [],
+        aggregates: new HistoryAggregates(
+            sessionsCompletedInWindow: 0,
+            lastLoadByExerciseId: [],
+            bestRecentLoadByExerciseId: [],
+            recentRepRange: [],
+            lastPerformedAtByExerciseId: [],
+            exercisesRepeatedInWindow: [],
+            daysSinceLastCompletedSession: null,
+        ),
+        currentProfileSnapshot: [],
+        activeSafetyBodyRegions: ['shoulder'],
+    );
+
+    (new CoachService)->respond('hola', minimalCoachContext(['historyContext' => $historyContext]), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    Http::assertSent(function ($request) {
+        $systemMessage = collect($request->data()['messages'])->firstWhere('role', 'system');
+
+        return str_contains($systemMessage['content'], 'RESTRICCIONES DE SEGURIDAD YA CONFIRMADAS (informativo, no las reinterpretes ni las expliques como diagnóstico): shoulder');
+    });
+});
+
 // ── Hito 14 — FAQ/Customer Service ──────────────────────────────────────
 
 it('never imports App\CustomerCare — only iterates scalars already received on CoachContext', function () {

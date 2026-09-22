@@ -80,7 +80,19 @@ it('1: a recent Contact with a real-lead-shaped summary is still treated as a du
 
 // ── 2: Contact reciente con summary de Acquisition -> NO es duplicado ──
 
-it('2: a recent Contact stamped by Acquisition attribution is NOT treated as a duplicate — the real lead gets created', function () {
+/**
+ * Hito A (Contact Identity, hallazgo de la prueba E2E real) — expectativa
+ * actualizada: antes de este hito, FallbackChatHandler usaba Contact::create()
+ * puro, así que un stub de atribución "NO tratado como duplicado" producía
+ * una SEGUNDA fila real (el bug exacto del incidente de staging con Juan
+ * Pablo — dos Contacts para el mismo tenant+teléfono). Con updateOrCreate()
+ * (misma clave tenant_id+customer_phone que usan los otros 8 puntos de
+ * creación de Contact del repositorio), el stub se ACTUALIZA in situ con
+ * los datos reales del lead — la intención original del test (el stub de
+ * atribución nunca bloquea que el lead real se registre) se preserva
+ * intacta; solo cambia CÓMO se registra (misma fila, no una nueva).
+ */
+it('2: a recent Contact stamped by Acquisition attribution is NOT treated as a duplicate — the real lead updates it in place, never a second Contact', function () {
     $tenant = fallbackReadyTenant();
     $stub = Contact::factory()->create([
         'tenant_id' => $tenant->id,
@@ -93,14 +105,13 @@ it('2: a recent Contact stamped by Acquisition attribution is NOT treated as a d
     (new FallbackChatHandler())->handle(fallbackContext($tenant, '573000000002', 'Confirmo mi compra, mi nombre es Ana'));
 
     $contacts = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573000000002')->get();
-    expect($contacts)->toHaveCount(2); // el stub de atribución + el lead real
-    expect($contacts->pluck('id'))->toContain($stub->id);
-    $realLead = $contacts->firstWhere('id', '!=', $stub->id);
+    expect($contacts)->toHaveCount(1); // el stub se actualiza, nunca un segundo Contact
+    expect($contacts->first()->id)->toBe($stub->id);
     // El lead real lleva el texto de cierre de la IA (sin el token), nunca
-    // la convención "Registro de " — confirma que es un lead genuino, no
-    // otro stub administrativo.
-    expect($realLead->summary)->not->toStartWith('Registro de ');
-    expect($realLead->summary)->toContain('Tu pedido está confirmado');
+    // la convención "Registro de " — confirma que la fila pasó a ser un
+    // lead genuino, no que se quedó como stub administrativo.
+    expect($contacts->first()->summary)->not->toStartWith('Registro de ');
+    expect($contacts->first()->summary)->toContain('Tu pedido está confirmado');
 });
 
 // ── 3: Contact reciente con summary de Referral attribution -> NO es duplicado (cubre el caso latente) ──
@@ -118,15 +129,24 @@ it('3: a recent Contact stamped by Referral attribution is NOT treated as a dupl
     (new FallbackChatHandler())->handle(fallbackContext($tenant, '573000000003', 'Confirmo mi compra, mi nombre es Luis'));
 
     $contacts = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573000000003')->get();
-    expect($contacts)->toHaveCount(2);
-    expect($contacts->pluck('id'))->toContain($stub->id);
+    expect($contacts)->toHaveCount(1);
+    expect($contacts->first()->id)->toBe($stub->id);
+    expect($contacts->first()->summary)->not->toStartWith('Registro de ');
 });
 
 // ── 4: Contact antiguo (>1h) con summary de lead real -> conserva el comportamiento legacy de ventana ──
 
+/**
+ * Hito A — expectativa actualizada por el mismo motivo que el test 2: el
+ * criterio real que este test protege ("un Contact fuera de la ventana de
+ * 1h nunca bloquea un nuevo lead") sigue exactamente igual — lo único que
+ * cambia es que, al no haber ya ningún Contact NUEVO creado por Referral/
+ * Acquisition (este escenario simula un Contact viejo y ya resuelto),
+ * updateOrCreate() actualiza esa misma fila en vez de crear una segunda.
+ */
 it('4: an old Contact (older than the 1-hour window), even with a real-lead-shaped summary, never blocks a new lead — the time window still applies exactly as before', function () {
     $tenant = fallbackReadyTenant();
-    Contact::factory()->create([
+    $old = Contact::factory()->create([
         'tenant_id' => $tenant->id,
         'customer_phone' => '573000000004',
         'summary' => '¡Gracias por tu compra anterior!',
@@ -136,7 +156,10 @@ it('4: an old Contact (older than the 1-hour window), even with a real-lead-shap
 
     (new FallbackChatHandler())->handle(fallbackContext($tenant, '573000000004', 'Confirmo mi compra, mi nombre es Sofía'));
 
-    expect(Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573000000004')->count())->toBe(2);
+    $contacts = Contact::where('tenant_id', $tenant->id)->where('customer_phone', '573000000004')->get();
+    expect($contacts)->toHaveCount(1); // nunca un segundo Contact — la fila existente se actualiza
+    expect($contacts->first()->id)->toBe($old->id);
+    expect($contacts->first()->summary)->toContain('Tu pedido está confirmado'); // el lead nuevo SÍ se registró
 });
 
 // ── 5: summary NULL — documentado como inalcanzable bajo el esquema actual ──

@@ -311,3 +311,109 @@ it('renders the customers list and detail page for a contact with no related dat
         ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
         ->assertOk();
 });
+
+// ── Hito A (Safety Administration) — confirm_health_restriction /
+// resolve_health_condition_without_restriction, delegando exactamente en
+// App\Training\Support\DeclaredHealthConditionRecorder (sin cambios) ────
+
+it('hides both safety actions when the Contact has no pending_review DeclaredHealthCondition', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertActionHidden('confirm_health_restriction')
+        ->assertActionHidden('resolve_health_condition_without_restriction');
+});
+
+it('hides both safety actions from a non-super-admin even with a pending condition', function () {
+    $tenant = Tenant::factory()->create();
+    $admin = User::factory()->create(['is_super_admin' => false, 'tenant_id' => $tenant->id]);
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id]);
+    DeclaredHealthCondition::factory()->for($contact)->create(['status' => \App\Training\Enums\HealthConditionStatus::PendingReview]);
+
+    Livewire::actingAs($admin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertActionHidden('confirm_health_restriction')
+        ->assertActionHidden('resolve_health_condition_without_restriction');
+});
+
+it('shows both safety actions to a super admin when a pending_review DeclaredHealthCondition exists', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    DeclaredHealthCondition::factory()->for($contact)->create(['status' => \App\Training\Enums\HealthConditionStatus::PendingReview]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->assertActionVisible('confirm_health_restriction')
+        ->assertActionVisible('resolve_health_condition_without_restriction');
+});
+
+it('confirm_health_restriction creates a confirmed TrainingRestriction and resolves the declaration, with the acting admin as reviewer', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    $condition = DeclaredHealthCondition::factory()->for($contact)->create([
+        'status' => \App\Training\Enums\HealthConditionStatus::PendingReview,
+        'original_text' => 'no puedo cargar peso en el hombro',
+    ]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->callAction('confirm_health_restriction', data: [
+            'declared_health_condition_id' => $condition->id,
+            'body_region' => \App\Training\Enums\BodyRegion::Shoulder->value,
+            'source' => \App\Training\Enums\RestrictionSource::UserExplicit->value,
+            'note' => 'Confirmado tras revisión',
+        ])
+        ->assertHasNoActionErrors();
+
+    $restriction = TrainingRestriction::where('contact_id', $contact->id)->sole();
+    expect($restriction->status)->toBe(\App\Training\Enums\RestrictionStatus::Confirmed);
+    expect($restriction->body_region)->toBe(\App\Training\Enums\BodyRegion::Shoulder);
+    expect($restriction->source)->toBe(\App\Training\Enums\RestrictionSource::UserExplicit);
+    expect($restriction->reviewed_by)->toBe($superAdmin->id);
+
+    $freshCondition = $condition->fresh();
+    expect($freshCondition->status)->toBe(\App\Training\Enums\HealthConditionStatus::ResolvedRestrictionCreated);
+    expect($freshCondition->reviewed_by)->toBe($superAdmin->id);
+    expect($freshCondition->related_restriction_id)->toBe($restriction->id);
+});
+
+it('resolve_health_condition_without_restriction resolves the declaration without ever creating a TrainingRestriction', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    $condition = DeclaredHealthCondition::factory()->for($contact)->create([
+        'status' => \App\Training\Enums\HealthConditionStatus::PendingReview,
+    ]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->callAction('resolve_health_condition_without_restriction', data: [
+            'declared_health_condition_id' => $condition->id,
+            'note' => 'No corresponde ninguna restricción real',
+        ])
+        ->assertHasNoActionErrors();
+
+    expect(TrainingRestriction::where('contact_id', $contact->id)->count())->toBe(0);
+
+    $freshCondition = $condition->fresh();
+    expect($freshCondition->status)->toBe(\App\Training\Enums\HealthConditionStatus::ResolvedNoRestriction);
+    expect($freshCondition->reviewed_by)->toBe($superAdmin->id);
+    expect($freshCondition->review_note)->toBe('No corresponde ninguna restricción real');
+});
+
+it('resolve_health_condition_without_restriction requires a non-empty note', function () {
+    $superAdmin = User::factory()->create(['is_super_admin' => true]);
+    $contact = Contact::factory()->create();
+    $condition = DeclaredHealthCondition::factory()->for($contact)->create(['status' => \App\Training\Enums\HealthConditionStatus::PendingReview]);
+
+    Livewire::actingAs($superAdmin)
+        ->test(ViewCustomer::class, ['record' => $contact->getRouteKey()])
+        ->callAction('resolve_health_condition_without_restriction', data: [
+            'declared_health_condition_id' => $condition->id,
+            'note' => '',
+        ])
+        ->assertHasActionErrors(['note']);
+
+    expect($condition->fresh()->status)->toBe(\App\Training\Enums\HealthConditionStatus::PendingReview);
+});
