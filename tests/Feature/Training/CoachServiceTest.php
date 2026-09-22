@@ -52,7 +52,7 @@ it('returns an empty result for an empty message, without calling the AI provide
 
     $result = (new CoachService)->respond('', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false, 'requested_focus_terms' => []]);
     Http::assertNothingSent();
 });
 
@@ -113,7 +113,7 @@ it('degrades to an empty result when the AI provider fails, without throwing', f
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false, 'requested_focus_terms' => []]);
 });
 
 it('degrades to an empty result when the AI response is not valid JSON', function () {
@@ -121,7 +121,7 @@ it('degrades to an empty result when the AI response is not valid JSON', functio
 
     $result = (new CoachService)->respond('hola', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
 
-    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false]);
+    expect($result)->toBe(['safety_signal_text' => null, 'intents' => [], 'training_reply' => null, 'reminder_day' => null, 'reminder_time' => null, 'reminder_recurrence' => null, 'reminder_confirmation' => null, 'faq_match_id' => null, 'faq_response_text' => null, 'customer_service_needed' => false, 'customer_service_message' => null, 'conversation_reinforcement_included' => false, 'requested_focus_terms' => []]);
 });
 
 it('treats an empty/blank training_reply as null, never an empty string action', function () {
@@ -376,6 +376,30 @@ it('parses faq_match_id/faq_response_text/customer_service_needed/customer_servi
     expect($result['faq_response_text'])->toBeNull(); // blanco -> null
     expect($result['customer_service_needed'])->toBeFalse(); // no era exactamente true
     expect($result['customer_service_message'])->toBeNull(); // no era string
+});
+
+/**
+ * Hito B1.3.1 (gap de test menor identificado en el Code Review de B1.3) —
+ * documenta, sin cambiar parseJson(), el comportamiento REAL actual cuando
+ * la IA devuelve "requested_focus_terms" como un objeto/array asociativo en
+ * vez de una lista plana: is_array() de PHP no distingue lista de mapa, así
+ * que la validación (array_filter + is_string, igual que el resto del
+ * método) conserva solo los VALORES que sean string, descarta las claves y
+ * cualquier valor no-string, y reindexa — nunca crashea, nunca propaga la
+ * estructura anidada. No representa un riesgo real de bypass de dominio: el
+ * vocabulario cerrado de RequestedFocusTermMapper sigue siendo la barrera
+ * semántica real aguas abajo (ver su propio test containsRecognizedTerm()/
+ * mapMany()), así que este test documenta el comportamiento, no lo corrige.
+ */
+it('parses requested_focus_terms defensively even when the AI returns an associative structure instead of a flat list', function () {
+    Http::fake(['api.openai.com/v1/chat/completions' => Http::response(chatCompletionBody([
+        'safety_signal_text' => null, 'intents' => ['continue_training'], 'training_reply' => null,
+        'requested_focus_terms' => ['a' => 'pecho', 'b' => 123, 'c' => ['nested' => 'piernas']],
+    ]))]);
+
+    $result = (new CoachService)->respond('mensaje', minimalCoachContext(), Tenant::factory()->create(['ai_provider' => 'openai']));
+
+    expect($result['requested_focus_terms'])->toBe(['pecho']);
 });
 
 // ── H16.2 Fase 1.3 (corrección post-auditoría E2E) — AM/PM ambiguo ──────

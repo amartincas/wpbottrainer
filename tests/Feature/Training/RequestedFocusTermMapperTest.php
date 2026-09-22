@@ -64,6 +64,20 @@ it('10: unknown terms are rejected — never approximated, never invented', func
     expect((new RequestedFocusTermMapper)->isRecognized('biceps femoral inventado'))->toBeFalse();
 });
 
+it('10b (Code Review B1.3 gap): a mix of a real term and a genuinely unknown one keeps only the real group', function () {
+    $groups = (new RequestedFocusTermMapper)->mapMany(['pecho', 'xyz']);
+
+    expect($groups)->toHaveCount(1);
+    expect($groups[0]->key)->toBe('chest');
+});
+
+it('10c (Code Review B1.3 gap): a literal duplicate of the exact same term produces a single group, never two', function () {
+    $groups = (new RequestedFocusTermMapper)->mapMany(['pecho', 'pecho']);
+
+    expect($groups)->toHaveCount(1);
+    expect($groups[0]->key)->toBe('chest');
+});
+
 it('11: never does substring matching — a superstring of a known term is rejected', function () {
     $mapper = new RequestedFocusTermMapper;
 
@@ -119,4 +133,42 @@ it('non-string terms in the input array are ignored without error', function () 
 
 it('an empty terms array produces no requested focus', function () {
     expect((new RequestedFocusTermMapper)->mapMany([]))->toBeNull();
+});
+
+// ── containsRecognizedTerm() — Hito B1.3.1, señal de enrutamiento (nunca extracción real) ──
+
+it('containsRecognizedTerm: detects a recognized term inside a full raw sentence, case-insensitively', function () {
+    $mapper = new RequestedFocusTermMapper;
+
+    expect($mapper->containsRecognizedTerm('Quiero trabajar espalda'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('QUIERO TRABAJAR ESPALDA'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('Hoy quiero trabajar piernas'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('todo el cuerpo por favor'))->toBeTrue(); // FULL_BODY_TERMS también cuenta
+});
+
+it('containsRecognizedTerm: false when the sentence contains no recognized term at all', function () {
+    $mapper = new RequestedFocusTermMapper;
+
+    expect($mapper->containsRecognizedTerm('Me duele el hombro'))->toBeFalse();
+    expect($mapper->containsRecognizedTerm('¿Cuánto cuesta la membresía?'))->toBeFalse();
+});
+
+// ── containsRecognizedTerm() — Hito B1.3.1.1, corrección de NC-1 (límites de palabra Unicode-aware) ──
+
+it('containsRecognizedTerm: 15/16/17 — no longer matches a recognized term as a mere substring of a longer word', function () {
+    $mapper = new RequestedFocusTermMapper;
+
+    expect($mapper->containsRecognizedTerm('espaldazo'))->toBeFalse();
+    expect($mapper->containsRecognizedTerm('corear con el equipo'))->toBeFalse();
+    expect($mapper->containsRecognizedTerm('necesito ir más slower'))->toBeFalse();
+});
+
+it('containsRecognizedTerm: 18/19/20/21/22 — real positives (punctuation-adjacent, full sentence, multi-word terms) still match', function () {
+    $mapper = new RequestedFocusTermMapper;
+
+    expect($mapper->containsRecognizedTerm('piernas?'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('piernas.'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('quiero trabajar piernas hoy'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('tren inferior'))->toBeTrue();
+    expect($mapper->containsRecognizedTerm('lower body'))->toBeTrue();
 });

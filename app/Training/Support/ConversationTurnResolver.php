@@ -24,7 +24,10 @@ use App\Training\Enums\DetectedIntentType;
  *
  * `continue_training` NUNCA depende de `training_reply` — siempre dispara
  * `DeliverSession`, que `TrainingHandler` traduce en la llamada ya existente
- * a `TrainingEngine::decideNextSession()` (sin cambios ahí).
+ * a `TrainingEngine::decideNextSession()`. Hito B1.3: `DeliverSession`
+ * transporta además los `requested_focus_terms` crudos que la IA haya
+ * extraído junto con `continue_training` (`[]` si no hubo ninguno) — sigue
+ * sin decidir nada de foco; solo los recoge.
  *
  * `membership_status` SIEMPRE usa el stub fijo — Commercial no implementado
  * todavía (fuera de alcance de Hito 14).
@@ -62,7 +65,7 @@ class ConversationTurnResolver
     public function __construct(private readonly SafetySignalDetector $safetyDetector) {}
 
     /**
-     * @param  array{safety_signal_text: ?string, reports?: array, session_finished?: bool, intents: array<int, string>, training_reply: ?string, faq_match_id?: ?int, faq_response_text?: ?string, customer_service_needed?: bool, customer_service_message?: ?string}  $result
+     * @param  array{safety_signal_text: ?string, reports?: array, session_finished?: bool, intents: array<int, string>, training_reply: ?string, faq_match_id?: ?int, faq_response_text?: ?string, customer_service_needed?: bool, customer_service_message?: ?string, requested_focus_terms?: array<int, string>}  $result
      *         Mismo formato plano que ya devuelve `ExecutionReportService::extractReport()`
      *         (`reports`/`session_finished` como claves de primer nivel, no
      *         anidadas) — el resultado de `CoachService::respond()` simplemente
@@ -103,7 +106,17 @@ class ConversationTurnResolver
         }
 
         if (in_array(DetectedIntentType::ContinueTraining->value, $intents, true)) {
-            $actions[] = ConversationAction::deliverSession();
+            // Hito B1.3 — términos crudos de foco puntual (si el usuario los
+            // dio), transportados SIN interpretar (mismo criterio que
+            // reminder_day/reminder_time arriba): este resolver sigue sin
+            // conocer RequestedFocusTermMapper ni RequestedFocusGroup — la
+            // canonicalización ocurre exclusivamente en TrainingHandler.
+            // `ExecutionReportService::extractReport()` (el otro origen
+            // posible de $result, ver docblock de resolve()) nunca incluye
+            // esta clave — `?? []` preserva el comportamiento de siempre en
+            // ese camino, donde además DeliverSession nunca genera una
+            // sesión nueva (la sesión activa ya existe por precondición).
+            $actions[] = ConversationAction::deliverSession($result['requested_focus_terms'] ?? []);
         }
 
         // Hito 10 — datos CRUDOS únicamente: ni resueltos ni validados aquí

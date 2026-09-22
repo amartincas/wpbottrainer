@@ -18,6 +18,7 @@ final readonly class ConversationAction
         public ?string $safetyReason = null,
         public ?array $reminderData = null,
         public bool $isFaqFallback = false,
+        public array $requestedFocusTerms = [],
     ) {}
 
     public static function escalateSafety(string $reason): self
@@ -38,9 +39,21 @@ final readonly class ConversationAction
         return new self(ConversationActionType::SendText, text: $text);
     }
 
-    public static function deliverSession(): self
+    /**
+     * Hito B1.3 (Requested Focus — wiring conversacional) — `$requestedFocusTerms`:
+     * términos CRUDOS (aún sin canonicalizar, ej. `["pecho", "piernas"]`) que
+     * el usuario pidió para ESTA sesión, si los hubo — `[]` en cualquier
+     * otro caso. Esta clase y `ConversationTurnResolver` NUNCA canonicalizan
+     * ni deciden `MuscleFocus` — mismo patrón exacto que `reminderData` con
+     * `reminder_day`/`reminder_time` (dato crudo, transportado sin
+     * interpretar; `TrainingHandler` es quien invoca
+     * `RequestedFocusTermMapper` para resolverlo).
+     *
+     * @param  array<int, string>  $requestedFocusTerms
+     */
+    public static function deliverSession(array $requestedFocusTerms = []): self
     {
-        return new self(ConversationActionType::DeliverSession);
+        return new self(ConversationActionType::DeliverSession, requestedFocusTerms: $requestedFocusTerms);
     }
 
     /**

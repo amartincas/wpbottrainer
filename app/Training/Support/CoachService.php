@@ -27,6 +27,19 @@ use Illuminate\Support\Facades\Log;
  * `CoachFactsFormatter`), nunca inventado para `membership_status`
  * (Commercial no implementado, fuera de alcance).
  *
+ * Hito B1.3 (Requested Focus — wiring conversacional) — `requested_focus_terms`:
+ * cuando el intent es `continue_training` y el usuario además pidió
+ * trabajar una o más zonas puntuales para ESTA sesión ("quiero pecho y
+ * piernas"), la IA extrae los TÉRMINOS LITERALES que usó — nunca un
+ * `MuscleFocus`, nunca decide qué músculos representan. Esta clase NO
+ * conoce `RequestedFocusTermMapper`/`RequestedFocusGroup`/`TrainingEngine`
+ * — el vocabulario cerrado y su expansión (ej. "piernas" ->
+ * quads+hamstrings+glutes+calves) se resuelven exclusivamente aguas abajo,
+ * en `TrainingHandler`, después de que `ConversationTurnResolver` ya
+ * transportó estos términos crudos sin tocarlos. Un término no reconocido
+ * simplemente no produce ningún grupo — nunca un error, nunca una
+ * aproximación (ver `RequestedFocusTermMapper`).
+ *
  * Hito 14 — `faq_match_id`/`faq_response_text`/`customer_service_needed`/
  * `customer_service_message`: el bloque de evaluación de FAQ/Customer
  * Service SOLO se incluye en el prompt cuando `CoachContext->activeFaqs`
@@ -46,6 +59,7 @@ class CoachService
         'faq_match_id' => null, 'faq_response_text' => null,
         'customer_service_needed' => false, 'customer_service_message' => null,
         'conversation_reinforcement_included' => false,
+        'requested_focus_terms' => [],
     ];
 
     /**
@@ -76,7 +90,7 @@ REGLAS DURAS PARA FAQ/CUSTOMER SERVICE:
 RULES;
 
     /**
-     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool, faq_match_id: ?int, faq_response_text: ?string, customer_service_needed: bool, customer_service_message: ?string, conversation_reinforcement_included: bool}
+     * @return array{safety_signal_text: ?string, intents: array<int, string>, training_reply: ?string, reminder_day: ?string, reminder_time: ?string, reminder_recurrence: ?bool, reminder_confirmation: ?bool, faq_match_id: ?int, faq_response_text: ?string, customer_service_needed: bool, customer_service_message: ?string, conversation_reinforcement_included: bool, requested_focus_terms: array<int, string>}
      */
     public function respond(string $messageBody, CoachContext $coachContext, Tenant $tenant): array
     {
@@ -109,6 +123,7 @@ Eres el entrenador personal conversacional de WpbotTrainer, hablando por WhatsAp
 REGLAS DURAS, INAMOVIBLES:
 - NUNCA inventes cargas, repeticiones, RPE, fechas, sesiones anteriores ni resultados que no aparezcan en los HECHOS de abajo.
 - NUNCA decidas ni sugieras un ejercicio, un peso, una cantidad de repeticiones, ni una progresión — esas decisiones ya las tomó el sistema; tu trabajo es solo explicarlas en lenguaje natural.
+- Si extraes "requested_focus_terms", usa EXCLUSIVAMENTE las palabras literales del usuario (ej. "pecho", "piernas") — NUNCA las traduzcas a inglés, a nombres técnicos/anatómicos, ni decidas tú qué músculos específicos representan; esa traducción la hace el sistema, no tú.
 - NUNCA emitas un juicio de seguridad ("no es grave", "puedes continuar", "eso está bien") — si detectas una posible señal de seguridad, repórtala en "safety_signal_text", nunca la resuelvas tú.
 - Si los HECHOS contienen una línea "RESTRICCIONES DE SEGURIDAD YA CONFIRMADAS", NUNCA afirmes que el usuario no tiene lesiones, restricciones o condiciones relevantes — reconoce la restricción existente cuando sea pertinente a la conversación. Esto es únicamente consistencia conversacional: tú nunca decides, confirmas ni revocas una restricción — esa autoridad es exclusivamente humana, vía revisión administrativa.
 - Si falta un dato para responder, dilo explícitamente — nunca lo aproximes.
@@ -122,7 +137,7 @@ HECHOS (única fuente de verdad — todo lo demás es lenguaje, no dato):
 
 Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber más de uno) de esta lista cerrada: {$intentValues}.
 - "exercise_question": preguntas sobre un ejercicio, carga, reps, RPE, técnica, o el motivo de una decisión ya tomada.
-- "continue_training": el usuario pide su entrenamiento/rutina/qué sigue.
+- "continue_training": el usuario pide su entrenamiento/rutina/qué sigue. Si ADEMÁS pide trabajar una o más zonas/músculos específicos SOLO para esta sesión (ej. "quiero mi rutina y quiero trabajar pecho y piernas", "quiero trabajar espalda", "prefiero pecho hoy"), extrae esos términos TAL COMO los dijo el usuario (sin traducir, sin decidir a qué músculos corresponden) en "requested_focus_terms". Si el usuario pidió explícitamente "todo el cuerpo"/una rutina general, o no mencionó ninguna zona, deja "requested_focus_terms" en un array vacío. Es una petición PUNTUAL para esta sesión — nunca la trates como una preferencia permanente ni la incluyas si el mensaje no es realmente una petición de entrenar ahora.
 - "general_conversation": conversación general de entrenamiento no cubierta arriba.
 - "membership_status": preguntas sobre membresía, pago, acceso o facturación.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
@@ -142,7 +157,8 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" (SOLO si el usuario mencionó un día, para crear/modificar/confirmar-con-cambio un recordatorio) | null,
   "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
   "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
-  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.{$this->faqJsonFields($coachContext)}{$this->conversationReinforcementJsonField($coachContext)}
+  "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.
+  "requested_focus_terms": ["<término literal tal como lo dijo el usuario, ej. \"pecho\", \"piernas\">"] (SOLO si el intent incluye "continue_training" y el usuario pidió zonas puntuales para esta sesión) | [] (en cualquier otro caso — nunca null, nunca omitido).{$this->faqJsonFields($coachContext)}{$this->conversationReinforcementJsonField($coachContext)}
 }
 {$this->faqRulesFooter($coachContext)}{$conversationReinforcementRule}
 
@@ -248,6 +264,14 @@ TXT;
                 ? $decoded['customer_service_message']
                 : null,
             'conversation_reinforcement_included' => ($decoded['conversation_reinforcement_included'] ?? false) === true,
+            // Hito B1.3 — array de strings, nunca confiado sin validar: un
+            // valor no-array, o con elementos no-string, se descarta
+            // (array_filter + 'is_string', mismo criterio defensivo que el
+            // resto de este método) — nunca se propaga una estructura
+            // arbitraria hacia RequestedFocusTermMapper.
+            'requested_focus_terms' => is_array($decoded['requested_focus_terms'] ?? null)
+                ? array_values(array_filter($decoded['requested_focus_terms'], 'is_string'))
+                : [],
         ];
     }
 }

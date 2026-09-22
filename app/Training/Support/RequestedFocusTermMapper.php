@@ -130,4 +130,49 @@ class RequestedFocusTermMapper
 
         return in_array($term, self::FULL_BODY_TERMS, true) || array_key_exists($term, self::EXACT_MAP);
     }
+
+    /**
+     * Hito B1.3.1 — a diferencia de `isRecognized()` (que compara un
+     * TÉRMINO YA EXTRAÍDO, exacto y completo, por el LLM), este método
+     * recibe TEXTO CRUDO de un mensaje completo y determina si CONTIENE
+     * alguno de los términos del vocabulario cerrado como subcadena.
+     *
+     * Usado EXCLUSIVAMENTE como señal de ENRUTAMIENTO por
+     * `TrainingIntentClassifier` (ver su docblock/`containsFocusRequest()`)
+     * — nunca para decidir el `requested_focus` real de una sesión, que
+     * sigue siendo exclusivamente `mapMany()` sobre términos ya extraídos
+     * por la IA. Este método es la ÚNICA razón por la que
+     * `TrainingIntentClassifier` no necesita (y no debe) duplicar
+     * `EXACT_MAP`/`FULL_BODY_TERMS` — sigue habiendo una sola fuente de
+     * vocabulario en todo el codebase.
+     *
+     * Comparación case-insensitive SOLO para esta señal de enrutamiento —
+     * `mapMany()`/`isRecognized()` (extracción/canonicalización real) siguen
+     * sin normalizar texto, exactamente como antes, sin ningún cambio de
+     * comportamiento.
+     *
+     * Hito B1.3.1.1 (corrección de NC-1 del Code Review) — matching por
+     * LÍMITES DE CARÁCTER letra/número, Unicode-aware (`\p{L}`/`\p{N}` con
+     * el modificador `/u`, NUNCA `\b` de PCRE, que no reconoce tildes/ñ sin
+     * soporte Unicode explícito) en vez de subcadena pura: "espaldazo" ya
+     * no reconoce "espalda", "corear" ya no reconoce "core", "slower" ya no
+     * reconoce "lower" — mientras que "piernas?"/"piernas." (seguidos de
+     * puntuación) y frases multi-palabra como "tren inferior"/"lower body"
+     * siguen reconociéndose correctamente (el límite solo se exige en los
+     * extremos de la frase completa, nunca entre sus propias palabras).
+     */
+    public function containsRecognizedTerm(string $text): bool
+    {
+        $normalized = mb_strtolower($text);
+
+        foreach ([...array_keys(self::EXACT_MAP), ...self::FULL_BODY_TERMS] as $term) {
+            $pattern = '/(?<![\p{L}\p{N}])'.preg_quote($term, '/').'(?![\p{L}\p{N}])/u';
+
+            if (preg_match($pattern, $normalized) === 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

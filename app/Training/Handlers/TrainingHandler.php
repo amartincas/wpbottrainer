@@ -46,6 +46,7 @@ use App\Training\Support\ExerciseMessageFormatter;
 use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
+use App\Training\Support\RequestedFocusTermMapper;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\SessionCloseMessageComposer;
 use App\Training\Support\SessionIntroComposer;
@@ -317,6 +318,7 @@ class TrainingHandler implements HandlerInterface
         private readonly SessionCloseMessageComposer $sessionCloseComposer,
         private readonly SessionIntroComposer $sessionIntroComposer,
         private readonly SupportPhaseConfirmationDetector $supportConfirmationDetector,
+        private readonly RequestedFocusTermMapper $requestedFocusTermMapper,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -612,6 +614,15 @@ class TrainingHandler implements HandlerInterface
         // fue la única llamada permitida — se cae directamente al paso 6
         // (comportamiento idéntico al de antes del Bloque 9 para este caso
         // exacto), sin invocar a Coach.
+        // Hito B1.3 (Requested Focus — wiring conversacional) — `null` por
+        // defecto: preserva EXACTAMENTE el comportamiento legacy salvo en el
+        // único camino que puede producir una petición real (rama de
+        // CoachService, más abajo). Ninguno de los otros 2 caminos que
+        // llegan al paso 6 sin pasar por CoachService (onboarding recién
+        // completado, afirmación corta tras un Reminder) tiene términos que
+        // extraer — nunca se les asigna un valor.
+        $requestedFocus = null;
+
         if ($onboardingJustCompletedThisTurn) {
             // continúa directo al paso 6, sin segunda llamada de IA.
         } elseif ($this->isShortAffirmativeAfterReminder($body, $freshContact)) {
@@ -631,6 +642,18 @@ class TrainingHandler implements HandlerInterface
             // totalmente determinista. Ver docs/DECISIONS.md.
             $result = $this->faqMatcher->sanitize($result, $coachContext->activeFaqs ?? []);
             $resolved = $this->turnResolver->resolve($result);
+
+            // Hito B1.3 — canonicalización de los términos crudos que
+            // ConversationTurnResolver ya transportó en la acción
+            // DeliverSession (si la hubo), ANTES de ejecutar las acciones.
+            // Único punto de todo el flujo que invoca RequestedFocusTermMapper
+            // — TrainingEngine::decideNextSession() sigue siendo quien decide
+            // la selección real; esto solo produce el array de grupos que le
+            // pasamos, nunca un ejercicio ni un MuscleFocus arbitrario. Si
+            // ninguna acción es DeliverSession (ej. el mensaje no pidió
+            // continuar el entrenamiento), o no hubo términos reconocidos,
+            // $requestedFocus queda en null — mismo comportamiento legacy.
+            $requestedFocus = $this->resolveRequestedFocus($resolved);
 
             // H16.1 (Cambio 3) — se marca ÚNICAMENTE cuando el contrato JSON
             // confirma explícitamente que el refuerzo se incorporó Y ese
@@ -669,7 +692,7 @@ class TrainingHandler implements HandlerInterface
         $engineStartedAt = microtime(true);
 
         try {
-            $session = $this->engine->decideNextSession($freshContact);
+            $session = $this->engine->decideNextSession($freshContact, $requestedFocus);
         } catch (TrainingAccessDeniedException $e) {
             $this->respondToDenial($e->reason, $freshContact, $from, $tenant);
 
@@ -868,6 +891,36 @@ class TrainingHandler implements HandlerInterface
         ]);
 
         return $fragment;
+    }
+
+    /**
+     * Hito B1.3 (Requested Focus — wiring conversacional) — busca la acción
+     * `DeliverSession` entre las ya resueltas por `ConversationTurnResolver`
+     * y, si trae términos crudos, los canonicaliza vía
+     * `RequestedFocusTermMapper` — el ÚNICO paso de todo `TrainingHandler`
+     * que traduce lenguaje (ya extraído por la IA) a `RequestedFocusGroup[]`.
+     * Nunca decide qué `MuscleFocus` corresponde a un término (eso ya lo
+     * hizo el mapper, con su vocabulario cerrado) ni selecciona ejercicios —
+     * el resultado se pasa tal cual a `TrainingEngine::decideNextSession()`,
+     * la única autoridad de selección.
+     *
+     * `null` cuando: no hay ninguna acción `DeliverSession` (el mensaje no
+     * pidió continuar el entrenamiento), no trajo términos, o ninguno de los
+     * términos fue reconocido por el vocabulario cerrado (ej. "todo el
+     * cuerpo", o un término desconocido) — en los 3 casos, `decideNextSession()`
+     * recibe `null` y ejecuta exactamente el comportamiento legacy.
+     *
+     * @return ?array<int, \App\Training\Support\RequestedFocusGroup>
+     */
+    private function resolveRequestedFocus(ConversationTurnResolved $resolved): ?array
+    {
+        foreach ($resolved->actions as $action) {
+            if ($action->type === ConversationActionType::DeliverSession) {
+                return $this->requestedFocusTermMapper->mapMany($action->requestedFocusTerms);
+            }
+        }
+
+        return null;
     }
 
     /**
