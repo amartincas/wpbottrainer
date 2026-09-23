@@ -126,6 +126,59 @@ it('advances past a delivered Preparation exercise on an explicit confirmation, 
     expect($exercises[1]->fresh()->delivered_at)->not->toBeNull();
 });
 
+// ── Hito de confirmación en lenguaje natural (diseño v4) — evidencia E2E real ──
+
+it('E2E real (staging): "Rodillas altas, hice una serie x 90 segundos" advances the Support, creates NO ExerciseLog for it, and never touches ExecutionReportRecorder/ExecutionReportService', function () {
+    $contact = supportPhaseReadyContact();
+    [, $exercises] = supportPhaseSession($contact, [
+        ['name' => 'Rodillas altas', 'phase' => WorkoutExercisePhase::Preparation, 'delivered_at' => now()->subMinutes(1), 'logged' => false],
+        ['name' => 'Medio burpee', 'phase' => WorkoutExercisePhase::Main, 'delivered_at' => null, 'logged' => false],
+    ]);
+
+    Http::fake(['graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200)]);
+
+    supportPhaseSendMessage($contact, 'Rodillas altas, hice una serie x 90 segundos');
+
+    // Determinista — nunca pasó por ExecutionReportService/CoachService
+    // (ninguna llamada de IA), confirmando que la rama 4a
+    // (SupportPhaseConfirmationDetector) resolvió el turno completo.
+    Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.openai.com'));
+
+    // Avanzó: el siguiente WorkoutExercise (Main) fue entregado.
+    $bodies = supportPhaseOutboundBodies();
+    expect($bodies->contains(fn ($b) => str_contains($b, 'Medio burpee')))->toBeTrue();
+    expect($exercises[1]->fresh()->delivered_at)->not->toBeNull();
+
+    // Rodillas altas (Preparation) NUNCA fue tratado como Main: sin
+    // ExerciseLog, nunca pasó por ExecutionReportRecorder.
+    expect(ExerciseLog::where('workout_exercise_id', $exercises[0]->id)->count())->toBe(0);
+    expect($exercises[0]->fresh()->requiresExecutionReport())->toBeFalse();
+});
+
+it('E2E real (staging): "Hice una pregunta sobre Rodillas altas" does NOT advance the Support — falls through to the normal report/question path instead', function () {
+    $contact = supportPhaseReadyContact();
+    [, $exercises] = supportPhaseSession($contact, [
+        ['name' => 'Rodillas altas', 'phase' => WorkoutExercisePhase::Preparation, 'delivered_at' => now()->subMinutes(1), 'logged' => false],
+        ['name' => 'Medio burpee', 'phase' => WorkoutExercisePhase::Main, 'delivered_at' => null, 'logged' => false],
+    ]);
+
+    Http::fake([
+        'api.openai.com/v1/chat/completions' => Http::response(supportPhaseReportTurn(
+            intents: ['exercise_question'],
+            trainingReply: 'Rodillas altas es un ejercicio de calentamiento cardiovascular.',
+        )),
+        'graph.facebook.com/*' => Http::response(['messages' => [['id' => 'wamid.OUT']]], 200),
+    ]);
+
+    supportPhaseSendMessage($contact, 'Hice una pregunta sobre Rodillas altas');
+
+    // NUNCA avanzó: "Medio burpee" no fue entregado.
+    $bodies = supportPhaseOutboundBodies();
+    expect($bodies->contains(fn ($b) => str_contains($b, 'Medio burpee')))->toBeFalse();
+    expect($exercises[1]->fresh()->delivered_at)->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $exercises[0]->id)->count())->toBe(0);
+});
+
 it('never advances past a delivered Preparation exercise on a free-text question — the session still answers, but the next exercise is never sent', function (string $body) {
     $contact = supportPhaseReadyContact();
     // Con un Main todavía sin ExerciseLog en la sesión (el caso típico

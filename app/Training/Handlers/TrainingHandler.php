@@ -590,7 +590,7 @@ class TrainingHandler implements HandlerInterface
         // caso cae, sin cambios, al paso 4 siguiente (que sabe responder
         // preguntas vía su propio `training_reply`) o al paso 5.
         if ($frontExercise !== null && ! $frontExercise['requires_report'] && $body !== ''
-            && $this->supportConfirmationDetector->isExplicitConfirmation($body)) {
+            && $this->supportConfirmationDetector->isExplicitConfirmation($body, $frontExercise['name'])) {
             $workoutExercise = WorkoutExercise::find($frontExercise['workout_exercise_id']);
 
             if ($workoutExercise !== null) {
