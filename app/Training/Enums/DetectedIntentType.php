@@ -77,6 +77,24 @@ enum DetectedIntentType: string
     case CustomerServiceRequest = 'customer_service_request';
 
     /**
+     * Hito B2 (Nueva rutina durante sesión activa) — el usuario pide
+     * EXPLÍCITAMENTE reemplazar la rutina/sesión COMPLETA actual por una
+     * distinta ("quiero otra rutina", "cámbiame la rutina", "no quiero esta
+     * rutina, dame otra") — nunca sustituir UN ejercicio individual dentro
+     * de la sesión (eso pertenece al futuro Hito C, no implementado; ver
+     * ejemplos negativos en el prompt de `CoachService`/`ExecutionReportService`).
+     * Deliberadamente distinto de `ContinueTraining`: ese intent nunca
+     * genera una rutina nueva mientras hay una activa (ver
+     * `ConversationActionType::DeliverSession`) — comportamiento opuesto al
+     * que este intent necesita.
+     *
+     * Puede combinarse con `requested_focus_terms` (mismo campo/criterio que
+     * ya usa `ContinueTraining`, ver B1) cuando el usuario además pide un
+     * foco puntual para la nueva rutina ("dame otra rutina de pecho").
+     */
+    case NewWorkoutRequest = 'new_workout_request';
+
+    /**
      * Valida una lista cruda (ej. del JSON de la IA) contra este vocabulario
      * cerrado — cualquier valor que no sea uno de estos casos se descarta
      * silenciosamente (nunca un error, nunca una segunda autoridad de

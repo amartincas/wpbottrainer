@@ -27,18 +27,27 @@ use Illuminate\Support\Facades\Log;
  * `CoachFactsFormatter`), nunca inventado para `membership_status`
  * (Commercial no implementado, fuera de alcance).
  *
- * Hito B1.3 (Requested Focus — wiring conversacional) — `requested_focus_terms`:
- * cuando el intent es `continue_training` y el usuario además pidió
- * trabajar una o más zonas puntuales para ESTA sesión ("quiero pecho y
- * piernas"), la IA extrae los TÉRMINOS LITERALES que usó — nunca un
- * `MuscleFocus`, nunca decide qué músculos representan. Esta clase NO
- * conoce `RequestedFocusTermMapper`/`RequestedFocusGroup`/`TrainingEngine`
- * — el vocabulario cerrado y su expansión (ej. "piernas" ->
- * quads+hamstrings+glutes+calves) se resuelven exclusivamente aguas abajo,
- * en `TrainingHandler`, después de que `ConversationTurnResolver` ya
- * transportó estos términos crudos sin tocarlos. Un término no reconocido
- * simplemente no produce ningún grupo — nunca un error, nunca una
- * aproximación (ver `RequestedFocusTermMapper`).
+ * Hito B1.3 (Requested Focus — wiring conversacional), extendido en Hito B2
+ * — `requested_focus_terms`: cuando el intent es `continue_training` O
+ * `new_workout_request` y el usuario además pidió trabajar una o más zonas
+ * puntuales ("quiero pecho y piernas", "dame otra rutina de pecho"), la IA
+ * extrae los TÉRMINOS LITERALES que usó — nunca un `MuscleFocus`, nunca
+ * decide qué músculos representan. Esta clase NO conoce
+ * `RequestedFocusTermMapper`/`RequestedFocusGroup`/`TrainingEngine`/
+ * `ReplaceWorkoutSessionService` — el vocabulario cerrado y su expansión
+ * (ej. "piernas" -> quads+hamstrings+glutes+calves), y la decisión de
+ * heredar o no el requested_focus de la sesión reemplazada, se resuelven
+ * exclusivamente aguas abajo, en `TrainingHandler`, después de que
+ * `ConversationTurnResolver` ya transportó estos términos crudos sin
+ * tocarlos. Un término no reconocido simplemente no produce ningún grupo —
+ * nunca un error, nunca una aproximación (ver `RequestedFocusTermMapper`).
+ *
+ * Hito B2 (Nueva rutina durante sesión activa) — `new_workout_request`:
+ * distinto de `continue_training` (que nunca reemplaza una sesión activa,
+ * ver `ConversationActionType::DeliverSession`) y distinto de una futura
+ * sustitución de UN ejercicio individual (Hito C, no implementado) — ver
+ * ejemplos explícitos en el prompt más abajo. Esta clase no decide el
+ * reemplazo en sí, solo detecta la intención.
  *
  * Hito 14 — `faq_match_id`/`faq_response_text`/`customer_service_needed`/
  * `customer_service_message`: el bloque de evaluación de FAQ/Customer
@@ -137,7 +146,8 @@ HECHOS (única fuente de verdad — todo lo demás es lenguaje, no dato):
 
 Identifica en el mensaje del usuario TODOS los intents que apliquen (puede haber más de uno) de esta lista cerrada: {$intentValues}.
 - "exercise_question": preguntas sobre un ejercicio, carga, reps, RPE, técnica, o el motivo de una decisión ya tomada.
-- "continue_training": el usuario pide su entrenamiento/rutina/qué sigue. Si ADEMÁS pide trabajar una o más zonas/músculos específicos SOLO para esta sesión (ej. "quiero mi rutina y quiero trabajar pecho y piernas", "quiero trabajar espalda", "prefiero pecho hoy"), extrae esos términos TAL COMO los dijo el usuario (sin traducir, sin decidir a qué músculos corresponden) en "requested_focus_terms". Si el usuario pidió explícitamente "todo el cuerpo"/una rutina general, o no mencionó ninguna zona, deja "requested_focus_terms" en un array vacío. Es una petición PUNTUAL para esta sesión — nunca la trates como una preferencia permanente ni la incluyas si el mensaje no es realmente una petición de entrenar ahora.
+- "continue_training": el usuario pide CONTINUAR con su entrenamiento/rutina actual, o pregunta qué sigue ("dame mi rutina", "¿qué sigue?", "continúa", "quiero seguir entrenando"). NUNCA uses este intent si el usuario pide explícitamente una rutina DISTINTA/NUEVA/DIFERENTE — eso es "new_workout_request" (ver abajo). Si ADEMÁS pide trabajar una o más zonas/músculos específicos SOLO para esta sesión (ej. "quiero mi rutina y quiero trabajar pecho y piernas", "quiero trabajar espalda", "prefiero pecho hoy"), extrae esos términos TAL COMO los dijo el usuario (sin traducir, sin decidir a qué músculos corresponden) en "requested_focus_terms". Si el usuario pidió explícitamente "todo el cuerpo"/una rutina general, o no mencionó ninguna zona, deja "requested_focus_terms" en un array vacío. Es una petición PUNTUAL para esta sesión — nunca la trates como una preferencia permanente ni la incluyas si el mensaje no es realmente una petición de entrenar ahora.
+- "new_workout_request" (Hito B2): el usuario pide EXPLÍCITAMENTE reemplazar la RUTINA/SESIÓN COMPLETA actual por una distinta — ej. "quiero otra rutina", "hazme otra rutina", "dame una rutina diferente", "cámbiame la rutina", "no quiero hacer esta rutina, dame otra", "quiero una rutina nueva", "dame otra sesión". Igual que "continue_training", si ADEMÁS pide una zona/músculo puntual para la NUEVA rutina (ej. "dame otra rutina de pecho", "cámbiame la rutina, quiero piernas"), extrae esos términos en "requested_focus_terms" con el mismo criterio (literal, sin traducir; array vacío si no mencionó ninguna zona o pidió "todo el cuerpo"). CRÍTICO — distínguelo de una petición sobre UN SOLO ejercicio dentro de la rutina, que NUNCA es "new_workout_request": "no quiero este ejercicio, dame otro", "cambia este ejercicio", "no puedo hacer este ejercicio", "reemplaza este ejercicio" hablan de UN ejercicio puntual (sustantivo "ejercicio"/"movimiento"), no de la rutina completa (sustantivo "rutina"/"sesión"/"entrenamiento") — esos casos NUNCA producen "new_workout_request" (hoy no tienen un intent propio; trátalos según el resto de reglas, nunca inventes uno). Tampoco confundas con un reporte de ejecución ("no pude hacer este ejercicio" sin pedir una rutina distinta es información sobre lo que el usuario hizo/no hizo, no una petición de reemplazo).
 - "general_conversation": conversación general de entrenamiento no cubierta arriba.
 - "membership_status": preguntas sobre membresía, pago, acceso o facturación.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
@@ -158,7 +168,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
   "reminder_time": "<hora en formato 24h HH:MM, SOLO si el usuario la mencionó>" | null,
   "reminder_recurrence": true (si dijo "todos los X"/"cada X") | false (una sola vez) | null (no aplica),
   "reminder_confirmation": true (el mensaje ACTUAL confirma afirmativamente la propuesta descrita en el HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" de arriba, si esa línea aparece) | false (la rechaza) | null (esa línea NO aparece en los HECHOS, o el mensaje no se refiere a ella) — NUNCA uses el HISTORIAL DE CONVERSACIÓN para decidir esto, solo ese HECHO estructurado; el historial puede no contener ya el mensaje original de la oferta.
-  "requested_focus_terms": ["<término literal tal como lo dijo el usuario, ej. \"pecho\", \"piernas\">"] (SOLO si el intent incluye "continue_training" y el usuario pidió zonas puntuales para esta sesión) | [] (en cualquier otro caso — nunca null, nunca omitido).{$this->faqJsonFields($coachContext)}{$this->conversationReinforcementJsonField($coachContext)}
+  "requested_focus_terms": ["<término literal tal como lo dijo el usuario, ej. \"pecho\", \"piernas\">"] (SOLO si el intent incluye "continue_training" O "new_workout_request" y el usuario pidió zonas puntuales para esa sesión) | [] (en cualquier otro caso — nunca null, nunca omitido).{$this->faqJsonFields($coachContext)}{$this->conversationReinforcementJsonField($coachContext)}
 }
 {$this->faqRulesFooter($coachContext)}{$conversationReinforcementRule}
 

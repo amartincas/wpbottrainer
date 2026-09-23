@@ -222,6 +222,20 @@ it('9: a skipped session is included when it genuinely exists', function () {
     expect($context->aggregates->sessionsCompletedInWindow)->toBe(0);
 });
 
+it('9b (Hito B2): a superseded session is included in the raw history, but never counts as completed/adherence', function () {
+    $contact = Contact::factory()->create();
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    WorkoutSession::factory()->superseded()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDay()]);
+
+    $context = historyProvider()->build($contact);
+
+    expect($context->windowSessionsCount)->toBe(1);
+    expect($context->sessions[0]->status)->toBe(WorkoutSessionStatus::Superseded);
+    // Nunca cuenta como "completed" ni contribuye a daysSinceLastCompletedSession.
+    expect($context->aggregates->sessionsCompletedInWindow)->toBe(0);
+    expect($context->aggregates->daysSinceLastCompletedSession)->toBeNull();
+});
+
 // ── 10/11/12: estados de ejercicio ──
 
 it('10/11/12: exercise outcome is derived exactly from ExerciseLog/ExerciseSet presence', function () {

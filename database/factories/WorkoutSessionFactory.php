@@ -37,4 +37,15 @@ class WorkoutSessionFactory extends Factory
     {
         return $this->state(fn () => ['status' => WorkoutSessionStatus::Skipped]);
     }
+
+    /**
+     * Hito B2 — `superseded_by_id` queda `null` por defecto: en un test
+     * real, se asigna después de crear la sesión que la reemplaza (mismo
+     * patrón que `ReplaceWorkoutSessionService`, que tampoco lo conoce de
+     * antemano).
+     */
+    public function superseded(): static
+    {
+        return $this->state(fn () => ['status' => WorkoutSessionStatus::Superseded]);
+    }
 }

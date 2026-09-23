@@ -138,6 +138,41 @@ it('continue_training yields DeliverSession regardless of training_reply', funct
     expect(actionTypes($resolved))->toBe([ConversationActionType::DeliverSession->value]);
 });
 
+// ── Hito B2 (revisión final B2.3, punto 1) — precedencia determinista ──
+
+it('B2: new_workout_request alone yields NewWorkoutRequest, never DeliverSession', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['new_workout_request'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::NewWorkoutRequest->value]);
+});
+
+it('B2: when the AI contradictorily tags BOTH continue_training and new_workout_request, DeliverSession is NEVER added — only NewWorkoutRequest, deterministically in code (not relying on the prompt alone)', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['continue_training', 'new_workout_request'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]);
+
+    expect(actionTypes($resolved))->toBe([ConversationActionType::NewWorkoutRequest->value]);
+    expect(actionTypes($resolved))->not->toContain(ConversationActionType::DeliverSession->value);
+});
+
+it('B2: the double-action guard preserves order with a real report — report registered, then replacement, never a DeliverSession in between', function () {
+    $resolved = turnResolver()->resolve([
+        'safety_signal_text' => null,
+        'reports' => [['exercise_name' => 'Sentadilla', 'not_performed' => false, 'sets' => [['reps' => 10, 'load' => 40, 'duration_seconds' => null]], 'rpe' => null, 'note' => null, 'skip_reason' => null]],
+        'session_finished' => false,
+        'intents' => ['continue_training', 'new_workout_request'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]);
+
+    expect(actionTypes($resolved))->toBe([
+        ConversationActionType::RecordExecutionReport->value,
+        ConversationActionType::NewWorkoutRequest->value,
+    ]);
+});
+
 it('50: continue_training + exercise_question -> both actions execute, training reply first, then deliver', function () {
     $resolved = turnResolver()->resolve([
         'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,

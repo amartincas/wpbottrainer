@@ -45,8 +45,19 @@ class TrainingHistoryContextProvider
     {
         $profile = $contact->trainingProfile;
 
+        // Hito B2 (diseño aprobado, Sección 19) — `Superseded` SÍ aparece en
+        // el historial bruto (contexto real para el Coach: "empezaste esta
+        // rutina y luego pediste otra"), pero `buildAggregates()` (abajo)
+        // sigue filtrando `sessionsCompletedInWindow`/`daysSinceLastCompletedSession`
+        // estrictamente por `status === Completed` — sin ningún cambio en
+        // esos dos filtros, `Superseded` NUNCA cuenta como adherencia real,
+        // exactamente igual que `Skipped` ya estaba excluido de ambos.
         $sessions = $contact->workoutSessions()
-            ->whereIn('status', [WorkoutSessionStatus::Completed, WorkoutSessionStatus::Skipped])
+            ->whereIn('status', [
+                WorkoutSessionStatus::Completed,
+                WorkoutSessionStatus::Skipped,
+                WorkoutSessionStatus::Superseded,
+            ])
             ->where('scheduled_at', '>=', now()->subWeeks(self::WINDOW_WEEKS))
             ->with('workoutExercises.exerciseLog.exerciseSets')
             ->orderByDesc('scheduled_at')

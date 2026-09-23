@@ -26,3 +26,29 @@ it('defaults to scheduled and supports completed/skipped states', function () {
     expect($completed->completed_at)->not->toBeNull();
     expect($skipped->status)->toBe(WorkoutSessionStatus::Skipped);
 });
+
+// ── Hito B2 — Superseded + superseded_by_id ─────────────────────────────
+
+it('supports the superseded state, with superseded_by_id null by default', function () {
+    $superseded = WorkoutSession::factory()->superseded()->create();
+
+    expect($superseded->status)->toBe(WorkoutSessionStatus::Superseded);
+    expect($superseded->superseded_by_id)->toBeNull();
+});
+
+it('supersededBy() resolves the new session, and supersededSession() resolves back to the old one', function () {
+    $contact = Contact::factory()->create();
+    $old = WorkoutSession::factory()->superseded()->create(['contact_id' => $contact->id]);
+    $new = WorkoutSession::factory()->create(['contact_id' => $contact->id]);
+
+    $old->update(['superseded_by_id' => $new->id]);
+
+    expect($old->fresh()->supersededBy->is($new))->toBeTrue();
+    expect($new->fresh()->supersededSession->is($old))->toBeTrue();
+});
+
+it('a Scheduled session with no superseded_by_id has no supersededBy relation', function () {
+    $session = WorkoutSession::factory()->create();
+
+    expect($session->supersededBy)->toBeNull();
+});

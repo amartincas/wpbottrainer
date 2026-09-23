@@ -43,9 +43,11 @@ use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
 use App\Training\Support\ExerciseMessageFormatter;
+use App\Training\Support\MultipleActiveWorkoutSessionsException;
 use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
+use App\Training\Support\ReplaceWorkoutSessionService;
 use App\Training\Support\RequestedFocusTermMapper;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\SessionCloseMessageComposer;
@@ -145,6 +147,18 @@ class TrainingHandler implements HandlerInterface
      */
     private const CATALOG_INSUFFICIENT_MESSAGE = 'Por ahora no tengo suficientes ejercicios disponibles para armar '
         .'tu rutina con tu perfil actual. Ya avisé a nuestro equipo — te escribo en cuanto esté resuelto.';
+
+    /**
+     * Hito B2 — mostrado cuando `ReplaceWorkoutSessionService::replace()`
+     * lanza `MultipleActiveWorkoutSessionsException` (inconsistencia real de
+     * datos: más de una `WorkoutSession` `Scheduled` para el mismo Contact,
+     * ver docblock de esa excepción). Caso límite que no debería ocurrir en
+     * operación normal — nunca se elige una sesión arbitrariamente, se
+     * informa y se deja para revisión (ver el `Log::error` que acompaña a
+     * este mensaje).
+     */
+    private const NEW_WORKOUT_REQUEST_INCONSISTENT_MESSAGE = 'Encontré un problema técnico con tu sesión actual. Ya '
+        .'avisé a nuestro equipo — escríbeme en un momento y seguimos. 🙏';
 
     /**
      * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
@@ -319,6 +333,7 @@ class TrainingHandler implements HandlerInterface
         private readonly SessionIntroComposer $sessionIntroComposer,
         private readonly SupportPhaseConfirmationDetector $supportConfirmationDetector,
         private readonly RequestedFocusTermMapper $requestedFocusTermMapper,
+        private readonly ReplaceWorkoutSessionService $replaceSessionService,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -724,6 +739,23 @@ class TrainingHandler implements HandlerInterface
             'elapsed_ms' => (int) round((microtime(true) - $engineStartedAt) * 1000),
         ]);
 
+        $this->deliverNewSession($session, $from, $tenant, $freshContact);
+    }
+
+    /**
+     * Hito B2 (Nueva rutina durante sesión activa) — extraído SIN cambio de
+     * comportamiento del bloque final del paso 6 de `handle()`: introduce
+     * (`SessionIntroComposer`, sin cambios — respeta íntegramente el fix de
+     * B1.3.2 sobre `requested_focus`) y entrega el primer ejercicio de una
+     * `WorkoutSession` `Scheduled` recién creada. Reutilizado tanto por el
+     * flujo normal (paso 6) como por `NewWorkoutRequest`
+     * (`ReplaceWorkoutSessionService`/creación de respaldo cuando no había
+     * nada que reemplazar) — una única semántica de "cómo se presenta una
+     * sesión nueva al usuario", nunca un segundo mensaje especial para B2
+     * (diseño aprobado, Sección 21).
+     */
+    private function deliverNewSession(WorkoutSession $session, string $from, Tenant $tenant, Contact $contact): void
+    {
         // Duración objetivo de sesión — introducción determinista (MVP, sin
         // IA): describe la sesión YA prescrita (focus/cantidad/duración
         // aproximada), leyendo únicamente la propia WorkoutSession ya
@@ -753,7 +785,7 @@ class TrainingHandler implements HandlerInterface
         $firstExercise = $session->nextUndeliveredExercise();
 
         if ($firstExercise !== null) {
-            $this->deliverExerciseAndMaybeComplete($firstExercise, $session, $from, $tenant, $freshContact);
+            $this->deliverExerciseAndMaybeComplete($firstExercise, $session, $from, $tenant, $contact);
         }
     }
 
@@ -1072,9 +1104,80 @@ class TrainingHandler implements HandlerInterface
 
                 $shouldDeliverSession = true;
             }
+
+            if ($action->type === ConversationActionType::NewWorkoutRequest) {
+                $this->handleNewWorkoutRequest($action->requestedFocusTerms, $from, $tenant, $contact);
+
+                continue;
+            }
         }
 
         return $shouldDeliverSession;
+    }
+
+    /**
+     * Hito B2 (Nueva rutina durante sesión activa) — única entrada de
+     * `ReplaceWorkoutSessionService` en todo el sistema. Canonicaliza los
+     * términos crudos (mismo mapeador, mismo patrón EXACTO que
+     * `resolveRequestedFocus()` usa para `DeliverSession` — nunca una
+     * segunda traducción de lenguaje) y delega en
+     * `ReplaceWorkoutSessionService::replaceOrCreate()` — NUNCA en
+     * `replace()` + una llamada de respaldo propia a
+     * `TrainingEngine::decideNextSession()` fuera de transacción (revisión
+     * final B2.3, punto 3): `replaceOrCreate()` mantiene ambos desenlaces
+     * dentro del MISMO alcance de bloqueo, y `wasReplacement` distingue
+     * explícitamente "reemplazó algo real" de "creó porque no había nada
+     * que reemplazar" — nunca se infiere comparando IDs (revisión final
+     * B2.3, punto 2).
+     *
+     * Excepciones — mismo criterio que el paso 6 ya usa, nunca un
+     * comportamiento nuevo: `MultipleActiveWorkoutSessionsException`
+     * (inconsistencia real de datos, nunca resuelta eligiendo una sesión
+     * arbitrariamente) o las mismas que ya puede lanzar
+     * `TrainingEngine::decideNextSession()`
+     * (`TrainingAccessDeniedException`/`TrainingCatalogInsufficientException`).
+     * Si `decideNextSession()` falla dentro de `replaceOrCreate()`,
+     * `DB::transaction()` revierte TODO — la sesión vieja (si la había)
+     * permanece `Scheduled` intacta (diseño aprobado, Sección 6).
+     */
+    private function handleNewWorkoutRequest(array $requestedFocusTerms, string $from, Tenant $tenant, Contact $contact): void
+    {
+        $explicitFocus = $this->requestedFocusTermMapper->mapMany($requestedFocusTerms);
+
+        try {
+            $result = $this->replaceSessionService->replaceOrCreate($contact, $explicitFocus);
+        } catch (MultipleActiveWorkoutSessionsException $e) {
+            Log::error('TRAINING_NEW_WORKOUT_REQUEST_INCONSISTENT_SESSIONS', [
+                'contact_id' => $contact->id,
+                'scheduled_count' => $e->scheduledCount,
+            ]);
+
+            $this->reply($from, self::NEW_WORKOUT_REQUEST_INCONSISTENT_MESSAGE, $tenant);
+
+            return;
+        } catch (TrainingAccessDeniedException $e) {
+            $this->respondToDenial($e->reason, $contact, $from, $tenant);
+
+            return;
+        } catch (TrainingCatalogInsufficientException $e) {
+            Log::warning('TRAINING_NEW_WORKOUT_REQUEST_CATALOG_INSUFFICIENT', ['contact_id' => $contact->id]);
+
+            $this->reply($from, self::CATALOG_INSUFFICIENT_MESSAGE, $tenant);
+
+            return;
+        }
+
+        // Log distinto por desenlace (revisión final B2.3, punto 2) — nunca
+        // el mismo evento para "reemplazó" y "creó porque no había nada que
+        // reemplazar": son hechos operativos distintos, útiles por separado
+        // para observabilidad (ej. detectar si el camino de 0-Scheduled se
+        // ejecuta con más frecuencia de la esperada).
+        Log::info($result['wasReplacement'] ? 'TRAINING_NEW_WORKOUT_REQUEST_REPLACED' : 'TRAINING_NEW_WORKOUT_REQUEST_CREATED_NO_PRIOR_SESSION', [
+            'contact_id' => $contact->id,
+            'workout_session_id' => $result['session']->id,
+        ]);
+
+        $this->deliverNewSession($result['session'], $from, $tenant, $contact);
     }
 
     /**

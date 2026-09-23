@@ -238,8 +238,29 @@ class TrainingEngine
             return $pending;
         }
 
+        // Hito B2 (auditoría B2.2, Hipótesis 2 confirmada) — `Superseded` SÍ
+        // participa aquí, igual que `Completed`/`Skipped`: esta colección
+        // alimenta tanto `varietyScore()` (mide EXPOSICIÓN — qué ejercicios
+        // ya se le mostraron al usuario, nunca si los ejecutó; una sesión
+        // reemplazada tuvo `WorkoutExercise` reales entregados, ver
+        // `varietyScore()`) como `mostNeglectedFocus()`/`decideFocus()`. Este
+        // último merece la aclaración explícita del diseño aprobado (Sección
+        // 18): `decideFocus()` solo dispara su reintento de foco cuando
+        // `$lastSession->status === WorkoutSessionStatus::Skipped` —una
+        // comparación estricta, nunca "distinto de Completed"— así que
+        // agregar `Superseded` a este `whereIn` NUNCA activa esa rama
+        // especial de `Skipped` para una sesión `Superseded`: cae, sin
+        // ningún código adicional, en el mismo tratamiento por defecto que
+        // ya reciben las sesiones `Completed` (avanza la rotación si
+        // corresponde) — exactamente lo pedido: "Superseded no significa
+        // 'no se hizo, reinténtalo', significa 'el usuario pidió otra
+        // cosa'".
         $recentSessions = $contact->workoutSessions()
-            ->whereIn('status', [WorkoutSessionStatus::Completed, WorkoutSessionStatus::Skipped])
+            ->whereIn('status', [
+                WorkoutSessionStatus::Completed,
+                WorkoutSessionStatus::Skipped,
+                WorkoutSessionStatus::Superseded,
+            ])
             ->with('workoutExercises')
             ->orderByDesc('scheduled_at')
             ->limit(self::RECENT_SESSIONS_LOOKBACK)

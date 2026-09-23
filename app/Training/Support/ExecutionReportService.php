@@ -38,6 +38,20 @@ use Illuminate\Support\Facades\Log;
  * iguales — cero cambios en esa parte. `$coachContext` es opcional
  * (`null` = comportamiento idéntico al de antes del Bloque 9, sin las
  * claves nuevas pobladas) para no romper ningún llamador existente.
+ *
+ * Hito B2 (Nueva rutina durante sesión activa) — hallazgo de auditoría
+ * (B2.2 sección B3/B6): mientras existe un Main sin reportar, ESTE es el
+ * servicio que procesa el mensaje (nunca `CoachService`, ver
+ * `TrainingHandler::handle()` paso 4) — así que `new_workout_request` y
+ * `requested_focus_terms` deben reconocerse TAMBIÉN aquí, con el mismo
+ * vocabulario/criterio exacto que `CoachService`, o el caso más común de B2
+ * (usuario con ejercicios pendientes pidiendo otra rutina) quedaría sin
+ * cubrir. Riesgo concreto que esta extensión cierra: sin ella, "no quiero
+ * esta rutina, dame otra" caería en la regla de "sin nombre explícito,
+ * asume el frente" (ver `$currentExerciseInstruction` abajo) y se
+ * persistiría como `skip_reason=dont_want` del ejercicio actual — nunca
+ * como una petición de reemplazo. El prompt distingue explícitamente ambos
+ * casos (ver reglas de `new_workout_request` más abajo).
  */
 class ExecutionReportService
 {
@@ -64,6 +78,9 @@ class ExecutionReportService
         'reminder_time' => null,
         'reminder_recurrence' => null,
         'reminder_confirmation' => null,
+        // Hito B2 — mismo criterio/shape exacto que CoachService::EMPTY_RESULT:
+        // ver docblock de parseJson() más abajo.
+        'requested_focus_terms' => [],
     ];
 
     /**
@@ -91,7 +108,8 @@ class ExecutionReportService
      *     sets: array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>,
      *     rpe: ?int, note: ?string, uncertain: bool,
      * }>, session_finished: bool, safety_signal_text: ?string,
-     *     intents: array<int, string>, training_reply: ?string}
+     *     intents: array<int, string>, training_reply: ?string,
+     *     requested_focus_terms: array<int, string>}
      */
     public function extractReport(string $messageBody, array $reportableExercises, Tenant $tenant, ?CoachContext $coachContext = null, ?string $frontExerciseName = null): array
     {
@@ -126,7 +144,7 @@ class ExecutionReportService
         // bifurca explícitamente según si HAY o no un Main realmente
         // mostrado.
         $currentExerciseInstruction = $frontExerciseName !== null
-            ? "El ejercicio que ACABAS de mostrarle al usuario, ahora mismo, es: \"{$frontExerciseName}\". Si el usuario responde sin mencionar explícitamente un ejercicio distinto de la lista de arriba (ej. \"listo\", \"3 series de 10\", \"10, 10, 8 con 8kg\", \"me costó\"), asume que \"exercise_name\" es ese mismo ejercicio — nunca lo dejes en null solo porque no repitió el nombre."
+            ? "El ejercicio que ACABAS de mostrarle al usuario, ahora mismo, es: \"{$frontExerciseName}\". Si el usuario responde sin mencionar explícitamente un ejercicio distinto de la lista de arriba (ej. \"listo\", \"3 series de 10\", \"10, 10, 8 con 8kg\", \"me costó\"), asume que \"exercise_name\" es ese mismo ejercicio — nunca lo dejes en null solo porque no repitió el nombre. EXCEPCIÓN CRÍTICA (Hito B2): si el usuario habla de la RUTINA/SESIÓN completa, no de este ejercicio puntual (ver regla de \"new_workout_request\" más abajo — ej. \"no quiero esta rutina, dame otra\"), NUNCA generes un reporte para el ejercicio actual a partir de esa frase — \"reports\" debe reflejar SOLO lo que el usuario reportó realmente haber hecho/no hecho de este ejercicio, nunca la petición de reemplazar la rutina."
             : 'En este momento NO se le ha mostrado al usuario ningún ejercicio de bloque principal para reportar (puede estar viendo un ejercicio de preparación/calentamiento o de vuelta a la calma, que no piden reporte). Si el usuario NO menciona explícitamente el nombre EXACTO de uno de los ejercicios de la lista de arriba, "reports" debe quedar como un arreglo vacío [] — NUNCA asumas por defecto a cuál de la lista se refiere.';
 
         $prompt = <<<PROMPT
@@ -152,12 +170,13 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
     }
   ],
   "session_finished": true (SOLO si el usuario indica de manera inequívoca que terminó TODOS los ejercicios o que desea cerrar toda la sesión, ej. "eso fue todo", "ya terminé", "acabé la sesión", "terminé todos los ejercicios") | false,
-  "intents": ["<uno o más de: exercise_question, continue_training, general_conversation, membership_status, faq_question, reminder_request, reminder_cancel, reminder_modify, mentioned_forgetting, asked_when_to_train>"],
+  "intents": ["<uno o más de: exercise_question, continue_training, new_workout_request, general_conversation, membership_status, faq_question, reminder_request, reminder_cancel, reminder_modify, mentioned_forgetting, asked_when_to_train>"],
   "training_reply": "<texto conversacional, SOLO si algún intent es de entrenamiento (exercise_question/continue_training/general_conversation) Y el mensaje no es (solo) un reporte>" | null,
   "reminder_day": "monday"|"tuesday"|"wednesday"|"thursday"|"friday"|"saturday"|"sunday"|"tomorrow"|"today" | null,
   "reminder_time": "<hora en formato 24h HH:MM>" | null,
   "reminder_recurrence": true|false|null,
-  "reminder_confirmation": true (el mensaje ACTUAL confirma la propuesta del HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" si aparece más abajo) | false (la rechaza) | null (esa línea no aparece, o el mensaje no se refiere a ella)
+  "reminder_confirmation": true (el mensaje ACTUAL confirma la propuesta del HECHO "RECORDATORIO PROPUESTO PENDIENTE DE CONFIRMACIÓN" si aparece más abajo) | false (la rechaza) | null (esa línea no aparece, o el mensaje no se refiere a ella),
+  "requested_focus_terms": ["<término literal tal como lo dijo el usuario, ej. \"pecho\", \"piernas\">"] (SOLO si el intent incluye "new_workout_request" y el usuario pidió una zona puntual para la NUEVA rutina) | [] (en cualquier otro caso — nunca null, nunca omitido)
 }
 
 Reglas del reporte:
@@ -172,7 +191,8 @@ Reglas del reporte:
 
 Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej. un reporte real Y una pregunta de membresía juntos):
 - "exercise_question": preguntas sobre un ejercicio, carga, reps, RPE, técnica, o el motivo de una decisión ya tomada.
-- "continue_training": el usuario pide su entrenamiento/rutina/qué sigue.
+- "continue_training": el usuario pide CONTINUAR con su entrenamiento/rutina actual, o pregunta qué sigue. NUNCA uses este intent si pide explícitamente una rutina DISTINTA/NUEVA/DIFERENTE — eso es "new_workout_request".
+- "new_workout_request" (Hito B2): el usuario pide EXPLÍCITAMENTE reemplazar la RUTINA/SESIÓN COMPLETA actual por una distinta — ej. "quiero otra rutina", "hazme otra rutina", "dame una rutina diferente", "cámbiame la rutina", "no quiero hacer esta rutina, dame otra", "quiero una rutina nueva". Si ADEMÁS pide una zona/músculo puntual para la NUEVA rutina (ej. "dame otra rutina de pecho"), extrae esos términos en "requested_focus_terms" (literal, sin traducir; array vacío si no mencionó ninguna zona). CRÍTICO — nunca lo confundas con: (a) una petición sobre UN SOLO ejercicio ("no quiero este ejercicio, dame otro", "cambia este ejercicio", "reemplaza este ejercicio" — hablan de "ejercicio"/"movimiento", no de "rutina"/"sesión"; hoy no tienen intent propio, no generes "new_workout_request" para ellos); (b) un reporte de ejecución real sobre el ejercicio actual ("no pude hacer este ejercicio", "me costó", "hice 3 series" — eso sigue siendo un elemento de "reports", nunca "new_workout_request"). Si el mensaje combina AMBOS (ej. "hice las tres series, pero ya no quiero seguir con esta rutina, dame otra"), genera el reporte real en "reports" Y además incluye "new_workout_request" en "intents" — el reporte se registra primero, el reemplazo después, en ese orden.
 - "general_conversation": conversación general de entrenamiento no cubierta arriba.
 - "membership_status": preguntas sobre membresía, pago, acceso o facturación.
 - "faq_question": cualquier otra duda general no relacionada con entrenamiento.
@@ -241,6 +261,13 @@ PROMPT;
             'training_reply' => is_string($decoded['training_reply'] ?? null) && trim($decoded['training_reply']) !== ''
                 ? $decoded['training_reply']
                 : null,
+            // Hito B2 — mismo criterio defensivo EXACTO que
+            // CoachService::parseJson(): una IA que devuelva una estructura
+            // asociativa en vez de una lista plana nunca debe romper el
+            // parseo — se descarta lo que no sea string, nunca se lanza.
+            'requested_focus_terms' => is_array($decoded['requested_focus_terms'] ?? null)
+                ? array_values(array_filter($decoded['requested_focus_terms'], 'is_string'))
+                : [],
             ...ReminderExtractionFields::validate($decoded, $messageBody),
         ];
     }

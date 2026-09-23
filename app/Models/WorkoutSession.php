@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 #[Fillable([
     'contact_id',
@@ -16,6 +17,9 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'completed_at',
     'generated_by',
     'prescription_context_snapshot',
+    // Hito B2 — escrito EXCLUSIVAMENTE por ReplaceWorkoutSessionService,
+    // nunca en la creación normal de TrainingEngine::decideNextSession().
+    'superseded_by_id',
 ])]
 class WorkoutSession extends Model
 {
@@ -101,5 +105,28 @@ class WorkoutSession extends Model
     public function nextUndeliveredExercise(): ?WorkoutExercise
     {
         return $this->workoutExercises->first(fn (WorkoutExercise $we) => $we->delivered_at === null);
+    }
+
+    /**
+     * Hito B2 (Nueva rutina durante sesión activa) — la `WorkoutSession`
+     * NUEVA que reemplazó a esta (`superseded_by_id`), si esta sesión fue
+     * reemplazada por `ReplaceWorkoutSessionService`. `null` en cualquier
+     * otro caso (incluida cualquier sesión creada antes de este hito).
+     */
+    public function supersededBy(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'superseded_by_id');
+    }
+
+    /**
+     * Hito B2 — inversa de `supersededBy()`: la `WorkoutSession` VIEJA que
+     * esta sesión reemplazó, si esta sesión fue creada por
+     * `ReplaceWorkoutSessionService` como reemplazo de otra. `null` para
+     * cualquier sesión creada por el flujo normal de
+     * `TrainingEngine::decideNextSession()` sin reemplazo.
+     */
+    public function supersededSession(): HasOne
+    {
+        return $this->hasOne(self::class, 'superseded_by_id');
     }
 }

@@ -114,6 +114,23 @@ it('falls back to the most recent Completed/Skipped session when there is no pen
     expect($context->currentSession->exercises[0]->rpe)->toBe(6);
 });
 
+it('Hito B2 — falls back to a Superseded session when there is no pending one, and CoachFactsFormatter never lets it read as Completed/Skipped', function () {
+    $tenant = Tenant::factory()->create();
+    $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000004']);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+
+    $session = WorkoutSession::factory()->superseded()->create(['contact_id' => $contact->id]);
+
+    $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000004'))->data;
+
+    expect($context->currentSession->workoutSessionId)->toBe($session->id);
+    expect($context->currentSession->status)->toBe(WorkoutSessionStatus::Superseded);
+
+    $facts = (new App\Training\Support\CoachFactsFormatter)->format($context);
+    expect($facts)->toContain('estado=superseded');
+    expect($facts)->toContain('reemplazada a petición del usuario');
+});
+
 it('computes ProgressionEvaluation for each exercise of the current session, keyed by exerciseId', function () {
     $tenant = Tenant::factory()->create();
     $contact = Contact::factory()->create(['tenant_id' => $tenant->id, 'customer_phone' => '5730000004']);

@@ -6,6 +6,7 @@ use App\Training\Context\CoachContext;
 use App\Training\Context\CoachExerciseSnapshot;
 use App\Training\Context\PendingReminderSuggestion;
 use App\Training\Enums\HistoryExerciseOutcome;
+use App\Training\Enums\WorkoutSessionStatus;
 
 /**
  * Bloque 9 (D052) — traduce `CoachContext` a un bloque de texto de HECHOS
@@ -136,6 +137,13 @@ class CoachFactsFormatter
 
         $lines = [
             "SESIÓN ACTUAL (id={$session->workoutSessionId}, estado={$session->status->value}".
+            // Hito B2 (diseño aprobado, Sección 20) — aclaración explícita
+            // OBLIGATORIA: sin esto, la IA podría interpretar "superseded"
+            // como una variante de "completed"/"skipped" por similitud de
+            // formato, en vez del significado real ("el usuario pidió
+            // reemplazarla por una rutina distinta, NUNCA que la haya
+            // completado ni que la haya omitido").
+            ($session->status === WorkoutSessionStatus::Superseded ? ' [reemplazada a petición del usuario por una rutina distinta — no fue completada ni omitida]' : '').
             ($session->decidedFocus !== null ? ", foco={$session->decidedFocus}" : '').
             ", programada_el={$session->scheduledAt->toDateString()}".
             ($session->completedAt !== null ? ", completada_el={$session->completedAt->toDateString()}" : '').

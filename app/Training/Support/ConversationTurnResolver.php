@@ -105,7 +105,22 @@ class ConversationTurnResolver
             $actions[] = ConversationAction::sendText($trainingReply);
         }
 
-        if (in_array(DetectedIntentType::ContinueTraining->value, $intents, true)) {
+        // Hito B2 (revisión final B2.3, punto 1) — PRECEDENCIA DETERMINISTA
+        // EN CÓDIGO, nunca confiada únicamente al prompt del LLM: si la IA
+        // (por error, o por un mensaje genuinamente ambiguo) etiqueta el
+        // mismo turno con AMBOS `continue_training` y `new_workout_request`
+        // a la vez, `DeliverSession` NUNCA se agrega — solo
+        // `NewWorkoutRequest` (más abajo). Sin esta guarda, un turno así
+        // produciría DOS acciones contradictorias en el mismo mensaje
+        // (`executeTurnActions()` las ejecuta ambas, en orden: primero
+        // continuaría/reenviaría la sesión vieja, después la reemplazaría),
+        // dejando al usuario con dos respuestas incoherentes seguidas. La
+        // regla es intencionalmente unidireccional (reemplazo gana, nunca
+        // al revés) — coherente con la semántica de B2: pedir una rutina
+        // distinta siempre debe ganarle a "continúa la actual".
+        $hasNewWorkoutRequest = in_array(DetectedIntentType::NewWorkoutRequest->value, $intents, true);
+
+        if (in_array(DetectedIntentType::ContinueTraining->value, $intents, true) && ! $hasNewWorkoutRequest) {
             // Hito B1.3 — términos crudos de foco puntual (si el usuario los
             // dio), transportados SIN interpretar (mismo criterio que
             // reminder_day/reminder_time arriba): este resolver sigue sin
@@ -117,6 +132,26 @@ class ConversationTurnResolver
             // ese camino, donde además DeliverSession nunca genera una
             // sesión nueva (la sesión activa ya existe por precondición).
             $actions[] = ConversationAction::deliverSession($result['requested_focus_terms'] ?? []);
+        }
+
+        // Hito B2 (Nueva rutina durante sesión activa) — mismo criterio
+        // exacto que ContinueTraining/DeliverSession arriba: términos
+        // crudos de foco puntual para la NUEVA rutina, transportados SIN
+        // interpretar. Se añade DESPUÉS de RecordExecutionReport (Regla
+        // 16 del diseño aprobado) — un mismo mensaje puede combinar un
+        // reporte real ("hice las tres series") con la petición de
+        // reemplazo ("pero ya no quiero seguir, dame otra"): el reporte
+        // debe registrarse ANTES de que TrainingHandler ejecute el
+        // reemplazo, y el orden de este array (recorrido secuencialmente
+        // por executeTurnActions()) es lo que lo garantiza — nunca
+        // depende del orden en que la IA listó los intents.
+        // `ExecutionReportService::extractReport()` (el otro origen
+        // posible de $result) SÍ puede incluir este intent en su propio
+        // vocabulario (ver docblock de CoachService/ExecutionReportService)
+        // — este resolver sigue sin conocer cuál de los dos produjo el
+        // resultado, solo reacciona a la forma ya validada.
+        if ($hasNewWorkoutRequest) {
+            $actions[] = ConversationAction::newWorkoutRequest($result['requested_focus_terms'] ?? []);
         }
 
         // Hito 10 — datos CRUDOS únicamente: ni resueltos ni validados aquí

@@ -57,6 +57,23 @@ final readonly class ConversationAction
     }
 
     /**
+     * Hito B2 (Nueva rutina durante sesión activa) — mismo patrón exacto que
+     * `deliverSession()`: `$requestedFocusTerms` son términos CRUDOS del
+     * foco puntual que el usuario pidió para la NUEVA rutina ("dame otra
+     * rutina de pecho"), `[]` si no pidió ninguno — esta clase y
+     * `ConversationTurnResolver` NUNCA canonicalizan ni deciden `MuscleFocus`,
+     * ni deciden si el foco se hereda de la sesión reemplazada (eso lo
+     * decide `ReplaceWorkoutSessionService`, con la precedencia ya
+     * aprobada).
+     *
+     * @param  array<int, string>  $requestedFocusTerms
+     */
+    public static function newWorkoutRequest(array $requestedFocusTerms = []): self
+    {
+        return new self(ConversationActionType::NewWorkoutRequest, requestedFocusTerms: $requestedFocusTerms);
+    }
+
+    /**
      * Hito 10 — datos CRUDOS (día/hora/recurrencia ya extraídos, todavía no
      * resueltos) de una petición de recordatorio. `TrainingHandler` es
      * quien resuelve con `ReminderTimeResolver`/`TimezoneResolver` y

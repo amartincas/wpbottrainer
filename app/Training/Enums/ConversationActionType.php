@@ -33,4 +33,14 @@ enum ConversationActionType: string
      */
     case AnswerFaq = 'answer_faq';
     case RequestCustomerService = 'request_customer_service';
+
+    /**
+     * Hito B2 — reemplaza la `WorkoutSession` `Scheduled` actual por una
+     * nueva, vía `App\Training\Support\ReplaceWorkoutSessionService`. Nunca
+     * se confunde con `DeliverSession`: esa acción está deliberadamente
+     * construida para NUNCA generar una rutina nueva mientras hay una
+     * activa — esta es la única acción que sí lo hace, y solo a petición
+     * explícita del usuario.
+     */
+    case NewWorkoutRequest = 'new_workout_request';
 }

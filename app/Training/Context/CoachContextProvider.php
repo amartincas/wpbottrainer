@@ -130,8 +130,19 @@ class CoachContextProvider implements ContextProviderInterface
             ->orderByDesc('scheduled_at')
             ->first();
 
+        // Hito B2 (diseño aprobado, Sección 20) — `Superseded` como
+        // candidato de fallback también, con la misma prioridad que
+        // `Completed`/`Skipped` (el más reciente por `scheduled_at` gana):
+        // en la práctica esta rama solo se alcanza cuando NO hay ninguna
+        // `Scheduled` — si `ReplaceWorkoutSessionService` acaba de crear la
+        // sesión de reemplazo, esa `Scheduled` nueva ya se resolvió arriba y
+        // esta rama nunca se ejecuta.
         $session ??= $contact->workoutSessions()
-            ->whereIn('status', [WorkoutSessionStatus::Completed, WorkoutSessionStatus::Skipped])
+            ->whereIn('status', [
+                WorkoutSessionStatus::Completed,
+                WorkoutSessionStatus::Skipped,
+                WorkoutSessionStatus::Superseded,
+            ])
             ->with(['workoutExercises.exercise', 'workoutExercises.exerciseLog.exerciseSets'])
             ->orderByDesc('scheduled_at')
             ->first();
