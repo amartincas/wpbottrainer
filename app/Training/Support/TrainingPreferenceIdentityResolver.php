@@ -125,7 +125,16 @@ class TrainingPreferenceIdentityResolver
             return TrainingPreferenceIdentityResolution::unresolved();
         }
 
-        $catalog = Exercise::query()->where('is_active', true)->get(['id', 'name', 'name_es']);
+        // Corrección post-E2E real (hallazgo de MAX_CLARIFICATION_OPTIONS) —
+        // `orderBy('id')` explícito: sin esto, el orden de $catalog no está
+        // garantizado por SQL (verificado: no hay ningún índice usable para
+        // esta consulta — el único índice de la tabla es compuesto
+        // `(muscle_group, is_active)`, que esta consulta no puede aprovechar
+        // por la regla de prefijo izquierdo), así que qué candidato queda
+        // fuera de `partialMatches()` sería arbitrario y no reproducible.
+        // Único criterio de orden: id ascendente — nunca un score de
+        // relevancia, nunca un criterio de identidad nuevo.
+        $catalog = Exercise::query()->where('is_active', true)->orderBy('id')->get(['id', 'name', 'name_es']);
         $toggled = $this->togglePlural($normalizedCandidate);
 
         $exact = $this->exactMatches($catalog, $normalizedCandidate);
@@ -152,11 +161,11 @@ class TrainingPreferenceIdentityResolver
         // forma alternada, la lista de opciones queda incompleta). Sigue
         // siendo EXCLUSIVAMENTE ayuda de clarificación — `partialMatches()`
         // nunca puede producir `resolved`, solo alimenta `clarify()`.
-        $options = $this->partialMatches($catalog, $normalizedCandidate, $toggled);
+        [$options, $totalMatches] = $this->partialMatches($catalog, $normalizedCandidate, $toggled);
 
         return $options === []
             ? TrainingPreferenceIdentityResolution::unresolved()
-            : TrainingPreferenceIdentityResolution::clarify($options);
+            : TrainingPreferenceIdentityResolution::clarify($options, $totalMatches);
     }
 
     /**
@@ -192,12 +201,24 @@ class TrainingPreferenceIdentityResolver
      * internas, sinónimos, reordenamiento ni ningún stemming más allá de
      * esta única alternancia ya aprobada.
      *
+     * Corrección post-E2E real (hallazgo de `MAX_CLARIFICATION_OPTIONS`) —
+     * el recorrido de `$catalog` YA NUNCA se corta al llegar a
+     * `MAX_CLARIFICATION_OPTIONS`: sigue completo hasta el final para poder
+     * reportar `$totalMatches` con exactitud, aunque `$labels` deje de
+     * crecer una vez lleno. Antes, cortar el `foreach` en cuanto se
+     * llenaban las 5 opciones hacía que una variante real quedara
+     * silenciosamente fuera de la lista, sin que nadie (ni el código, ni el
+     * usuario) pudiera saber que existía. `$catalog` ya llega ordenado por
+     * `id` ascendente desde `resolveExercise()` — determinista, siempre las
+     * MISMAS 5 primeras coincidencias, nunca un recorte arbitrario.
+     *
      * @param  Collection<int, Exercise>  $catalog
-     * @return array<int, string>
+     * @return array{0: array<int, string>, 1: int} [labels, totalMatches]
      */
     private function partialMatches($catalog, string $normalizedCandidate, ?string $toggledCandidate): array
     {
         $labels = [];
+        $totalMatches = 0;
         // Token de conexión ("de", "la", "con"...) nunca por sí solo cuenta
         // como coincidencia — evitaría ofrecer ejercicios genuinamente no
         // relacionados solo porque comparten una preposición.
@@ -237,17 +258,18 @@ class TrainingPreferenceIdentityResolver
                     ));
 
                 if ($matchesSubstring || $sharesToken) {
-                    $labels[] = $name;
+                    $totalMatches++;
+
+                    if (count($labels) < self::MAX_CLARIFICATION_OPTIONS) {
+                        $labels[] = $name;
+                    }
+
                     break;
                 }
             }
-
-            if (count($labels) >= self::MAX_CLARIFICATION_OPTIONS) {
-                break;
-            }
         }
 
-        return array_values(array_unique($labels));
+        return [array_values(array_unique($labels)), $totalMatches];
     }
 
     private function toResolved(Exercise $exercise): TrainingPreferenceIdentityResolution

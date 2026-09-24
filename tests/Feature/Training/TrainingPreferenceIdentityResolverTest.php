@@ -132,6 +132,107 @@ it('Caso 5: a single similar-but-different candidate found only via the toggle s
     expect($resolution->clarificationOptions)->toBe(['Sentadilla búlgara con mancuernas']);
 });
 
+// ── Fix post-E2E real (hallazgo de MAX_CLARIFICATION_OPTIONS): orden
+// determinista por id ascendente + totalMatches, sin cortar el recorrido
+// del catálogo al llenar las 5 opciones. ──
+
+it('Caso A (orden determinista): clarificationOptions queda ordenado por id ascendente, sin importar el orden de inserción', function () {
+    // IDs explícitos, deliberadamente en el orden INVERSO al que deben
+    // aparecer — si el resolver no ordenara por id, este test fallaría de
+    // forma no determinista según el orden físico de la BD.
+    Exercise::factory()->create(['id' => 300, 'name' => 'C Squat', 'name_es' => 'Sentadilla C', 'is_active' => true]);
+    Exercise::factory()->create(['id' => 100, 'name' => 'A Squat', 'name_es' => 'Sentadilla A', 'is_active' => true]);
+    Exercise::factory()->create(['id' => 200, 'name' => 'B Squat', 'name_es' => 'Sentadilla B', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toBe(['Sentadilla A', 'Sentadilla B', 'Sentadilla C']);
+});
+
+it('Caso B: exactamente 5 coincidencias -> 5 opciones, totalMatches=5, sin señal de "hay más"', function () {
+    foreach (range(1, 5) as $i) {
+        Exercise::factory()->create(['id' => 100 + $i, 'name' => "Squat {$i}", 'name_es' => "Sentadilla {$i}", 'is_active' => true]);
+    }
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toHaveCount(5);
+    expect($resolution->totalMatches)->toBe(5);
+    expect($resolution->hasMoreMatches())->toBeFalse();
+});
+
+it('Caso C: 6 coincidencias -> 5 opciones, totalMatches=6, hasMoreMatches=true', function () {
+    foreach (range(1, 6) as $i) {
+        Exercise::factory()->create(['id' => 100 + $i, 'name' => "Squat {$i}", 'name_es' => "Sentadilla {$i}", 'is_active' => true]);
+    }
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toHaveCount(5);
+    expect($resolution->totalMatches)->toBe(6);
+    expect($resolution->hasMoreMatches())->toBeTrue();
+    // Determinismo: las 5 mostradas son siempre las de menor id (1-5), nunca 2-6 ni otra combinación.
+    expect($resolution->clarificationOptions)->toBe(['Sentadilla 1', 'Sentadilla 2', 'Sentadilla 3', 'Sentadilla 4', 'Sentadilla 5']);
+});
+
+it('Caso D: 8 coincidencias -> 5 opciones, totalMatches=8, hasMoreMatches=true', function () {
+    foreach (range(1, 8) as $i) {
+        Exercise::factory()->create(['id' => 100 + $i, 'name' => "Squat {$i}", 'name_es' => "Sentadilla {$i}", 'is_active' => true]);
+    }
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toHaveCount(5);
+    expect($resolution->totalMatches)->toBe(8);
+    expect($resolution->hasMoreMatches())->toBeTrue();
+});
+
+it('Caso E: alcanzar MAX_CLARIFICATION_OPTIONS no corta el recorrido — coincidencias más allá de la 6ª siguen contabilizadas', function () {
+    // 7 coincidencias: si el foreach se cortara al llegar a 5 opciones
+    // llenas (comportamiento ANTERIOR al fix), totalMatches quedaría en 5
+    // o 6 según dónde se cortara — nunca en el valor real (7).
+    foreach (range(1, 7) as $i) {
+        Exercise::factory()->create(['id' => 100 + $i, 'name' => "Squat {$i}", 'name_es' => "Sentadilla {$i}", 'is_active' => true]);
+    }
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->totalMatches)->toBe(7);
+    expect($resolution->clarificationOptions)->toHaveCount(5);
+});
+
+it('Caso F (real conceptual): "No me gustan las sentadillas" contra un catálogo local con 6 variantes sigue siendo clarify, nunca resolved', function () {
+    // Nombres inspirados en el catálogo real ya auditado (Sección C del
+    // hallazgo de #1072) — usando ÚNICAMENTE fixtures/factory locales, sin
+    // ningún id de producción/staging.
+    $names = [
+        'Sentadilla con banda',
+        'Sentadilla con peso corporal',
+        'Sentadilla búlgara con mancuernas',
+        'Máquina de sentadilla con cinturón Cuads',
+        'Sentadilla de glúteos en máquina Smith',
+        'Sentadillas sumo',
+    ];
+
+    foreach ($names as $name) {
+        Exercise::factory()->create(['name' => $name, 'name_es' => $name, 'is_active' => true]);
+    }
+
+    $classification = (new \App\Training\Support\TrainingPreferenceMessageClassifier)->classify('No me gustan las sentadillas');
+    $resolution = preferenceIdentityResolver()->resolve($classification->candidateTerm, null);
+
+    expect($classification->category)->toBe(\App\Training\Enums\PreferenceMessageCategory::Dislike);
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->status)->not->toBe('resolved');
+    expect($resolution->totalMatches)->toBe(6);
+    expect($resolution->clarificationOptions)->toHaveCount(5);
+    expect($resolution->hasMoreMatches())->toBeTrue();
+});
+
 it('returns unresolved when there is no match at all, not even partial', function () {
     Exercise::factory()->create(['name' => 'Squat', 'name_es' => 'Sentadilla', 'is_active' => true]);
 

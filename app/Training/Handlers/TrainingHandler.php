@@ -194,6 +194,16 @@ class TrainingHandler implements HandlerInterface
     private const PREFERENCE_CLARIFY_OPTIONS_MESSAGE = 'No estoy segura de a cuál ejercicio te refieres: %s. ¿Cuál de ellos?';
 
     /**
+     * Corrección post-E2E real (hallazgo de `MAX_CLARIFICATION_OPTIONS`) —
+     * variante usada cuando `TrainingPreferenceIdentityResolution::hasMoreMatches()`
+     * es `true`: el catálogo tenía más coincidencias reales que las
+     * mostradas. Nunca se oculta esto en silencio (Sección 15 del diseño
+     * B3) — se avisa y se pide al usuario ser más específico, sin exponer
+     * el conteo exacto (no aporta nada útil al usuario real).
+     */
+    private const PREFERENCE_CLARIFY_OPTIONS_MORE_MESSAGE = 'No estoy segura de a cuál ejercicio te refieres. Encontré varias opciones, entre ellas: %s. Hay más además de estas — ¿puedes ser más específico?';
+
+    /**
      * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
      * rutina cuando ya existe una sesión pendiente (contexto activo): se
      * informa brevemente en vez de dejar el turno sin ninguna respuesta.
@@ -1340,7 +1350,10 @@ class TrainingHandler implements HandlerInterface
                 }
 
                 if ($resolution->status === 'clarify') {
-                    $this->reply($from, sprintf(self::PREFERENCE_CLARIFY_OPTIONS_MESSAGE, implode(', ', $resolution->clarificationOptions)), $tenant);
+                    $template = $resolution->hasMoreMatches()
+                        ? self::PREFERENCE_CLARIFY_OPTIONS_MORE_MESSAGE
+                        : self::PREFERENCE_CLARIFY_OPTIONS_MESSAGE;
+                    $this->reply($from, sprintf($template, implode(', ', $resolution->clarificationOptions)), $tenant);
 
                     return;
                 }
