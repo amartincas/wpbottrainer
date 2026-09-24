@@ -29,6 +29,22 @@ use App\Training\Support\TrainingPreferenceResolver;
  * `applied_preferences` del snapshot (Sección G/5). Helpers con prefijo
  * "preference" — propios de este archivo, evita colisión con `trainingEngine()`
  * ya usado en TrainingEngineTest.php y otros.
+ *
+ * Fix de determinismo (post-commit f85a985) — causa raíz de la flakiness
+ * detectada en la auditoría (~1/3 de las corridas): `TrainingProfileFactory`
+ * sortea `training_location` de forma aleatoria (`fake()->randomElement(...)`,
+ * incluye `Outdoor`) cuando no se sobreescribe explícitamente. Varios tests
+ * de este archivo crean ejercicios con `equipment_needed` no vacío — con
+ * `Outdoor` al azar, la regla YA EXISTENTE y ajena a B3 de `isEligible()`
+ * ("Outdoor + equipo requerido -> inelegible", Hito 9.0) excluye esos
+ * ejercicios del pool ANTES de que Preference participe, sin relación
+ * alguna con `computeAppliedPreferences()` ni con el algoritmo de B3 (ambos
+ * verificados deterministas por separado, ver auditoría). `preferenceReadyContact()`
+ * fija ahora `Home` como valor por defecto — ningún test de este archivo
+ * ejercita `Outdoor` a propósito salvo el Caso E, que sigue
+ * sobreescribiéndolo explícitamente vía `$profileOverrides` (que
+ * `array_merge()` prioriza sobre este default, sin cambios de
+ * comportamiento para ese caso).
  */
 function preferenceReadyContact(array $profileOverrides = []): Contact
 {
@@ -38,6 +54,7 @@ function preferenceReadyContact(array $profileOverrides = []): Contact
         'contact_id' => $contact->id,
         'split_type' => SplitType::FullBody,
         'goal' => TrainingGoal::GeneralFitness,
+        'training_location' => TrainingLocation::Home,
     ], $profileOverrides));
 
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
