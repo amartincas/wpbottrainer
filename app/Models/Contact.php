@@ -90,6 +90,16 @@ class Contact extends Model
     }
 
     /**
+     * Hito B3.1 (Estado conversacional para clarificaciones de preferencias)
+     * — estado transitorio, previo a `TrainingPreference`. Ver
+     * App\Models\TrainingPreferenceClarification.
+     */
+    public function trainingPreferenceClarifications(): HasMany
+    {
+        return $this->hasMany(TrainingPreferenceClarification::class);
+    }
+
+    /**
      * Hito 10 — dominio Reminder. Mismo criterio que el resto: Contact sigue
      * siendo la única identidad, estas relaciones exponen datos que
      * pertenecen a Reminder, no a Core ni a Training en sí.

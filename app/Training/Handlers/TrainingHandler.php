@@ -17,6 +17,7 @@ use App\Models\Reminder;
 use App\Models\ReminderSuggestion;
 use App\Models\Tenant;
 use App\Models\TrainingAccess;
+use App\Models\TrainingPreferenceClarification;
 use App\Models\TrainingProfile;
 use App\Models\WhatsAppMessage;
 use App\Models\WorkoutExercise;
@@ -41,6 +42,7 @@ use App\Training\Onboarding\OnboardingConversationComposer;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
 use App\Training\Support\AutomaticTrialProvisioner;
 use App\Training\Support\CoachService;
+use App\Training\Support\ConversationAction;
 use App\Training\Support\ConversationTurnResolved;
 use App\Training\Support\ConversationTurnResolver;
 use App\Training\Support\DeclaredHealthConditionRecorder;
@@ -50,6 +52,7 @@ use App\Training\Support\ExecutionReportService;
 use App\Training\Support\ExerciseMessageFormatter;
 use App\Training\Support\MultipleActiveWorkoutSessionsException;
 use App\Training\Support\OnboardingConversationService;
+use App\Training\Support\PendingPreferenceClarificationResolver;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\ReplaceWorkoutSessionService;
@@ -63,6 +66,9 @@ use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingCatalogInsufficientException;
+use App\Training\Support\TrainingPreferenceClarificationRecorder;
+use App\Training\Support\TrainingPreferenceClassification;
+use App\Training\Support\TrainingPreferenceIdentityResolution;
 use App\Training\Support\TrainingPreferenceIdentityResolver;
 use App\Training\Support\TrainingPreferenceMessageClassifier;
 use App\Training\Support\TrainingPreferenceRecorder;
@@ -381,6 +387,8 @@ class TrainingHandler implements HandlerInterface
         private readonly TrainingPreferenceIdentityResolver $preferenceIdentityResolver,
         private readonly TrainingPreferenceRecorder $preferenceRecorder,
         private readonly DeclaredHealthConditionRecorder $healthConditionRecorder,
+        private readonly PendingPreferenceClarificationResolver $pendingClarificationResolver,
+        private readonly TrainingPreferenceClarificationRecorder $clarificationRecorder,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -660,6 +668,23 @@ class TrainingHandler implements HandlerInterface
             $frontExerciseId = ($frontExercise !== null && $frontExercise['requires_report']) ? $frontExercise['workout_exercise_id'] : null;
             $result = $this->reportExtractor->extractReport($body, $reportableExercises, $tenant, $coachContext, $frontExerciseName);
             $resolved = $this->turnResolver->resolve($result);
+
+            // Hito B3.1 — clasificación calculada UNA sola vez por turno,
+            // reutilizada tanto por el gate de pending (abajo) como por
+            // handleTrainingPreferenceMessage() más abajo — nunca se
+            // clasifica dos veces el mismo $body.
+            $classification = $this->preferenceClassifier->classify($body);
+
+            // Hito B3.1 — se evalúa ANTES de executeTurnActions() (Regla del
+            // encargo: nunca dos respuestas). Si este turno resulta ser la
+            // respuesta a una clarificación B3 pendiente, el turno queda
+            // COMPLETAMENTE resuelto aquí — executeTurnActions() nunca se
+            // ejecuta (su precondición, ver el método, garantiza que
+            // $resolved no llevaba nada más que ignorar).
+            if ($this->tryConsumePendingPreferenceClarification($body, $freshContact, $classification, $resolved, $from, $tenant)) {
+                return;
+            }
+
             $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body, $frontExerciseId);
 
             // Hito B3 (Preferencias persistentes) — corre SIEMPRE después del
@@ -667,7 +692,7 @@ class TrainingHandler implements HandlerInterface
             // preferencia después", mismo orden que B2 report+reemplazo).
             // Clasificador 100% determinista sobre $body crudo — nunca sobre
             // $result (que ya viene del LLM), ver docblock de la clase.
-            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant);
+            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
 
             return;
         }
@@ -748,6 +773,20 @@ class TrainingHandler implements HandlerInterface
             // sigue sin poder activarse desde este camino (CoachService
             // nunca expone `reports`/`session_finished`), así que pasar el
             // fragmento real aquí no cambia ningún otro comportamiento.
+
+            // Hito B3.1 — clasificación calculada UNA sola vez por turno,
+            // reutilizada tanto por el gate de pending (abajo) como por
+            // handleTrainingPreferenceMessage() más abajo.
+            $classification = $this->preferenceClassifier->classify($body);
+
+            // Hito B3.1 — igual que en el paso 4: se evalúa ANTES de
+            // executeTurnActions() para poder suprimir la respuesta genérica
+            // de CoachService cuando el turno en realidad responde una
+            // clarificación B3 pendiente (hallazgo del E2E real, Contact 26).
+            if ($this->tryConsumePendingPreferenceClarification($body, $freshContact, $classification, $resolved, $from, $tenant)) {
+                return;
+            }
+
             $shouldDeliverSession = $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body);
 
             // Hito B3 — mismo criterio que el paso 4: corre después de
@@ -756,7 +795,7 @@ class TrainingHandler implements HandlerInterface
             // declarada en el mismo mensaje ("no me gustan las sentadillas,
             // dame mi rutina") ya aplique a la sesión que está a punto de
             // crearse.
-            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant);
+            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
 
             if (! $shouldDeliverSession) {
                 return;
@@ -1259,14 +1298,20 @@ class TrainingHandler implements HandlerInterface
      * autoridad de clasificación — este método solo aplica las reglas de
      * CONTEXTO (Main pendiente sí/no) que el clasificador, deliberadamente,
      * no conoce (Regla 9).
+     *
+     * Hito B3.1 — `$classification` se recibe YA CALCULADA por el llamador
+     * (mismo objeto que también evaluó `tryConsumePendingPreferenceClarification()`
+     * antes de `executeTurnActions()`) — nunca se reclasifica el mismo
+     * `$body` dos veces. `null` solo por compatibilidad de firma en
+     * cualquier llamador futuro que no la tenga ya calculada.
      */
-    private function handleTrainingPreferenceMessage(string $body, Contact $contact, ?array $frontExercise, string $from, Tenant $tenant): void
+    private function handleTrainingPreferenceMessage(string $body, Contact $contact, ?array $frontExercise, string $from, Tenant $tenant, ?TrainingPreferenceClassification $classification = null): void
     {
         if ($body === '') {
             return;
         }
 
-        $classification = $this->preferenceClassifier->classify($body);
+        $classification ??= $this->preferenceClassifier->classify($body);
 
         if ($classification->category === null) {
             return;
@@ -1337,6 +1382,13 @@ class TrainingHandler implements HandlerInterface
 
                 if ($resolution->status === 'resolved' && $resolution->dimension === PreferenceDimension::Exercise) {
                     $this->preferenceRecorder->persistExercisePreference($contact, $resolution->exerciseId, $body);
+                    // Hito B3.1 (Parte 6 paso 3 del diseño aprobado) — una
+                    // nueva declaración que resuelve DE INMEDIATO deja
+                    // obsoleta cualquier clarificación anterior sin
+                    // responder: seguir preguntando "¿cuál sentadilla?"
+                    // después de esto sería redundante/confuso. No-op si no
+                    // había ninguna pending.
+                    $this->clarificationRecorder->abandonActiveFor($contact);
                     $this->reply($from, sprintf(self::PREFERENCE_CONFIRMATION_MESSAGE, $resolution->resolvedLabel), $tenant);
 
                     return;
@@ -1344,12 +1396,31 @@ class TrainingHandler implements HandlerInterface
 
                 if ($resolution->status === 'resolved' && $resolution->dimension === PreferenceDimension::Equipment) {
                     $this->preferenceRecorder->persistEquipmentPreference($contact, $resolution->equipmentValue, $body);
+                    $this->clarificationRecorder->abandonActiveFor($contact);
                     $this->reply($from, sprintf(self::PREFERENCE_CONFIRMATION_MESSAGE, $resolution->resolvedLabel), $tenant);
 
                     return;
                 }
 
                 if ($resolution->status === 'clarify') {
+                    // Hito B3.1 (Parte 7 del diseño aprobado) — se crea (o,
+                    // si ya existía una pending sin responder, la reemplaza:
+                    // `create()` abandona la anterior en la misma
+                    // transacción) la TrainingPreferenceClarification que
+                    // permite reconocer la respuesta del PRÓXIMO turno.
+                    // `dimension` es siempre Exercise aquí — `clarify` solo
+                    // puede producirse por esta vía (el vocabulario de
+                    // Equipment es un diccionario exacto cerrado, nunca
+                    // produce `clarify`, ver TrainingPreferenceIdentityResolver::resolveEquipment()).
+                    $this->clarificationRecorder->create(
+                        contact: $contact,
+                        dimension: PreferenceDimension::Exercise,
+                        candidateTerm: $classification->candidateTerm,
+                        originalText: $body,
+                        presentedOptions: $resolution->clarificationOptions,
+                        totalMatches: $resolution->totalMatches,
+                    );
+
                     $template = $resolution->hasMoreMatches()
                         ? self::PREFERENCE_CLARIFY_OPTIONS_MORE_MESSAGE
                         : self::PREFERENCE_CLARIFY_OPTIONS_MESSAGE;
@@ -1362,6 +1433,129 @@ class TrainingHandler implements HandlerInterface
 
                 return;
         }
+    }
+
+    /**
+     * Hito B3.1 — se evalúa ANTES de `executeTurnActions()`, en ambos puntos
+     * del turno (paso 4 y paso 5), usando el mismo `$resolved` ya calculado
+     * por `ConversationTurnResolver` (Bloque 9) — nunca una segunda llamada
+     * de IA. Devuelve `true` únicamente cuando el turno quedó COMPLETAMENTE
+     * resuelto por B3.1 (respuesta a una clarificación pendiente, resuelta o
+     * ambigua) — en ese caso el llamador NUNCA debe invocar
+     * `executeTurnActions()` para este turno (Regla del encargo: nunca dos
+     * respuestas). Devuelve `false` en cualquier otro caso (incluida la
+     * ausencia de pending), y el llamador continúa exactamente como hoy.
+     *
+     * Precedencia (diseño v3 aprobado, Parte 6):
+     * 1. Safety B3 (`$classification->category === Safety`) y 3. cualquier
+     *    otra categoría B3 (`!== null`) -> se maneja en
+     *    `handleTrainingPreferenceMessage()`, nunca aquí -> false.
+     * 2. `$resolved` contiene una acción distinta de `SendText` -> una
+     *    intención nueva explícita (B1/B2/Safety-IA/reminder/FAQ/customer
+     *    service/reporte) ya reclamó el turno -> false, pending intacta.
+     * 4. `category === null` Y `$resolved` es solo `SendText` Y existe
+     *    pending activa -> se intenta resolver contra ella.
+     */
+    private function tryConsumePendingPreferenceClarification(
+        string $body,
+        Contact $contact,
+        TrainingPreferenceClassification $classification,
+        ConversationTurnResolved $resolved,
+        string $from,
+        Tenant $tenant,
+    ): bool {
+        if ($classification->category !== null) {
+            return false;
+        }
+
+        $onlySendText = collect($resolved->actions)
+            ->every(fn (ConversationAction $action) => $action->type === ConversationActionType::SendText);
+
+        if (! $onlySendText) {
+            return false;
+        }
+
+        $pending = TrainingPreferenceClarification::activePendingFor($contact);
+
+        if ($pending === null) {
+            return false;
+        }
+
+        $outcome = $this->pendingClarificationResolver->resolve($pending, $body);
+
+        return match ($outcome->status) {
+            'resolved' => $this->consumePendingAsResolved($contact, $pending, $outcome->resolution, $from, $tenant),
+            'ambiguous' => $this->consumePendingAsAmbiguous($contact, $pending, $outcome->resolution, $body, $from, $tenant),
+            // 'no_match' — Parte 4.E del diseño aprobado: pending intacta,
+            // sin respuesta adicional de B3, el turno sigue su flujo normal
+            // (executeTurnActions() se ejecutará normalmente en el
+            // llamador).
+            default => false,
+        };
+    }
+
+    /**
+     * Hito B3.1 (Parte 3 del diseño aprobado, rama "resolved") — crea/
+     * reactiva la `TrainingPreference` (mismo lifecycle B3 de siempre, vía
+     * `TrainingPreferenceRecorder`, sin ningún cambio a esa clase), marca la
+     * pending como `resolved` y envía ÚNICAMENTE la confirmación de B3 —
+     * nunca se ejecuta `executeTurnActions()` para este turno (el llamador
+     * retorna `true`).
+     */
+    private function consumePendingAsResolved(
+        Contact $contact,
+        TrainingPreferenceClarification $pending,
+        TrainingPreferenceIdentityResolution $resolution,
+        string $from,
+        Tenant $tenant,
+    ): bool {
+        if ($resolution->dimension === PreferenceDimension::Equipment) {
+            $this->preferenceRecorder->persistEquipmentPreference($contact, $resolution->equipmentValue, $pending->original_text);
+        } else {
+            $this->preferenceRecorder->persistExercisePreference($contact, $resolution->exerciseId, $pending->original_text);
+        }
+
+        $this->clarificationRecorder->resolve($pending);
+
+        $this->reply($from, sprintf(self::PREFERENCE_CONFIRMATION_MESSAGE, $resolution->resolvedLabel), $tenant);
+
+        return true;
+    }
+
+    /**
+     * Hito B3.1 (Parte 3/Punto 3 del diseño aprobado, rama "ambiguous") — la
+     * pending ACTUAL se abandona (dentro de `create()`, misma transacción) y
+     * se crea una NUEVA con las opciones que produjo ESTA respuesta —
+     * `original_candidate_term` es el texto de esta respuesta (nunca el
+     * candidato original concatenado, ver `PendingPreferenceClarificationResolver`),
+     * `original_text`/`dimension` se conservan de la pending anterior (es la
+     * declaración auténtica de preferencia, turno 1). Se envía ÚNICAMENTE la
+     * nueva pregunta de clarificación, reutilizando exactamente las mismas
+     * plantillas del flujo B3 normal.
+     */
+    private function consumePendingAsAmbiguous(
+        Contact $contact,
+        TrainingPreferenceClarification $pending,
+        TrainingPreferenceIdentityResolution $resolution,
+        string $responseBody,
+        string $from,
+        Tenant $tenant,
+    ): bool {
+        $this->clarificationRecorder->create(
+            contact: $contact,
+            dimension: $pending->dimension,
+            candidateTerm: $responseBody,
+            originalText: $pending->original_text,
+            presentedOptions: $resolution->clarificationOptions,
+            totalMatches: $resolution->totalMatches,
+        );
+
+        $template = $resolution->hasMoreMatches()
+            ? self::PREFERENCE_CLARIFY_OPTIONS_MORE_MESSAGE
+            : self::PREFERENCE_CLARIFY_OPTIONS_MESSAGE;
+        $this->reply($from, sprintf($template, implode(', ', $resolution->clarificationOptions)), $tenant);
+
+        return true;
     }
 
     /**
