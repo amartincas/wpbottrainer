@@ -66,6 +66,72 @@ it('resolves a single exact match automatically even when other candidates share
     expect($resolution->exerciseId)->toBe($exercise->id);
 });
 
+// ── Fix post-E2E real (staging, Contact 26): partialMatches() ahora
+// compara TAMBIÉN la alternancia singular/plural del candidato, no solo
+// exactMatches(). Antes de este fix, "sentadillas" (plural) nunca
+// compartía token/subcadena con nombres compuestos que usan la forma
+// singular como núcleo ("Sentadilla con banda"), dejando la lista de
+// clarificación incompleta — reproducido primero con el catálogo real
+// (7 ejercicios "Sentadilla..." activos, solo 1 aparecía como opción). ──
+
+it('Caso 1: a plural candidate ("sentadillas") now offers every compound singular-named match', function () {
+    Exercise::factory()->create(['name' => 'Banded Squat', 'name_es' => 'Sentadilla con banda', 'is_active' => true]);
+    Exercise::factory()->create(['name' => 'Bodyweight Squat', 'name_es' => 'Sentadilla con peso corporal', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toContain('Sentadilla con banda', 'Sentadilla con peso corporal');
+});
+
+it('Caso 2: the singular candidate ("sentadilla") produces the exact same set of options as the plural form', function () {
+    Exercise::factory()->create(['name' => 'Banded Squat', 'name_es' => 'Sentadilla con banda', 'is_active' => true]);
+    Exercise::factory()->create(['name' => 'Bodyweight Squat', 'name_es' => 'Sentadilla con peso corporal', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadilla', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->clarificationOptions)->toContain('Sentadilla con banda', 'Sentadilla con peso corporal');
+});
+
+it('Caso 3: a multi-word candidate matching one compound name exactly still resolves automatically via exactMatches(), never via partial', function () {
+    $exercise = Exercise::factory()->create(['name' => 'Sumo Squat', 'name_es' => 'Sentadillas sumo', 'is_active' => true]);
+    Exercise::factory()->create(['name' => 'Banded Squat', 'name_es' => 'Sentadilla con banda', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas sumo', null);
+
+    expect($resolution->status)->toBe('resolved');
+    expect($resolution->exerciseId)->toBe($exercise->id);
+});
+
+it('Caso 4: partialMatches() never produces "resolved", even when several candidates match via the toggled form', function () {
+    Exercise::factory()->create(['name' => 'Banded Squat', 'name_es' => 'Sentadilla con banda', 'is_active' => true]);
+    Exercise::factory()->create(['name' => 'Bodyweight Squat', 'name_es' => 'Sentadilla con peso corporal', 'is_active' => true]);
+    Exercise::factory()->create(['name' => 'Bulgarian Squat with Dumbbell', 'name_es' => 'Sentadilla búlgara con mancuernas', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->dimension)->toBeNull();
+    expect($resolution->exerciseId)->toBeNull();
+    expect($resolution->clarificationOptions)->toHaveCount(3);
+});
+
+it('Caso 5: a single similar-but-different candidate found only via the toggle still never auto-resolves', function () {
+    // "sentadillas" (plural) -> alternancia -> "sentadilla" (singular);
+    // "Sentadilla búlgara con mancuernas" comparte el token "sentadilla"
+    // pero es un ejercicio genuinamente distinto de lo que el usuario pidió
+    // — debe seguir siendo una OPCIÓN de clarificación (aunque sea la
+    // única), nunca una resolución automática.
+    Exercise::factory()->create(['name' => 'Bulgarian Squat with Dumbbell', 'name_es' => 'Sentadilla búlgara con mancuernas', 'is_active' => true]);
+
+    $resolution = preferenceIdentityResolver()->resolve('sentadillas', null);
+
+    expect($resolution->status)->toBe('clarify');
+    expect($resolution->exerciseId)->toBeNull();
+    expect($resolution->clarificationOptions)->toBe(['Sentadilla búlgara con mancuernas']);
+});
+
 it('returns unresolved when there is no match at all, not even partial', function () {
     Exercise::factory()->create(['name' => 'Squat', 'name_es' => 'Sentadilla', 'is_active' => true]);
 

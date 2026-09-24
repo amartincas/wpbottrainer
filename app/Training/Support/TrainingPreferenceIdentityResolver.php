@@ -126,6 +126,7 @@ class TrainingPreferenceIdentityResolver
         }
 
         $catalog = Exercise::query()->where('is_active', true)->get(['id', 'name', 'name_es']);
+        $toggled = $this->togglePlural($normalizedCandidate);
 
         $exact = $this->exactMatches($catalog, $normalizedCandidate);
 
@@ -134,7 +135,6 @@ class TrainingPreferenceIdentityResolver
         }
 
         if (count($exact) === 0) {
-            $toggled = $this->togglePlural($normalizedCandidate);
             $exactToggled = $toggled !== null ? $this->exactMatches($catalog, $toggled) : [];
 
             if (count($exactToggled) === 1) {
@@ -143,9 +143,16 @@ class TrainingPreferenceIdentityResolver
         }
 
         // Ni un match único directo ni por singular/plural: se ofrecen
-        // opciones por coincidencia parcial de tokens, EXCLUSIVAMENTE como
-        // ayuda de clarificación — nunca como resolución automática.
-        $options = $this->partialMatches($catalog, $normalizedCandidate);
+        // opciones por coincidencia parcial de tokens/subcadena —
+        // comparando TANTO el candidato original COMO su alternancia
+        // singular/plural (hallazgo del E2E real: el catálogo usa
+        // mayoritariamente la forma singular como núcleo del nombre
+        // compuesto, ej. "Sentadilla con banda", mientras el usuario puede
+        // escribir en plural, ej. "sentadillas" — sin comparar también la
+        // forma alternada, la lista de opciones queda incompleta). Sigue
+        // siendo EXCLUSIVAMENTE ayuda de clarificación — `partialMatches()`
+        // nunca puede producir `resolved`, solo alimenta `clarify()`.
+        $options = $this->partialMatches($catalog, $normalizedCandidate, $toggled);
 
         return $options === []
             ? TrainingPreferenceIdentityResolution::unresolved()
@@ -172,16 +179,32 @@ class TrainingPreferenceIdentityResolver
     }
 
     /**
+     * EXCLUSIVAMENTE para clarificación — jamás produce una resolución
+     * automática (ver únicos dos llamadores de este método en
+     * `resolveExercise()`, ambos alimentan `clarify()`/`unresolved()`,
+     * nunca `resolved()`). Compara tanto `$normalizedCandidate` como su
+     * alternancia singular/plural `$toggledCandidate` (mismo alcance ya
+     * aprobado para `exactMatches()`, Sección A.4/revisión v4) — sin esto,
+     * un candidato en plural ("sentadillas") nunca comparte token/subcadena
+     * con nombres compuestos que usan la forma singular como núcleo
+     * ("Sentadilla con banda"), dejando la lista de opciones incompleta
+     * (hallazgo del E2E real en staging). Sigue sin normalizar preposiciones
+     * internas, sinónimos, reordenamiento ni ningún stemming más allá de
+     * esta única alternancia ya aprobada.
+     *
      * @param  Collection<int, Exercise>  $catalog
      * @return array<int, string>
      */
-    private function partialMatches($catalog, string $normalizedCandidate): array
+    private function partialMatches($catalog, string $normalizedCandidate, ?string $toggledCandidate): array
     {
         $labels = [];
         // Token de conexión ("de", "la", "con"...) nunca por sí solo cuenta
         // como coincidencia — evitaría ofrecer ejercicios genuinamente no
         // relacionados solo porque comparten una preposición.
         $candidateTokens = array_filter(explode(' ', $normalizedCandidate), fn (string $t) => mb_strlen($t) >= 4);
+        $toggledTokens = $toggledCandidate !== null
+            ? array_filter(explode(' ', $toggledCandidate), fn (string $t) => mb_strlen($t) >= 4)
+            : [];
 
         foreach ($catalog as $exercise) {
             $names = array_filter([$exercise->name_es, $exercise->name]);
@@ -197,16 +220,23 @@ class TrainingPreferenceIdentityResolver
                 // "sentadilla" -> "Sentadilla sumo" y "press banca" ->
                 // "Press de banca") O por TOKEN compartido de al menos 4
                 // caracteres (cubre "sentadilla con salto" -> "Sentadilla
-                // sumo", donde ninguna es subcadena de la otra) — en
-                // cualquier caso, solo una OPCIÓN de clarificación, nunca
-                // una resolución automática (Regla del encargo, Sección 6).
+                // sumo", donde ninguna es subcadena de la otra) — evaluado
+                // contra AMBAS formas del candidato (original y alternada)
+                // — en cualquier caso, solo una OPCIÓN de clarificación,
+                // nunca una resolución automática (Regla del encargo,
+                // Sección 6).
                 $nameTokens = array_filter(explode(' ', $normalizedName), fn (string $t) => mb_strlen($t) >= 4);
-                $sharesToken = array_intersect($candidateTokens, $nameTokens) !== [];
+                $sharesToken = array_intersect($candidateTokens, $nameTokens) !== []
+                    || ($toggledTokens !== [] && array_intersect($toggledTokens, $nameTokens) !== []);
 
-                if (str_contains($normalizedName, $normalizedCandidate)
+                $matchesSubstring = str_contains($normalizedName, $normalizedCandidate)
                     || str_contains($normalizedCandidate, $normalizedName)
-                    || $sharesToken
-                ) {
+                    || ($toggledCandidate !== null && (
+                        str_contains($normalizedName, $toggledCandidate)
+                        || str_contains($toggledCandidate, $normalizedName)
+                    ));
+
+                if ($matchesSubstring || $sharesToken) {
                     $labels[] = $name;
                     break;
                 }
