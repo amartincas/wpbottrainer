@@ -12,19 +12,19 @@ use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\SplitType;
-use App\Training\Enums\TrackingType;
 use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
 use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
-use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
+use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Facades\Log;
 
 function makeReadyContact(array $profileOverrides = []): Contact
@@ -58,9 +58,10 @@ function trainingEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 

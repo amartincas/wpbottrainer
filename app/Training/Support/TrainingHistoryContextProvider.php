@@ -39,7 +39,10 @@ class TrainingHistoryContextProvider
 
     private const WINDOW_WEEKS = 4;
 
-    public function __construct(private readonly SafetyRestrictionResolver $safetyResolver) {}
+    public function __construct(
+        private readonly SafetyRestrictionResolver $safetyResolver,
+        private readonly TrainingPreferenceResolver $preferenceResolver,
+    ) {}
 
     public function build(Contact $contact): TrainingHistoryContext
     {
@@ -73,7 +76,7 @@ class TrainingHistoryContextProvider
             windowWeeks: self::WINDOW_WEEKS,
             sessions: $sessionEntries->all(),
             aggregates: $this->buildAggregates($sessionEntries),
-            currentProfileSnapshot: $this->buildProfileSnapshot($profile),
+            currentProfileSnapshot: $this->buildProfileSnapshot($profile, $contact),
             activeSafetyBodyRegions: $profile !== null ? $this->safetyResolver->activeSafetyBodyRegions($profile) : [],
         );
     }
@@ -279,7 +282,7 @@ class TrainingHistoryContextProvider
      * por SafetyRestrictionResolver, ya expuesto aparte como
      * `activeSafetyBodyRegions`.
      */
-    private function buildProfileSnapshot(?TrainingProfile $profile): array
+    private function buildProfileSnapshot(?TrainingProfile $profile, Contact $contact): array
     {
         if ($profile === null) {
             return [];
@@ -295,6 +298,12 @@ class TrainingHistoryContextProvider
             'training_location' => $profile->training_location?->value,
             'equipment_fully_equipped' => $profile->equipment_fully_equipped,
             'available_equipment' => $profile->available_equipment,
+            // Hito B3 (diseño v3 FINAL, Sección 15) — FACT puro para el
+            // Coach: nombres/equipo que el contacto declaró no querer.
+            // TrainingEngine nunca lee este campo (usa exclusivamente
+            // TrainingPreferenceResolver::excludedIdentifiersFor()) — esta
+            // lista es solo para narración.
+            'active_preferences' => $this->preferenceResolver->activeLabelsFor($contact),
         ];
     }
 }

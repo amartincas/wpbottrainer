@@ -20,6 +20,8 @@ use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
+use Carbon\Carbon;
 
 // Nombres deliberadamente distintos a los helpers de TrainingEngineTest.php
 // (makeReadyContact/trainingEngine) para evitar colisión de funciones
@@ -46,9 +48,10 @@ function snapshotEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 
@@ -102,7 +105,7 @@ it('B: the snapshot contains the real profile values used by the engine at that 
     // esta aserción demuestra la coincidencia ACTUAL, no una equivalencia
     // conceptual permanente.
     expect($snapshot['generated_at'])->not->toBeNull();
-    expect(\Carbon\Carbon::parse($snapshot['generated_at'])->format('Y-m-d H:i:s'))
+    expect(Carbon::parse($snapshot['generated_at'])->format('Y-m-d H:i:s'))
         ->toBe($session->scheduled_at->format('Y-m-d H:i:s'));
 });
 

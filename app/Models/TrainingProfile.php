@@ -161,33 +161,41 @@ class TrainingProfile extends Model
      * depende de nada externo a `Exercise` mismo.
      *
      * @param  array<int, string>  $activeSafetyTags  Resultado de
-     *         SafetyRestrictionResolver::activeSafetyBodyRegions($this) en
-     *         el mismo instante — nunca recalculado aquí, para no duplicar
-     *         lógica de seguridad.
+     *                                                SafetyRestrictionResolver::activeSafetyBodyRegions($this) en
+     *                                                el mismo instante — nunca recalculado aquí, para no duplicar
+     *                                                lógica de seguridad.
      * @param  \DateTimeInterface  $generatedAt  Fundación Temporal (Bloque 3,
-     *         ver docs/DECISIONS.md D046): representa `prescribed_at` —el
-     *         instante exacto en que `TrainingEngine` tomó ESTA decisión de
-     *         prescripción—, NUNCA el momento en que el mensaje se entregó
-     *         por WhatsApp (ese timestamp no existe todavía como campo) ni
-     *         un compromiso de programación futura. Es un concepto distinto
-     *         de `WorkoutSession.scheduled_at` (el instante para el que la
-     *         sesión está prevista), aunque hoy ambos coincidan porque
-     *         `TrainingEngine` no soporta programación anticipada.
+     *                                           ver docs/DECISIONS.md D046): representa `prescribed_at` —el
+     *                                           instante exacto en que `TrainingEngine` tomó ESTA decisión de
+     *                                           prescripción—, NUNCA el momento en que el mensaje se entregó
+     *                                           por WhatsApp (ese timestamp no existe todavía como campo) ni
+     *                                           un compromiso de programación futura. Es un concepto distinto
+     *                                           de `WorkoutSession.scheduled_at` (el instante para el que la
+     *                                           sesión está prevista), aunque hoy ambos coincidan porque
+     *                                           `TrainingEngine` no soporta programación anticipada.
      * @param  array<int, array{key: string, muscles: array<int, string>}>  $requestedFocus
-     *         Hito B1 (Requested Focus) — petición puntual de ESTA sesión
-     *         (nunca `TrainingProfile.primary_focus`/`secondary_focus`, que
-     *         no cambian por esto). `[]` cuando no se solicitó — mismo
-     *         significado que ausencia de clave, nunca un estado distinto.
-     *         Ya serializado a array plano (no `RequestedFocusGroup[]`) por
-     *         quien llama — este modelo no conoce esa clase de dominio.
+     *                                                                                       Hito B1 (Requested Focus) — petición puntual de ESTA sesión
+     *                                                                                       (nunca `TrainingProfile.primary_focus`/`secondary_focus`, que
+     *                                                                                       no cambian por esto). `[]` cuando no se solicitó — mismo
+     *                                                                                       significado que ausencia de clave, nunca un estado distinto.
+     *                                                                                       Ya serializado a array plano (no `RequestedFocusGroup[]`) por
+     *                                                                                       quien llama — este modelo no conoce esa clase de dominio.
      * @param  array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>  $requestedFocusCoverage
-     *         Hito B1 — resultado de honrar (o no) cada grupo de
-     *         `$requestedFocus`, calculado por `TrainingEngine` DESPUÉS de
-     *         la selección final. `[]` cuando no se solicitó. Es la única
-     *         fuente que un futuro Coach debe usar para saber qué realmente
-     *         se cumplió — nunca debe inferirse de otra forma (ver
-     *         `SessionIntroComposer::focusLine()`, mismo criterio ya
-     *         aplicado a `decided_focus`).
+     *                                                                                                                                                          Hito B1 — resultado de honrar (o no) cada grupo de
+     *                                                                                                                                                          `$requestedFocus`, calculado por `TrainingEngine` DESPUÉS de
+     *                                                                                                                                                          la selección final. `[]` cuando no se solicitó. Es la única
+     *                                                                                                                                                          fuente que un futuro Coach debe usar para saber qué realmente
+     *                                                                                                                                                          se cumplió — nunca debe inferirse de otra forma (ver
+     *                                                                                                                                                          `SessionIntroComposer::focusLine()`, mismo criterio ya
+     *                                                                                                                                                          aplicado a `decided_focus`).
+     * @param  array<int, array{dimension: string, value: string, exercise_id: ?int, excluded_candidates_count: int}>  $appliedPreferences
+     *                                                                                                                                      Hito B3 (diseño v3 FINAL, Sección G) — preferencias activas
+     *                                                                                                                                      que REALMENTE excluyeron al menos 1 candidato en esta sesión
+     *                                                                                                                                      (calculado por `TrainingEngine::computeAppliedPreferences()`,
+     *                                                                                                                                      independiente por preferencia, nunca secuencial). `[]` cuando
+     *                                                                                                                                      no hubo ninguna con efecto real. Extensión ADITIVA —
+     *                                                                                                                                      `schema_version` permanece en 1 (mismo criterio D046 ya
+     *                                                                                                                                      aplicado a `requested_focus`/`requested_focus_coverage`).
      */
     public function toPrescriptionContextSnapshot(
         string $decidedFocus,
@@ -195,6 +203,7 @@ class TrainingProfile extends Model
         \DateTimeInterface $generatedAt,
         array $requestedFocus = [],
         array $requestedFocusCoverage = [],
+        array $appliedPreferences = [],
     ): array {
         return [
             'schema_version' => 1,
@@ -210,6 +219,7 @@ class TrainingProfile extends Model
             'available_equipment' => $this->available_equipment ?? [],
             'equipment_fully_equipped' => $this->equipment_fully_equipped,
             'active_safety_tags' => array_values($activeSafetyTags),
+            'applied_preferences' => $appliedPreferences,
             // prescribed_at conceptual — ver docblock del parámetro $generatedAt.
             'generated_at' => $generatedAt->toISOString(),
         ];

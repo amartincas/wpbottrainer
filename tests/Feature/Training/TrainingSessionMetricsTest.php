@@ -1,9 +1,14 @@
 <?php
 
 use App\Models\Contact;
+use App\Models\TrainingProfile;
 use App\Models\WorkoutSession;
 use App\Training\Enums\WorkoutSessionStatus;
+use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\SafetyRestrictionResolver;
+use App\Training\Support\TrainingHistoryContextProvider;
 use App\Training\Support\TrainingPeriodResolver;
+use App\Training\Support\TrainingPreferenceResolver;
 use App\Training\Support\TrainingSessionMetrics;
 use Carbon\CarbonImmutable;
 
@@ -46,7 +51,7 @@ it('counts 9 sessions completed within the last 4 weeks — never capped to 6 li
 
 it('9 completed sessions within 4 weeks coexist correctly with TrainingHistoryContextProvider still capped to 6', function () {
     $contact = Contact::factory()->create();
-    \App\Models\TrainingProfile::factory()->create(['contact_id' => $contact->id]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id]);
     $now = CarbonImmutable::parse('2026-09-17 12:00:00', 'UTC');
 
     for ($i = 0; $i < 9; $i++) {
@@ -56,8 +61,8 @@ it('9 completed sessions within 4 weeks coexist correctly with TrainingHistoryCo
     $period = (new TrainingPeriodResolver)->resolve('last_4_weeks', 'America/Bogota', $now);
     $realMetric = sessionMetrics()->completedCount($contact, $period);
 
-    $safetyResolver = new \App\Training\Support\SafetyRestrictionResolver(new \App\Training\Support\BodyRegionCanonicalMapper);
-    $historyContext = (new \App\Training\Support\TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
+    $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
+    $historyContext = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
 
     expect($realMetric)->toBe(9);
     expect($historyContext->aggregates->sessionsCompletedInWindow)->toBeLessThanOrEqual(6);

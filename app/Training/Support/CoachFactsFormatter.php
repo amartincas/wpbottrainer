@@ -124,6 +124,15 @@ class CoachFactsFormatter
             $parts[] = 'foco_primario='.implode(',', $profile['primary_focus']);
         }
 
+        // Hito B3 (diseño v3 FINAL, Sección 15) — FACT puro, nunca una
+        // instrucción de selección: el Coach solo puede NARRAR que estas
+        // preferencias existen y, cuando corresponda, que ya se aplicaron
+        // (ver REGLA DURA en CoachService::buildPrompt()) — jamás decidir
+        // ni sugerir una preferencia nueva.
+        if (! empty($profile['active_preferences'])) {
+            $parts[] = 'preferencias_activas='.implode(',', $profile['active_preferences']);
+        }
+
         return $parts === [] ? '' : 'PERFIL: '.implode('; ', $parts);
     }
 

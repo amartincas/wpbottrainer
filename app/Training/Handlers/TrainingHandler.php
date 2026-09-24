@@ -25,6 +25,10 @@ use App\Services\WhatsAppService;
 use App\Services\WhatsAppStatusTracker;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\ConversationActionType;
+use App\Training\Enums\HealthConditionCategory;
+use App\Training\Enums\PreferenceDimension;
+use App\Training\Enums\PreferenceMessageCategory;
+use App\Training\Enums\ReminderStatus;
 use App\Training\Enums\ReminderSuggestionOrigin;
 use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\SafetyStatus;
@@ -39,6 +43,7 @@ use App\Training\Support\AutomaticTrialProvisioner;
 use App\Training\Support\CoachService;
 use App\Training\Support\ConversationTurnResolved;
 use App\Training\Support\ConversationTurnResolver;
+use App\Training\Support\DeclaredHealthConditionRecorder;
 use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
@@ -48,6 +53,7 @@ use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
 use App\Training\Support\ReplaceWorkoutSessionService;
+use App\Training\Support\RequestedFocusGroup;
 use App\Training\Support\RequestedFocusTermMapper;
 use App\Training\Support\SafetySignalDetector;
 use App\Training\Support\SessionCloseMessageComposer;
@@ -57,7 +63,12 @@ use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingAccessDeniedException;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingCatalogInsufficientException;
+use App\Training\Support\TrainingPreferenceIdentityResolver;
+use App\Training\Support\TrainingPreferenceMessageClassifier;
+use App\Training\Support\TrainingPreferenceRecorder;
 use App\Training\Support\TrialEndedMessageComposer;
+use Carbon\CarbonImmutable;
+use Carbon\CarbonInterface;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -159,6 +170,28 @@ class TrainingHandler implements HandlerInterface
      */
     private const NEW_WORKOUT_REQUEST_INCONSISTENT_MESSAGE = 'Encontré un problema técnico con tu sesión actual. Ya '
         .'avisé a nuestro equipo — escríbeme en un momento y seguimos. 🙏';
+
+    /**
+     * Hito B3 (diseño v3 FINAL) — confirmaciones/clarificaciones
+     * deterministas, sin IA, del flujo de Preferencias persistentes. Mismo
+     * criterio que el resto de las confirmaciones fijas de este archivo —
+     * texto de producto simple, no requiere redacción de la IA.
+     */
+    private const PREFERENCE_CONFIRMATION_MESSAGE = 'Anotado — no incluiré %s en tus próximas rutinas.';
+
+    private const PREFERENCE_SAFETY_ACK_MESSAGE = 'Gracias por avisarme. Quedó registrado para que nuestro equipo lo '
+        .'revise — mientras tanto, seguimos con tu entrenamiento con normalidad.';
+
+    private const PREFERENCE_AMBIGUOUS_CLARIFICATION_MESSAGE = '¿Eso es algo que prefieres evitar siempre a partir '
+        .'de ahora, o solo por esta vez?';
+
+    private const PREFERENCE_NO_PUEDO_EQUIPMENT_CLARIFICATION_MESSAGE = '¿No tienes ese equipo, o prefieres no usarlo?';
+
+    private const PREFERENCE_NO_PUEDO_EXERCISE_CLARIFICATION_MESSAGE = '¿No puedes por algún tema físico, o prefieres no hacerlo?';
+
+    private const PREFERENCE_UNRESOLVED_MESSAGE = 'No estoy segura de a qué ejercicio te refieres — ¿me dices el nombre exacto?';
+
+    private const PREFERENCE_CLARIFY_OPTIONS_MESSAGE = 'No estoy segura de a cuál ejercicio te refieres: %s. ¿Cuál de ellos?';
 
     /**
      * Bloque 9 (D052) — `continue_training` nunca genera ni reenvía una
@@ -334,6 +367,10 @@ class TrainingHandler implements HandlerInterface
         private readonly SupportPhaseConfirmationDetector $supportConfirmationDetector,
         private readonly RequestedFocusTermMapper $requestedFocusTermMapper,
         private readonly ReplaceWorkoutSessionService $replaceSessionService,
+        private readonly TrainingPreferenceMessageClassifier $preferenceClassifier,
+        private readonly TrainingPreferenceIdentityResolver $preferenceIdentityResolver,
+        private readonly TrainingPreferenceRecorder $preferenceRecorder,
+        private readonly DeclaredHealthConditionRecorder $healthConditionRecorder,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -615,6 +652,13 @@ class TrainingHandler implements HandlerInterface
             $resolved = $this->turnResolver->resolve($result);
             $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body, $frontExerciseId);
 
+            // Hito B3 (Preferencias persistentes) — corre SIEMPRE después del
+            // reporte real (Sección 24 del diseño aprobado: "reporte primero,
+            // preferencia después", mismo orden que B2 report+reemplazo).
+            // Clasificador 100% determinista sobre $body crudo — nunca sobre
+            // $result (que ya viene del LLM), ver docblock de la clase.
+            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant);
+
             return;
         }
 
@@ -695,6 +739,14 @@ class TrainingHandler implements HandlerInterface
             // nunca expone `reports`/`session_finished`), así que pasar el
             // fragmento real aquí no cambia ningún otro comportamiento.
             $shouldDeliverSession = $this->executeTurnActions($resolved, $activeSessionFragment->data, $from, $tenant, $freshContact, $profile, $startedAt, $body);
+
+            // Hito B3 — mismo criterio que el paso 4: corre después de
+            // procesar el resto del turno, y ANTES de generar/entregar
+            // cualquier sesión nueva en el paso 6, para que una preferencia
+            // declarada en el mismo mensaje ("no me gustan las sentadillas,
+            // dame mi rutina") ya aplique a la sesión que está a punto de
+            // crearse.
+            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant);
 
             if (! $shouldDeliverSession) {
                 return;
@@ -942,7 +994,7 @@ class TrainingHandler implements HandlerInterface
      * cuerpo", o un término desconocido) — en los 3 casos, `decideNextSession()`
      * recibe `null` y ejecuta exactamente el comportamiento legacy.
      *
-     * @return ?array<int, \App\Training\Support\RequestedFocusGroup>
+     * @return ?array<int, RequestedFocusGroup>
      */
     private function resolveRequestedFocus(ConversationTurnResolved $resolved): ?array
     {
@@ -968,18 +1020,18 @@ class TrainingHandler implements HandlerInterface
      * cambios).
      *
      * @param  array{workout_session_id: int, unreported_exercises: array}|null  $activeSessionData
-     *         el fragmento REAL de sesión activa (Regla 11, corrección
-     *         post-incidente de staging #33) — `null` ÚNICAMENTE cuando de
-     *         verdad no hay ninguna `WorkoutSession` `Scheduled` para este
-     *         contacto (nunca hardcodeado por el llamador para "simplificar"
-     *         un camino: eso fue precisamente la causa de que `DeliverSession`
-     *         reenviara la sesión ya existente). Usado tanto por
-     *         `RecordExecutionReport` como por `DeliverSession`.
+     *                                                                                               el fragmento REAL de sesión activa (Regla 11, corrección
+     *                                                                                               post-incidente de staging #33) — `null` ÚNICAMENTE cuando de
+     *                                                                                               verdad no hay ninguna `WorkoutSession` `Scheduled` para este
+     *                                                                                               contacto (nunca hardcodeado por el llamador para "simplificar"
+     *                                                                                               un camino: eso fue precisamente la causa de que `DeliverSession`
+     *                                                                                               reenviara la sesión ya existente). Usado tanto por
+     *                                                                                               `RecordExecutionReport` como por `DeliverSession`.
      * @param  ?int  $frontExerciseId  necesario únicamente para
-     *         `RecordExecutionReport` — el mismo id ya pasado a
-     *         `ExecutionReportService::extractReport()` (ver paso 4 de
-     *         `handle()`). `null` en cualquier otro camino, donde esa
-     *         acción nunca aparece o el frente no requiere reporte.
+     *                                 `RecordExecutionReport` — el mismo id ya pasado a
+     *                                 `ExecutionReportService::extractReport()` (ver paso 4 de
+     *                                 `handle()`). `null` en cualquier otro camino, donde esa
+     *                                 acción nunca aparece o el frente no requiere reporte.
      */
     private function executeTurnActions(
         ConversationTurnResolved $resolved,
@@ -1181,6 +1233,125 @@ class TrainingHandler implements HandlerInterface
     }
 
     /**
+     * Hito B3 (Preferencias persistentes, diseño v3 FINAL) — contrato
+     * conversacional completo (Sección E): Classify (determinista, sobre
+     * `$body` crudo) -> Resolve identity -> persist/report/safety/clarify.
+     * Corre en AMBOS caminos que llegan aquí (paso 4 con Main pendiente,
+     * paso 5 sin contexto reportable — mismo hallazgo que B2.2/B2.3 obligó a
+     * cablear en `CoachService` Y `ExecutionReportService`), SIEMPRE
+     * DESPUÉS de que `executeTurnActions()` ya procesó el resto del turno
+     * (Sección 24: "reporte primero, preferencia después").
+     *
+     * NUNCA modifica `isEligible()`, NUNCA escribe en
+     * `TrainingProfile.available_equipment`, NUNCA infiere desde
+     * `ExerciseLog.skip_reason`, NUNCA mezcla Safety con Preference (Reglas
+     * 11/12 del encargo). `TrainingPreferenceMessageClassifier` es la única
+     * autoridad de clasificación — este método solo aplica las reglas de
+     * CONTEXTO (Main pendiente sí/no) que el clasificador, deliberadamente,
+     * no conoce (Regla 9).
+     */
+    private function handleTrainingPreferenceMessage(string $body, Contact $contact, ?array $frontExercise, string $from, Tenant $tenant): void
+    {
+        if ($body === '') {
+            return;
+        }
+
+        $classification = $this->preferenceClassifier->classify($body);
+
+        if ($classification->category === null) {
+            return;
+        }
+
+        switch ($classification->category) {
+            case PreferenceMessageCategory::Temporal:
+                // Nunca persiste — colapsa al mecanismo existente de reporte
+                // (si hay Main pendiente) o no-op (diseño v3, Sección 3,
+                // Opción A). Nada que hacer aquí.
+                return;
+
+            case PreferenceMessageCategory::Safety:
+                // Hito B3 — reutiliza DIRECTAMENTE DeclaredHealthConditionRecorder
+                // (autoridad Safety existente para declaraciones NO
+                // emergentes, ver auditoría puntual) — nunca duplica lógica
+                // médica, nunca crea/confirma una TrainingRestriction, nunca
+                // pausa el entrenamiento (eso sigue siendo exclusivo de
+                // SafetySignalDetector/EscalateSafety, sin tocar).
+                $healthCategory = $classification->safetySubcategory === 'recovery'
+                    ? HealthConditionCategory::PossibleRecovery
+                    : HealthConditionCategory::PossibleInjury;
+
+                $this->healthConditionRecorder->declare(contact: $contact, originalText: $body, category: $healthCategory);
+
+                $this->reply($from, self::PREFERENCE_SAFETY_ACK_MESSAGE, $tenant);
+
+                return;
+
+            case PreferenceMessageCategory::InstanceAnchor:
+            case PreferenceMessageCategory::ActionRefusal:
+                // Con Main pendiente: el reporte YA EJECUTADO (arriba, antes
+                // de llamar a este método) es la interpretación correcta —
+                // B3 nunca duplica ni reinterpreta ese reporte. Sin Main:
+                // genuinamente ambiguo (Sección 1/5 del diseño), nunca se
+                // asume Preference por defecto (Regla 8).
+                if ($frontExercise !== null && $frontExercise['requires_report']) {
+                    return;
+                }
+
+                $this->reply($from, self::PREFERENCE_AMBIGUOUS_CLARIFICATION_MESSAGE, $tenant);
+
+                return;
+
+            case PreferenceMessageCategory::Ambiguous:
+                if ($classification->noPuedoBare) {
+                    $guess = $this->preferenceIdentityResolver->resolve($classification->candidateTerm, null);
+                    $message = ($guess->status === 'resolved' && $guess->dimension === PreferenceDimension::Equipment)
+                        ? self::PREFERENCE_NO_PUEDO_EQUIPMENT_CLARIFICATION_MESSAGE
+                        : self::PREFERENCE_NO_PUEDO_EXERCISE_CLARIFICATION_MESSAGE;
+
+                    $this->reply($from, $message, $tenant);
+
+                    return;
+                }
+
+                $this->reply($from, self::PREFERENCE_AMBIGUOUS_CLARIFICATION_MESSAGE, $tenant);
+
+                return;
+
+            case PreferenceMessageCategory::Dislike:
+            case PreferenceMessageCategory::Permanence:
+                // Modelo C (diseño v3, Sección 4) — ambas son inequívocas por
+                // construcción léxica: se persiste inmediatamente, sin
+                // confirmación adicional, salvo que la IDENTIDAD (no la
+                // categoría) sea ambigua.
+                $resolution = $this->preferenceIdentityResolver->resolve($classification->candidateTerm, $frontExercise);
+
+                if ($resolution->status === 'resolved' && $resolution->dimension === PreferenceDimension::Exercise) {
+                    $this->preferenceRecorder->persistExercisePreference($contact, $resolution->exerciseId, $body);
+                    $this->reply($from, sprintf(self::PREFERENCE_CONFIRMATION_MESSAGE, $resolution->resolvedLabel), $tenant);
+
+                    return;
+                }
+
+                if ($resolution->status === 'resolved' && $resolution->dimension === PreferenceDimension::Equipment) {
+                    $this->preferenceRecorder->persistEquipmentPreference($contact, $resolution->equipmentValue, $body);
+                    $this->reply($from, sprintf(self::PREFERENCE_CONFIRMATION_MESSAGE, $resolution->resolvedLabel), $tenant);
+
+                    return;
+                }
+
+                if ($resolution->status === 'clarify') {
+                    $this->reply($from, sprintf(self::PREFERENCE_CLARIFY_OPTIONS_MESSAGE, implode(', ', $resolution->clarificationOptions)), $tenant);
+
+                    return;
+                }
+
+                $this->reply($from, self::PREFERENCE_UNRESOLVED_MESSAGE, $tenant);
+
+                return;
+        }
+    }
+
+    /**
      * H16.2 Fase 1 — regla "código decide, IA redacta" aplicada al cierre de
      * sesión: la SEGUNDA llamada de IA de este turno (`SessionCloseMessageComposer`)
      * ocurre ÚNICA Y EXCLUSIVAMENTE cuando `$report['session_finished']` es
@@ -1199,9 +1370,9 @@ class TrainingHandler implements HandlerInterface
      * @param  array{reports: array, session_finished: bool}  $report
      * @param  array{workout_session_id: int, unreported_exercises: array}  $activeSessionData
      * @param  ?int  $frontExerciseId  Corrección post-incidente de staging
-     *         (#33) — mismo id ya pasado a `ExecutionReportService`, único
-     *         objetivo válido para un reporte implícito (sin nombre) — ver
-     *         `ExecutionReportRecorder::resolveExercise()`.
+     *                                 (#33) — mismo id ya pasado a `ExecutionReportService`, único
+     *                                 objetivo válido para un reporte implícito (sin nombre) — ver
+     *                                 `ExecutionReportRecorder::resolveExercise()`.
      */
     private function recordExecutionReport(array $report, array $activeSessionData, string $from, Tenant $tenant, Contact $contact, float $startedAt, ?int $frontExerciseId = null): void
     {
@@ -1305,9 +1476,9 @@ class TrainingHandler implements HandlerInterface
      * `ExecutionReportRecorder::maybeCompleteSession()`).
      *
      * @param  ?WorkoutExercise  $next  NEXT TO DELIVER (Regla 7,
-     *         `WorkoutSession::nextUndeliveredExercise()`) — nunca una lista
-     *         de "sin resolver": este mensaje solo necesita saber si hay un
-     *         siguiente ejercicio real para anunciar la transición.
+     *                                  `WorkoutSession::nextUndeliveredExercise()`) — nunca una lista
+     *                                  de "sin resolver": este mensaje solo necesita saber si hay un
+     *                                  siguiente ejercicio real para anunciar la transición.
      */
     private function buildReportResponseMessage(ExecutionReportOutcome $outcome, ?WorkoutExercise $next): string
     {
@@ -1551,7 +1722,7 @@ class TrainingHandler implements HandlerInterface
             'tenant_id' => $tenant->id,
             'contact_id' => $contact->id,
             'type' => $suggestion->proposed_type,
-            'status' => \App\Training\Enums\ReminderStatus::Pending,
+            'status' => ReminderStatus::Pending,
             'fire_at' => $override['resolution']->fireAt,
             'recurrence' => $override['resolution']->recurrence,
             'created_from_suggestion_id' => $suggestion->id,
@@ -1603,7 +1774,7 @@ class TrainingHandler implements HandlerInterface
             return;
         }
 
-        $reminder->update(['status' => \App\Training\Enums\ReminderStatus::Cancelled, 'cancelled_at' => now()]);
+        $reminder->update(['status' => ReminderStatus::Cancelled, 'cancelled_at' => now()]);
         $this->reply($from, self::REMINDER_CANCELLED_MESSAGE, $tenant);
     }
 
@@ -1639,7 +1810,7 @@ class TrainingHandler implements HandlerInterface
         }
 
         $timezone = $this->timezoneResolver->resolve($contact);
-        $currentLocal = \Carbon\CarbonImmutable::instance($reminder->fire_at)->setTimezone($timezone);
+        $currentLocal = CarbonImmutable::instance($reminder->fire_at)->setTimezone($timezone);
         $recurring = $reminder->recurrence !== null;
 
         // Sin día nuevo explícito ("cámbialo para las 8"): se conserva el
@@ -1757,7 +1928,7 @@ class TrainingHandler implements HandlerInterface
         }
 
         $timezone = $this->timezoneResolver->resolve($contact);
-        $day = self::WEEKDAY_INT_TO_STRING[\Carbon\CarbonImmutable::now($timezone)->dayOfWeek];
+        $day = self::WEEKDAY_INT_TO_STRING[CarbonImmutable::now($timezone)->dayOfWeek];
 
         $resolution = $this->reminderTimeResolver->resolve($day, self::PROACTIVE_OFFER_TIME, true, $timezone, now());
 
@@ -1809,14 +1980,14 @@ class TrainingHandler implements HandlerInterface
      * vuelve a decidir la fecha, solo la describe. Cuando `$day` SÍ vino
      * explícito, delega sin cambios a `describeDay()`.
      */
-    private function resolvedDayLabel(?string $day, bool $recurring, \Carbon\CarbonInterface $fireAt, string $timezone): string
+    private function resolvedDayLabel(?string $day, bool $recurring, CarbonInterface $fireAt, string $timezone): string
     {
         if ($day !== null) {
             return $this->describeDay($day, $recurring);
         }
 
-        $fireAtLocal = \Carbon\CarbonImmutable::instance($fireAt)->setTimezone($timezone);
-        $nowLocal = \Carbon\CarbonImmutable::now($timezone);
+        $fireAtLocal = CarbonImmutable::instance($fireAt)->setTimezone($timezone);
+        $nowLocal = CarbonImmutable::now($timezone);
 
         return $fireAtLocal->isSameDay($nowLocal) ? 'hoy' : 'mañana';
     }

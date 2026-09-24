@@ -17,6 +17,7 @@ use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
@@ -40,9 +41,10 @@ function varietyTrainingEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 

@@ -11,11 +11,14 @@ use App\Models\WorkoutSession;
 use App\Training\Enums\BodyRegion;
 use App\Training\Enums\HistoryExerciseOutcome;
 use App\Training\Enums\RestrictionStatus;
-use App\Training\Enums\TrackingType;
+use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
+use App\Training\Support\HistoryAggregates;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
+use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -24,7 +27,7 @@ use Illuminate\Support\Facades\DB;
  */
 function historyProvider(): TrainingHistoryContextProvider
 {
-    return new TrainingHistoryContextProvider(new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
+    return new TrainingHistoryContextProvider(new SafetyRestrictionResolver(new BodyRegionCanonicalMapper), new TrainingPreferenceResolver);
 }
 
 /**
@@ -32,7 +35,7 @@ function historyProvider(): TrainingHistoryContextProvider
  *
  * @param  array<int, array{reps?: ?int, load?: ?float, duration?: ?int}>  $sets
  */
-function performedExercise(WorkoutSession $session, Exercise $exercise, array $sets, ?int $rpe = null, ?string $note = null, ?\Carbon\CarbonInterface $loggedAt = null): WorkoutExercise
+function performedExercise(WorkoutSession $session, Exercise $exercise, array $sets, ?int $rpe = null, ?string $note = null, ?CarbonInterface $loggedAt = null): WorkoutExercise
 {
     $we = WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id,
@@ -344,7 +347,7 @@ it('20: the exercise name always comes from exercise_snapshot, never the live Ex
 
 it('21: a session created before Block 3 (no prescription_context_snapshot) leaves decidedFocus/goal null, never invented', function () {
     $contact = Contact::factory()->create();
-    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'goal' => \App\Training\Enums\TrainingGoal::BuildMuscle]);
+    TrainingProfile::factory()->create(['contact_id' => $contact->id, 'goal' => TrainingGoal::BuildMuscle]);
     $session = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'prescription_context_snapshot' => null]);
     performedExercise($session, Exercise::factory()->create(), [['reps' => 10, 'load' => 20]]);
 
@@ -547,7 +550,7 @@ it('34: daysSinceLastCompletedSession measures from the most recent completed se
 // ── 35: sin porcentaje de adherencia ──
 
 it('35: HistoryAggregates never exposes an adherence percentage field', function () {
-    $reflection = new ReflectionClass(\App\Training\Support\HistoryAggregates::class);
+    $reflection = new ReflectionClass(HistoryAggregates::class);
     $propertyNames = array_map(fn ($p) => $p->getName(), $reflection->getProperties());
 
     foreach ($propertyNames as $name) {

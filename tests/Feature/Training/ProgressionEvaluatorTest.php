@@ -17,7 +17,10 @@ use App\Training\Enums\TrackingType;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
+use App\Training\Support\TrainingHistoryContext;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
+use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -27,7 +30,7 @@ use Illuminate\Support\Facades\DB;
  */
 function historyProviderForProgression(): TrainingHistoryContextProvider
 {
-    return new TrainingHistoryContextProvider(new SafetyRestrictionResolver(new BodyRegionCanonicalMapper));
+    return new TrainingHistoryContextProvider(new SafetyRestrictionResolver(new BodyRegionCanonicalMapper), new TrainingPreferenceResolver);
 }
 
 function progressionEvaluator(): ProgressionEvaluator
@@ -50,7 +53,7 @@ function pExecution(
     ?int $prescribedReps = 10,
     ?int $prescribedSets = null,
     ?float $prescribedLoad = null,
-    ?\Carbon\CarbonInterface $loggedAt = null,
+    ?CarbonInterface $loggedAt = null,
 ): WorkoutExercise {
     $we = WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id,
@@ -105,7 +108,7 @@ function pSession(Contact $contact, int $daysAgo): WorkoutSession
     ]);
 }
 
-function buildProgressionContext(Contact $contact): \App\Training\Support\TrainingHistoryContext
+function buildProgressionContext(Contact $contact): TrainingHistoryContext
 {
     return historyProviderForProgression()->build($contact->fresh());
 }

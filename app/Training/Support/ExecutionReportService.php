@@ -84,25 +84,25 @@ class ExecutionReportService
     ];
 
     /**
-     * @param array<int, array{name: string}> $reportableExercises exercises
-     *        still unreported in the active session — the LLM may only name
-     *        one of these; anything else is treated as unresolved.
+     * @param  array<int, array{name: string}>  $reportableExercises  exercises
+     *                                                                still unreported in the active session — the LLM may only name
+     *                                                                one of these; anything else is treated as unresolved.
      * @param  ?string  $frontExerciseName  Corrección post-incidente de
-     *         staging (#33, hito R1/R2/R3) — el nombre del `WorkoutExercise`
-     *         que el CONTEXTO DE EJECUCIÓN (`TrainingHandler`, vía
-     *         `WorkoutSession::frontExercise()`) ya determinó como "lo que
-     *         se le acaba de mostrar al usuario ahora mismo" — ÚNICA fuente
-     *         de esa identidad, nunca `$reportableExercises[0]`. `null`
-     *         cuando el frente actual NO requiere reporte (es Preparation/
-     *         Cooldown, o no hay sesión activa) — en ese caso, un mensaje
-     *         sin nombre explícito NUNCA se asume como reporte de ningún
-     *         ejercicio (ver `buildPrompt()`); este servicio NUNCA decide
-     *         por su cuenta cuál `WorkoutExercise` es el reportado.
+     *                                      staging (#33, hito R1/R2/R3) — el nombre del `WorkoutExercise`
+     *                                      que el CONTEXTO DE EJECUCIÓN (`TrainingHandler`, vía
+     *                                      `WorkoutSession::frontExercise()`) ya determinó como "lo que
+     *                                      se le acaba de mostrar al usuario ahora mismo" — ÚNICA fuente
+     *                                      de esa identidad, nunca `$reportableExercises[0]`. `null`
+     *                                      cuando el frente actual NO requiere reporte (es Preparation/
+     *                                      Cooldown, o no hay sesión activa) — en ese caso, un mensaje
+     *                                      sin nombre explícito NUNCA se asume como reporte de ningún
+     *                                      ejercicio (ver `buildPrompt()`); este servicio NUNCA decide
+     *                                      por su cuenta cuál `WorkoutExercise` es el reportado.
      * @param  ?CoachContext  $coachContext  Bloque 9 (D052) — cuando se
-     *         provee, el mismo prompt/llamada también clasifica
-     *         interrupciones conversacionales y responde las de dominio
-     *         entrenamiento, grounded en estos hechos. `null` preserva el
-     *         comportamiento exacto de antes del Bloque 9.
+     *                                       provee, el mismo prompt/llamada también clasifica
+     *                                       interrupciones conversacionales y responde las de dominio
+     *                                       entrenamiento, grounded en estos hechos. `null` preserva el
+     *                                       comportamiento exacto de antes del Bloque 9.
      * @return array{reports: array<int, array{
      *     exercise_name: ?string, not_performed: bool, skip_reason: ?string,
      *     sets: array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>,
@@ -187,6 +187,7 @@ Reglas del reporte:
 - Puedes incluir más de un elemento en "reports" si el mensaje cubre varios ejercicios.
 - IMPORTANTE: una confirmación breve sin ningún detalle (ej. "hecho", "listo", "ya", "terminado", "list") SIGUE siendo un reporte real, no un mensaje vacío — genera UN elemento en "reports" para ese caso, con "exercise_name": null (deja que el sistema determine a cuál ejercicio se refiere), "not_performed": false, "sets": [], y todo lo demás null. NUNCA devuelvas "reports": [] para una confirmación de este tipo.
 - Si el mensaje genuinamente no tiene ninguna relación con el entrenamiento (ej. cambia de tema por completo), "reports" debe ser [].
+- CRÍTICO (Hito B3): "no me gusta(n) X"/"no soy fan de X"/"prefiero no hacer X" en TÉRMINOS GENERALES (sin decir que no lo hizo AHORA) NUNCA es un reporte de que no realizó el ejercicio actual — es una declaración de preferencia a futuro, un dominio distinto que el sistema procesa por su cuenta. Genera un reporte para esa frase SOLO si el usuario ADEMÁS indica explícitamente que no lo hizo esta vez (ej. "no me gustan las sentadillas, no las hice hoy").
 - CRÍTICO: "listo", "hecho", "ya está" o expresiones equivalentes referidas al ejercicio que se le acaba de mostrar (ver más arriba) NUNCA significan por sí solas que el usuario terminó TODA la sesión — son un reporte de ESE ejercicio, "session_finished" debe quedar en false. Marca "session_finished" en true ÚNICAMENTE cuando el usuario comunique de forma inequívoca que terminó todos los ejercicios o toda la sesión (ver ejemplos arriba) — nunca lo infieras de una confirmación corta de un solo ejercicio.
 
 Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej. un reporte real Y una pregunta de membresía juntos):

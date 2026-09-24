@@ -16,6 +16,7 @@ use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Facades\Http;
 
 /**
@@ -81,9 +82,10 @@ it('propagates an unrecognized YMove equipment value all the way to a real ineli
     $engine = new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 
     $session = $engine->decideNextSession($contact->fresh());

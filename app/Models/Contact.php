@@ -2,6 +2,9 @@
 
 namespace App\Models;
 
+use App\Acquisition\Models\ContactAcquisition;
+use App\Referrals\Models\Referral;
+use App\Referrals\Models\ReferralCode;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -77,6 +80,16 @@ class Contact extends Model
     }
 
     /**
+     * Hito B3 (Preferencias persistentes) — dominio SEPARADO de
+     * `trainingRestrictions()` (Safety, revisión humana obligatoria). Ver
+     * App\Models\TrainingPreference.
+     */
+    public function trainingPreferences(): HasMany
+    {
+        return $this->hasMany(TrainingPreference::class);
+    }
+
+    /**
      * Hito 10 — dominio Reminder. Mismo criterio que el resto: Contact sigue
      * siendo la única identidad, estas relaciones exponen datos que
      * pertenecen a Reminder, no a Core ni a Training en sí.
@@ -108,7 +121,7 @@ class Contact extends Model
      */
     public function referralCode(): HasOne
     {
-        return $this->hasOne(\App\Referrals\Models\ReferralCode::class);
+        return $this->hasOne(ReferralCode::class);
     }
 
     /**
@@ -117,7 +130,7 @@ class Contact extends Model
      */
     public function referredBy(): HasOne
     {
-        return $this->hasOne(\App\Referrals\Models\Referral::class, 'referred_contact_id');
+        return $this->hasOne(Referral::class, 'referred_contact_id');
     }
 
     /**
@@ -126,7 +139,7 @@ class Contact extends Model
      */
     public function referralsMade(): HasMany
     {
-        return $this->hasMany(\App\Referrals\Models\Referral::class, 'referrer_contact_id');
+        return $this->hasMany(Referral::class, 'referrer_contact_id');
     }
 
     /**
@@ -138,7 +151,7 @@ class Contact extends Model
      */
     public function acquisition(): HasOne
     {
-        return $this->hasOne(\App\Acquisition\Models\ContactAcquisition::class);
+        return $this->hasOne(ContactAcquisition::class);
     }
 
     /**

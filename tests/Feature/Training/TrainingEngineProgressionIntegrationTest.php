@@ -9,13 +9,17 @@ use App\Models\TrainingProfile;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
 use App\Training\Engine\TrainingEngine;
+use App\Training\Enums\ProgressionDecision;
 use App\Training\Enums\SplitType;
+use App\Training\Enums\TrackingType;
+use App\Training\Enums\TrainingGoal;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -41,7 +45,7 @@ function readyContactForProgressionIntegration(array $profileOverrides = []): Co
         // menor que antes. Fijar general_fitness (3 ejercicios con el
         // default de 30 min del Tenant) restaura la determinismo que estos
         // tests ya asumían implícitamente.
-        'goal' => \App\Training\Enums\TrainingGoal::GeneralFitness,
+        'goal' => TrainingGoal::GeneralFitness,
     ], $profileOverrides));
 
     TrainingAccess::factory()->create(['contact_id' => $contact->id]);
@@ -56,9 +60,10 @@ function progressionIntegrationEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 
@@ -66,7 +71,7 @@ function progressionIntegrationEngine(): TrainingEngine
 
 it('1: no history yields the existing GOAL_DEFAULTS initial prescription (insufficient_data)', function () {
     // goal fijado explícitamente: GOAL_DEFAULTS varía sets/reps por objetivo.
-    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     Exercise::factory()->create(['muscle_group' => 'chest']);
 
     $session = progressionIntegrationEngine()->decideNextSession($contact);
@@ -158,9 +163,9 @@ it('4: reduce does not invent a decrement — it holds the current value, exactl
     ExerciseSet::factory()->create(['exercise_log_id' => $log->id, 'actual_reps' => 10, 'actual_load' => 30]);
 
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
-    $context = (new TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
-    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, \App\Training\Enums\TrackingType::RepsAndLoad);
-    expect($evaluation->decision)->toBe(\App\Training\Enums\ProgressionDecision::Reduce);
+    $context = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
+    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, TrackingType::RepsAndLoad);
+    expect($evaluation->decision)->toBe(ProgressionDecision::Reduce);
 
     $session = progressionIntegrationEngine()->decideNextSession($contact);
     $we = $session->workoutExercises->firstWhere('exercise_id', $exercise->id);
@@ -245,7 +250,7 @@ it('7: reps below the historical prescription block progress, even with rising l
 it('8: a single execution with no usable signal yields insufficient_data, never a fabricated progression', function () {
     // goal fijado explícitamente: GOAL_DEFAULTS varía reps por objetivo, y
     // esta aserción depende del valor exacto de general_fitness.
-    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     $exercise = Exercise::factory()->create(['muscle_group' => 'chest']);
 
     $session1 = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
@@ -270,18 +275,18 @@ it('9: a single generation builds TrainingHistoryContext exactly once, regardles
     // goal fijado — 3 candidatos en el catálogo, la aserción de abajo
     // (toHaveCount(3)) requiere que la duración objetivo dinámica compute
     // exactamente 3 para no depender del goal aleatorio del factory.
-    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     Exercise::factory()->create(['muscle_group' => 'chest']);
     Exercise::factory()->create(['muscle_group' => 'legs']);
     Exercise::factory()->create(['muscle_group' => 'back']);
 
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
-    $realContext = (new TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
+    $realContext = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
 
     $spyProvider = Mockery::mock(TrainingHistoryContextProvider::class);
     $spyProvider->shouldReceive('build')->once()->andReturn($realContext);
 
-    $engine = new TrainingEngine(new TrainingAccessGate, $safetyResolver, $spyProvider, new ProgressionEvaluator, new DurationEstimator);
+    $engine = new TrainingEngine(new TrainingAccessGate, $safetyResolver, $spyProvider, new ProgressionEvaluator, new DurationEstimator, new TrainingPreferenceResolver);
     $session = $engine->decideNextSession($contact->fresh());
 
     expect($session->workoutExercises)->toHaveCount(3);
@@ -311,7 +316,7 @@ it('10: query count is unaffected by how much history each prescribed exercise h
     // por tanto cuántas queries de INSERT/progresión se ejecutan — sin que
     // eso tenga nada que ver con lo que este test realmente compara
     // (profundidad de historial, no cantidad de ejercicios).
-    $contactA = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contactA = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     $keepIdsA = [];
     foreach (['chest', 'legs', 'back'] as $muscleGroup) {
         $exercise = Exercise::factory()->create(['muscle_group' => $muscleGroup]);
@@ -342,7 +347,7 @@ it('10: query count is unaffected by how much history each prescribed exercise h
     // única variable real es la cantidad de historial.
     Exercise::query()->update(['is_active' => false]);
 
-    $contactB = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contactB = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     $chest = Exercise::factory()->create(['muscle_group' => 'chest']);
     $legs = Exercise::factory()->create(['muscle_group' => 'legs']);
     $back = Exercise::factory()->create(['muscle_group' => 'back']);
@@ -407,12 +412,12 @@ it('12: the direction computed by ProgressionEvaluator is unaffected by how Trai
     ExerciseSet::factory()->create(['exercise_log_id' => $log->id, 'actual_reps' => 10, 'actual_load' => 35]);
 
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
-    $context = (new TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
-    $directEvaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, \App\Training\Enums\TrackingType::RepsAndLoad);
+    $context = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
+    $directEvaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, TrackingType::RepsAndLoad);
 
     progressionIntegrationEngine()->decideNextSession($contact);
 
-    expect($directEvaluation->decision)->toBe(\App\Training\Enums\ProgressionDecision::Progress);
+    expect($directEvaluation->decision)->toBe(ProgressionDecision::Progress);
 });
 
 // ── 16: snapshots nuevos siguen siendo correctos ──
@@ -477,7 +482,7 @@ it('19: two contacts with identical history produce identical numeric prescripti
         // candidatos de la primera y romper la comparación 1:1.
         Exercise::query()->update(['is_active' => false]);
 
-        $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+        $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
         $exercise = Exercise::factory()->create(['muscle_group' => 'chest']);
 
         $older = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDays(2)]);
@@ -529,7 +534,7 @@ it('20/21: the numeric prescription method never references AI or WhatsApp', fun
 // (mostRecentEntryFor() debe usar la MISMA E que ProgressionEvaluator, D050)
 
 it('22: a Skipped execution more recent than the last Performed one is never the carry-forward source', function () {
-    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     $exercise = Exercise::factory()->create(['muscle_group' => 'chest']);
 
     $performedSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id, 'scheduled_at' => now()->subDays(2)]);
@@ -552,8 +557,8 @@ it('22: a Skipped execution more recent than the last Performed one is never the
     // Sin ExerciseSet -> outcome Skipped (log existe, cero sets).
 
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
-    $context = (new TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
-    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, \App\Training\Enums\TrackingType::RepsAndLoad);
+    $context = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
+    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, TrackingType::RepsAndLoad);
 
     // (1) El evaluator usa E = el Performed, no el Skipped más reciente.
     expect($evaluation->metrics->executionsConsidered)->toBe(1);
@@ -572,7 +577,7 @@ it('22: a Skipped execution more recent than the last Performed one is never the
 });
 
 it('23: when only a Skipped execution exists (no Performed at all), insufficient_data still yields GOAL_DEFAULTS, never the Skipped prescription', function () {
-    $contact = readyContactForProgressionIntegration(['goal' => \App\Training\Enums\TrainingGoal::GeneralFitness]);
+    $contact = readyContactForProgressionIntegration(['goal' => TrainingGoal::GeneralFitness]);
     $exercise = Exercise::factory()->create(['muscle_group' => 'chest']);
 
     $skippedSession = WorkoutSession::factory()->completed()->create(['contact_id' => $contact->id]);
@@ -583,11 +588,11 @@ it('23: when only a Skipped execution exists (no Performed at all), insufficient
     ExerciseLog::factory()->create(['workout_exercise_id' => $skippedWe->id, 'skip_reason' => 'no_time']);
 
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
-    $context = (new TrainingHistoryContextProvider($safetyResolver))->build($contact->fresh());
-    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, \App\Training\Enums\TrackingType::RepsAndLoad);
+    $context = (new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver))->build($contact->fresh());
+    $evaluation = (new ProgressionEvaluator)->evaluate($context, $exercise->id, TrackingType::RepsAndLoad);
 
     // (5) Sin ningún Performed: insufficient_data, nunca se usa el Skipped.
-    expect($evaluation->decision)->toBe(\App\Training\Enums\ProgressionDecision::InsufficientData);
+    expect($evaluation->decision)->toBe(ProgressionDecision::InsufficientData);
     expect($evaluation->reasonCodes)->toContain('no_history');
 
     $session = progressionIntegrationEngine()->decideNextSession($contact);

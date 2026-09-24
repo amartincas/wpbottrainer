@@ -6,8 +6,10 @@ use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\ExperienceLevel;
+use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingGoal;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DurationEstimator;
 use App\Training\Support\ProgressionEvaluator;
@@ -15,6 +17,7 @@ use App\Training\Support\RequestedFocusGroup;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Facades\Log;
 
 // Hito B1 (Requested Focus) — helpers propios de este archivo (prefijo
@@ -44,9 +47,10 @@ function rfEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 
@@ -61,7 +65,7 @@ function rfExercises(string $muscle, int $count, array $overrides = []): void
     for ($i = 0; $i < $count; $i++) {
         Exercise::factory()->create(array_merge([
             'muscle_group' => 'core', // deliberadamente fuera del vocabulario grueso usado por defaultFocus() para full_body, irrelevante a los tests de este archivo salvo que se pida explícitamente
-            'primary_muscle' => \App\Training\Enums\MuscleFocus::from($muscle),
+            'primary_muscle' => MuscleFocus::from($muscle),
             'difficulty_level' => 'beginner',
             'equipment_needed' => [],
         ], $overrides));
@@ -134,14 +138,14 @@ it('19-21: an exercise relevant to two groups never occupies two reserved slots,
     // colisión, cuando el catálogo realmente alcanza para ambos).
     $exerciseB = Exercise::factory()->create([
         'muscle_group' => 'core',
-        'primary_muscle' => \App\Training\Enums\MuscleFocus::Back,
+        'primary_muscle' => MuscleFocus::Back,
         'difficulty_level' => 'beginner',
         'equipment_needed' => [],
     ]);
     // A: primary=chest, secondary=back -> relevante para AMBOS grupos.
     $exerciseA = Exercise::factory()->create([
         'muscle_group' => 'core',
-        'primary_muscle' => \App\Training\Enums\MuscleFocus::Chest,
+        'primary_muscle' => MuscleFocus::Chest,
         'secondary_muscles' => ['back'],
         'difficulty_level' => 'beginner',
         'equipment_needed' => [],
@@ -249,7 +253,7 @@ it('25: a group with candidates excluded entirely by equipment eligibility -> un
     // El catálogo SÍ tiene "shoulders", pero exige equipo que el perfil no declara.
     Exercise::factory()->create([
         'muscle_group' => 'core',
-        'primary_muscle' => \App\Training\Enums\MuscleFocus::Shoulders,
+        'primary_muscle' => MuscleFocus::Shoulders,
         'difficulty_level' => 'beginner',
         'equipment_needed' => ['barbell'],
     ]);
@@ -288,7 +292,7 @@ it('26: requested focus never blocks WorkoutSession creation, even when every re
     $session = rfEngine()->decideNextSession($contact->fresh(), $groups);
 
     expect($session)->not->toBeNull();
-    expect($session->workoutExercises->where('phase', \App\Training\Enums\WorkoutExercisePhase::Main))->toHaveCount(1);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Main))->toHaveCount(1);
 
     foreach (['biceps', 'triceps'] as $key) {
         expect(coverageByKey($session->prescription_context_snapshot, $key)['status'])->toBe('unavailable');
@@ -298,7 +302,7 @@ it('26: requested focus never blocks WorkoutSession creation, even when every re
 it('27: requested focus never relaxes isEligible() — the equipment-blocked exercise from test 25 never appears in the session', function () {
     $blocked = Exercise::factory()->create([
         'muscle_group' => 'core',
-        'primary_muscle' => \App\Training\Enums\MuscleFocus::Shoulders,
+        'primary_muscle' => MuscleFocus::Shoulders,
         'difficulty_level' => 'beginner',
         'equipment_needed' => ['barbell'],
     ]);
@@ -338,7 +342,7 @@ it('28-30: more groups than exercises -> no fictitious slots, unfunded groups ma
     expect($snapshot['requested_focus_coverage'][2]['reason'])->toBe('session_too_short');
 
     // Nunca un slot ficticio: exactamente N ejercicios de Main, nunca N+1.
-    expect($session->workoutExercises->where('phase', \App\Training\Enums\WorkoutExercisePhase::Main))->toHaveCount(2);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Main))->toHaveCount(2);
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -373,7 +377,7 @@ it('32: requestedFocus present triggers group-based selection, not the flat prim
     $groups = [new RequestedFocusGroup('biceps', ['biceps'])];
     $session = rfEngine()->decideNextSession($contact->fresh(), $groups);
 
-    expect($session->workoutExercises->where('phase', \App\Training\Enums\WorkoutExercisePhase::Main))->toHaveCount(2);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Main))->toHaveCount(2);
     expect(coverageByKey($session->prescription_context_snapshot, 'biceps')['status'])->toBe('fulfilled');
 });
 
@@ -448,5 +452,5 @@ it('38: once the requested groups are exhausted, the free pool falls back to the
     $session = rfEngine()->decideNextSession($contact->fresh(), $groups);
 
     expect($session->workoutExercises->pluck('exercise_id'))->toContain($generalFallback->id);
-    expect($session->workoutExercises->where('phase', \App\Training\Enums\WorkoutExercisePhase::Main))->toHaveCount(2);
+    expect($session->workoutExercises->where('phase', WorkoutExercisePhase::Main))->toHaveCount(2);
 });

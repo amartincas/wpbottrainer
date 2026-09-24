@@ -6,6 +6,7 @@ use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
 use App\Models\WorkoutExercise;
 use App\Models\WorkoutSession;
+use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\ExperienceLevel;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\SplitType;
@@ -18,7 +19,7 @@ use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
-use App\Training\Engine\TrainingEngine;
+use App\Training\Support\TrainingPreferenceResolver;
 
 /**
  * Hito B2 — casos 11/12 del diseño aprobado: `Superseded` SÍ participa en
@@ -50,9 +51,10 @@ function sfEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 

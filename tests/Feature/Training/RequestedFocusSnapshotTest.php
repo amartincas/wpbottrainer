@@ -16,6 +16,7 @@ use App\Training\Support\RequestedFocusGroup;
 use App\Training\Support\SafetyRestrictionResolver;
 use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 
 // Hito B1 (Requested Focus) — mismo criterio de PrescriptionContextSnapshotTest.php
 // (nombres de helper propios, prefijo "rfSnap", para evitar colisión).
@@ -43,9 +44,10 @@ function rfSnapEngine(): TrainingEngine
     return new TrainingEngine(
         new TrainingAccessGate,
         $safetyResolver,
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
         new DurationEstimator,
+        new TrainingPreferenceResolver,
     );
 }
 

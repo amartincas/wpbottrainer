@@ -28,6 +28,7 @@ use App\Training\Support\TrainingAccessGate;
 use App\Training\Support\TrainingCatalogInsufficientException;
 use App\Training\Support\TrainingHistoryContext;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPreferenceResolver;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -184,6 +185,7 @@ class TrainingEngine
         private readonly TrainingHistoryContextProvider $historyProvider,
         private readonly ProgressionEvaluator $progressionEvaluator,
         private readonly DurationEstimator $durationEstimator,
+        private readonly TrainingPreferenceResolver $preferenceResolver,
     ) {}
 
     /**
@@ -191,22 +193,23 @@ class TrainingEngine
      * sesión pendiente (status=scheduled), la devuelve sin cambios —
      * idempotente para "qué toca hoy".
      *
-     * @throws TrainingAccessDeniedException si el Gate bloquea el acceso
-     *         (sin acceso comercial vigente, o perfil marcado por seguridad).
-     * @throws TrainingCatalogInsufficientException si el catálogo elegible
-     *         no produce ni un solo ejercicio de bloque principal (Main) —
-     *         ninguna WorkoutSession se crea en ese caso.
      *
      * @param  ?array<int, RequestedFocusGroup>  $requestedFocus  Hito B1
-     *         (Requested Focus) — petición PUNTUAL de esta sesión (ej.
-     *         "pecho y piernas"), ya normalizada por
-     *         `RequestedFocusTermMapper` — nunca texto libre, nunca decidida
-     *         por el LLM. `null` (default) preserva EXACTAMENTE el
-     *         comportamiento anterior a este hito: ningún caller existente
-     *         necesita cambiar. Nunca modifica
-     *         `TrainingProfile.primary_focus`/`secondary_focus`/`next_focus`
-     *         — ver `$autonomousFocus` más abajo, que sigue siendo la única
-     *         fuente de `next_focus`.
+     *                                                            (Requested Focus) — petición PUNTUAL de esta sesión (ej.
+     *                                                            "pecho y piernas"), ya normalizada por
+     *                                                            `RequestedFocusTermMapper` — nunca texto libre, nunca decidida
+     *                                                            por el LLM. `null` (default) preserva EXACTAMENTE el
+     *                                                            comportamiento anterior a este hito: ningún caller existente
+     *                                                            necesita cambiar. Nunca modifica
+     *                                                            `TrainingProfile.primary_focus`/`secondary_focus`/`next_focus`
+     *                                                            — ver `$autonomousFocus` más abajo, que sigue siendo la única
+     *                                                            fuente de `next_focus`.
+     *
+     * @throws TrainingAccessDeniedException si el Gate bloquea el acceso
+     *                                       (sin acceso comercial vigente, o perfil marcado por seguridad).
+     * @throws TrainingCatalogInsufficientException si el catálogo elegible
+     *                                              no produce ni un solo ejercicio de bloque principal (Main) —
+     *                                              ninguna WorkoutSession se crea en ese caso.
      */
     public function decideNextSession(Contact $contact, ?array $requestedFocus = null): WorkoutSession
     {
@@ -286,8 +289,25 @@ class TrainingEngine
         $activePool = Exercise::query()->where('is_active', true)->get();
 
         // `isEligible()` no depende de la fase — mismo filtro de seguridad/
-        // equipo para R1/R2/R3, sin excepción.
+        // equipo para R1/R2/R3, sin excepción. NUNCA se modifica para
+        // incorporar Preference (Hito B3, Regla 13 del diseño aprobado) —
+        // el filtro de preferencia es un paso SEPARADO, aplicado a
+        // continuación.
         $eligiblePool = $activePool->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+
+        // Hito B3 (Preferencias persistentes, diseño v3 FINAL) — paso 3 del
+        // pipeline (Safety -> Eligibility -> Preference -> Focus -> ...):
+        // reduce el pool AÚN MÁS, después de Safety/Equipment y antes de
+        // cualquier lógica de foco/tiers. `$eligiblePool` (solo Safety+
+        // Equipment) se conserva sin tocar para el diagnóstico de 3 vías de
+        // `requestedFocusCoverage()` (catalog / safety_or_equipment /
+        // preference) — la selección real siempre usa
+        // `$preferenceFilteredPool`.
+        $excludedByPreference = $this->preferenceResolver->excludedIdentifiersFor($contact);
+        $preferenceFilteredPool = $eligiblePool->reject(
+            fn (Exercise $exercise) => $this->isExcludedByPreference($exercise, $excludedByPreference)
+        );
+        $appliedPreferences = $this->computeAppliedPreferences($excludedByPreference, $eligiblePool);
 
         [$targetPrepCount, $targetCooldownCount, $maxSupportSlots, $mainBudgetMinutes] = $this->planSupportBudget($contact->tenant);
 
@@ -300,11 +320,11 @@ class TrainingEngine
         // único primaryTier plano — ver docblock de
         // selectExercisesForRequestedFocus()).
         if ($requestedFocus === null) {
-            $mainExercises = $this->selectExercises($profile, $autonomousFocus, $recentSessions, $contact, $eligiblePool, $mainBudgetMinutes);
+            $mainExercises = $this->selectExercises($profile, $autonomousFocus, $recentSessions, $contact, $preferenceFilteredPool, $mainBudgetMinutes);
             $requestedFocusCoverage = [];
         } else {
             [$mainExercises, $requestedFocusCoverage] = $this->selectExercisesForRequestedFocus(
-                $profile, $requestedFocus, $autonomousFocus, $recentSessions, $contact, $eligiblePool, $activePool, $mainBudgetMinutes,
+                $profile, $requestedFocus, $autonomousFocus, $recentSessions, $contact, $preferenceFilteredPool, $eligiblePool, $activePool, $mainBudgetMinutes,
             );
         }
 
@@ -318,9 +338,12 @@ class TrainingEngine
         $usedIds = $mainExercises->pluck('id');
 
         // Preparación: hasta targetPrepCount, acotado por maxSupportSlots.
+        // Hito B3 — usa el pool YA reducido por preferencia (mismo criterio
+        // que R1): una preferencia declarada excluye también de Preparation/
+        // Cooldown, nunca solo de Main.
         $prepExercises = $this->selectPreparationExercises(
             $profile, $recentSessions, min($targetPrepCount, $maxSupportSlots),
-            $eligiblePool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
+            $preferenceFilteredPool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
         );
         $usedIds = $usedIds->merge($prepExercises->pluck('id'));
 
@@ -332,7 +355,7 @@ class TrainingEngine
         $remainingSlots = max(0, $maxSupportSlots - $prepExercises->count());
         $cooldownExercises = $this->selectCooldownExercises(
             $profile, $recentSessions, min($targetCooldownCount, $remainingSlots),
-            $eligiblePool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
+            $preferenceFilteredPool->reject(fn (Exercise $exercise) => $usedIds->contains($exercise->id)),
         );
 
         // Bloque 8 (D051): el contexto histórico se construye UNA sola vez
@@ -372,6 +395,7 @@ class TrainingEngine
                     ? array_map(fn (RequestedFocusGroup $group) => ['key' => $group->key, 'muscles' => $group->muscles], $requestedFocus)
                     : [],
                 $requestedFocusCoverage,
+                $appliedPreferences,
             ),
         ]);
 
@@ -695,8 +719,8 @@ class TrainingEngine
      *    informativo) sin que eso relaje la reserva por slots del paso 4.
      *
      * @param  array<int, RequestedFocusGroup>  $requestedFocus  Orden
-     *         original preservado — usado para la salida (trazabilidad),
-     *         nunca para decidir prioridad de slots (eso es `key` ASC).
+     *                                                           original preservado — usado para la salida (trazabilidad),
+     *                                                           nunca para decidir prioridad de slots (eso es `key` ASC).
      * @return array{0: Collection<int, Exercise>, 1: array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>}
      */
     private function selectExercisesForRequestedFocus(
@@ -706,6 +730,7 @@ class TrainingEngine
         Collection $recentSessions,
         Contact $contact,
         Collection $eligiblePool,
+        Collection $safetyEligiblePool,
         Collection $activePool,
         float $targetMinutes,
     ): array {
@@ -716,13 +741,23 @@ class TrainingEngine
         // (diseño aprobado, Sección 2/8).
         $orderedByKey = collect($requestedFocus)->sortBy(fn (RequestedFocusGroup $group) => $group->key)->values();
 
-        // Paso 1: candidatos relevantes por grupo, ya ordenados.
+        // Paso 1: candidatos relevantes por grupo, ya ordenados. `$eligiblePool`
+        // aquí YA viene reducido por Preference (Hito B3) — la reserva de
+        // slots real nunca considera un candidato que el usuario declaró no
+        // querer. `$safetyEligiblePool` (Hito B3, anterior a Preference) se
+        // usa EXCLUSIVAMENTE para el diagnóstico de 3 vías más abajo, nunca
+        // para reservar slots.
         $candidatesByKey = [];
+        $safetyCandidatesByKey = [];
         foreach ($requestedFocus as $group) {
             $relevant = $eligiblePool->filter(
                 fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
             );
             $candidatesByKey[$group->key] = $this->sortCandidates($relevant, $profile, $recentSessions);
+
+            $safetyCandidatesByKey[$group->key] = $safetyEligiblePool->filter(
+                fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
+            );
         }
 
         // Paso 2: slots teóricos.
@@ -817,7 +852,7 @@ class TrainingEngine
         }
 
         $coverage = $this->requestedFocusCoverage(
-            $requestedFocus, $theoreticalSlots, $effectiveSlots, $slotsFilled, $candidatesByKey, $selected, $activePool, $contact,
+            $requestedFocus, $theoreticalSlots, $effectiveSlots, $slotsFilled, $candidatesByKey, $safetyCandidatesByKey, $selected, $activePool, $contact,
         );
 
         return [$selected, $coverage];
@@ -846,11 +881,11 @@ class TrainingEngine
      * @param  array<string, int>  $effectiveSlots
      * @param  array<string, int>  $slotsFilled
      * @param  array<string, Collection<int, Exercise>>  $candidatesByKey  Candidatos
-     *         elegibles POR GRUPO (independiente de qué otro grupo haya
-     *         reclamado — la cuenta "cruda" de disponibilidad, usada para el
-     *         diagnóstico catalog/safety_or_equipment; NUNCA `$slotsFilled`,
-     *         que puede ser menor por una colisión de reclamo entre grupos,
-     *         algo que no tiene nada que ver con catálogo ni con Safety).
+     *                                                                     elegibles POR GRUPO (independiente de qué otro grupo haya
+     *                                                                     reclamado — la cuenta "cruda" de disponibilidad, usada para el
+     *                                                                     diagnóstico catalog/safety_or_equipment; NUNCA `$slotsFilled`,
+     *                                                                     que puede ser menor por una colisión de reclamo entre grupos,
+     *                                                                     algo que no tiene nada que ver con catálogo ni con Safety).
      * @param  Collection<int, Exercise>  $selected
      * @return array<int, array{key: string, slots_reserved: int, slots_filled: int, coverage: int, status: string, reason: ?string}>
      */
@@ -860,6 +895,7 @@ class TrainingEngine
         array $effectiveSlots,
         array $slotsFilled,
         array $candidatesByKey,
+        array $safetyCandidatesByKey,
         Collection $selected,
         Collection $activePool,
         Contact $contact,
@@ -871,6 +907,7 @@ class TrainingEngine
             $reserved = $effectiveSlots[$group->key];
             $filled = $slotsFilled[$group->key];
             $eligibleCount = $candidatesByKey[$group->key]->count();
+            $safetyEligibleCount = $safetyCandidatesByKey[$group->key]->count();
 
             $finalCoverage = $selected->filter(
                 fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
@@ -881,7 +918,7 @@ class TrainingEngine
                 $reason = 'session_too_short';
             } elseif ($filled === 0) {
                 $status = 'unavailable';
-                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $activePool);
+                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $safetyEligibleCount, $activePool);
 
                 Log::info('TRAINING_REQUESTED_FOCUS_UNAVAILABLE', [
                     'contact_id' => $contact->id,
@@ -890,7 +927,7 @@ class TrainingEngine
                 ]);
             } elseif ($filled < $theoretical) {
                 $status = 'partial';
-                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $activePool);
+                $reason = $this->requestedFocusUnavailableReason($group, $eligibleCount, $safetyEligibleCount, $activePool);
 
                 Log::info('TRAINING_REQUESTED_FOCUS_PARTIAL', [
                     'contact_id' => $contact->id,
@@ -919,20 +956,31 @@ class TrainingEngine
 
     /**
      * Hito B1 — diagnóstico `catalog` vs. `safety_or_equipment` (diseño
-     * aprobado, Sección 13): compara cuántos ejercicios ACTIVOS (antes de
-     * `isEligible()`) son relevantes para el grupo contra cuántos
-     * sobrevivieron. Si `isEligible()` excluyó alguno, la razón es
-     * `safety_or_equipment`; si el catálogo activo nunca tuvo ninguno para
-     * empezar, es `catalog`. Puramente diagnóstico — nunca cambia qué se
-     * selecciona.
+     * aprobado, Sección 13). Hito B3 (diseño v3 FINAL, Sección 5/13) —
+     * extendido a 3 vías con un nuevo valor `preference`: compara catálogo
+     * ACTIVO -> elegible por Safety+Equipment (`$safetyEligibleCount`) ->
+     * elegible tras Preference (`$eligibleCount`, el que realmente participó
+     * en la reserva de slots). Se reporta la PRIMERA capa que redujo el
+     * conteo (si Safety/Equipment ya redujo algo, se reporta
+     * `safety_or_equipment` aunque Preference también haya contribuido —
+     * simplificación deliberada, mismo criterio que el diagnóstico de 2 vías
+     * anterior). Puramente diagnóstico — nunca cambia qué se selecciona.
      */
-    private function requestedFocusUnavailableReason(RequestedFocusGroup $group, int $eligibleCount, Collection $activePool): string
+    private function requestedFocusUnavailableReason(RequestedFocusGroup $group, int $eligibleCount, int $safetyEligibleCount, Collection $activePool): string
     {
         $catalogCount = $activePool->filter(
             fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $group->muscles) !== []
         )->count();
 
-        return $catalogCount > $eligibleCount ? 'safety_or_equipment' : 'catalog';
+        if ($catalogCount > $safetyEligibleCount) {
+            return 'safety_or_equipment';
+        }
+
+        if ($safetyEligibleCount > $eligibleCount) {
+            return 'preference';
+        }
+
+        return 'catalog';
     }
 
     /**
@@ -1306,6 +1354,81 @@ class TrainingEngine
         $available = $profile->available_equipment ?? [];
 
         return array_diff($equipmentNeeded, $available) === [];
+    }
+
+    /**
+     * Hito B3 (diseño v3 FINAL, Sección E/17) — filtro de Preference,
+     * DELIBERADAMENTE separado de `isEligible()` (Regla 13 del encargo de
+     * implementación), aplicado inmediatamente después en
+     * `decideNextSession()`. `$excluded` ya viene nivelado por
+     * `TrainingPreferenceResolver` — este método nunca conoce el modelo
+     * `TrainingPreference`.
+     */
+    private function isExcludedByPreference(Exercise $exercise, array $excluded): bool
+    {
+        if (in_array($exercise->id, $excluded['exercise_ids'], true)) {
+            return true;
+        }
+
+        $equipmentNeeded = $exercise->equipment_needed ?? [];
+
+        return array_intersect($equipmentNeeded, $excluded['equipment']) !== [];
+    }
+
+    /**
+     * Hito B3 (diseño v3 FINAL, Sección G, revisión v3 punto 5) —
+     * `applied_preferences` del snapshot. Cálculo INDEPENDIENTE por cada
+     * preferencia activa, siempre contra `$eligiblePoolBeforePreference`
+     * (el pool posterior a Safety+Equipment, ANTERIOR a cualquier filtro de
+     * Preference) — nunca secuencial. Los conteos pueden solaparse
+     * intencionalmente (ej. un mismo ejercicio excluido tanto por una
+     * preferencia de Exercise como por una de Equipment cuenta en ambas
+     * entradas) — la suma de todos los conteos NO representa el total de
+     * candidatos únicos excluidos. Solo se incluyen preferencias que
+     * realmente excluyeron al menos 1 candidato en ESTA sesión
+     * (`excluded_candidates_count > 0`) — una preferencia activa sin ningún
+     * candidato que excluir aquí no aparece.
+     *
+     * @return array<int, array{dimension: string, value: string, exercise_id: ?int, excluded_candidates_count: int}>
+     */
+    private function computeAppliedPreferences(array $excluded, Collection $eligiblePoolBeforePreference): array
+    {
+        $applied = [];
+
+        foreach ($excluded['exercise_ids'] as $exerciseId) {
+            $matches = $eligiblePoolBeforePreference->filter(fn (Exercise $e) => $e->id === $exerciseId);
+
+            if ($matches->isEmpty()) {
+                continue;
+            }
+
+            $exercise = $matches->first();
+            $applied[] = [
+                'dimension' => 'exercise',
+                'value' => $exercise->name_es ?? $exercise->name,
+                'exercise_id' => $exerciseId,
+                'excluded_candidates_count' => $matches->count(),
+            ];
+        }
+
+        foreach ($excluded['equipment'] as $equipmentValue) {
+            $count = $eligiblePoolBeforePreference->filter(
+                fn (Exercise $e) => in_array($equipmentValue, $e->equipment_needed ?? [], true)
+            )->count();
+
+            if ($count === 0) {
+                continue;
+            }
+
+            $applied[] = [
+                'dimension' => 'equipment',
+                'value' => $equipmentValue,
+                'exercise_id' => null,
+                'excluded_candidates_count' => $count,
+            ];
+        }
+
+        return $applied;
     }
 
     private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, TrainingHistoryContext $historyContext, TrainingProfile $profile): WorkoutExercise

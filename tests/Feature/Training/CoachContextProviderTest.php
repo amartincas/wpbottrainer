@@ -2,6 +2,9 @@
 
 use App\Core\Messaging\ExecutionContext;
 use App\Core\Messaging\IngestedMessage;
+use App\CustomerCare\Support\CustomerServiceEscalationDetector;
+use App\CustomerCare\Support\FaqMatcher;
+use App\CustomerCare\Support\FaqRelevanceDetector;
 use App\Models\Contact;
 use App\Models\Exercise;
 use App\Models\ExerciseLog;
@@ -17,12 +20,18 @@ use App\Training\Enums\HistoryExerciseOutcome;
 use App\Training\Enums\ReminderSuggestionOrigin;
 use App\Training\Enums\ReminderSuggestionStatus;
 use App\Training\Enums\TrackingType;
+use App\Training\Enums\WorkoutExercisePhase;
 use App\Training\Enums\WorkoutSessionStatus;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\CoachFactsFormatter;
 use App\Training\Support\ProgressionEvaluator;
 use App\Training\Support\SafetyRestrictionResolver;
+use App\Training\Support\TimezoneResolver;
 use App\Training\Support\TrainingHistoryContextProvider;
+use App\Training\Support\TrainingPeriodDetector;
+use App\Training\Support\TrainingPeriodResolver;
+use App\Training\Support\TrainingPreferenceResolver;
+use App\Training\Support\TrainingSessionMetrics;
 
 /**
  * Bloque 9 (D052) — CoachContextProvider: compone CoachContext reutilizando
@@ -33,15 +42,15 @@ function coachContextProvider(): CoachContextProvider
     $safetyResolver = new SafetyRestrictionResolver(new BodyRegionCanonicalMapper);
 
     return new CoachContextProvider(
-        new TrainingHistoryContextProvider($safetyResolver),
+        new TrainingHistoryContextProvider($safetyResolver, new TrainingPreferenceResolver),
         new ProgressionEvaluator,
-        new \App\CustomerCare\Support\FaqRelevanceDetector,
-        new \App\CustomerCare\Support\CustomerServiceEscalationDetector,
-        new \App\CustomerCare\Support\FaqMatcher,
-        new \App\Training\Support\TrainingPeriodDetector,
-        new \App\Training\Support\TrainingPeriodResolver,
-        new \App\Training\Support\TrainingSessionMetrics,
-        new \App\Training\Support\TimezoneResolver,
+        new FaqRelevanceDetector,
+        new CustomerServiceEscalationDetector,
+        new FaqMatcher,
+        new TrainingPeriodDetector,
+        new TrainingPeriodResolver,
+        new TrainingSessionMetrics,
+        new TimezoneResolver,
     );
 }
 
@@ -126,7 +135,7 @@ it('Hito B2 — falls back to a Superseded session when there is no pending one,
     expect($context->currentSession->workoutSessionId)->toBe($session->id);
     expect($context->currentSession->status)->toBe(WorkoutSessionStatus::Superseded);
 
-    $facts = (new App\Training\Support\CoachFactsFormatter)->format($context);
+    $facts = (new CoachFactsFormatter)->format($context);
     expect($facts)->toContain('estado=superseded');
     expect($facts)->toContain('reemplazada a petición del usuario');
 });
@@ -158,11 +167,11 @@ it('Hito R1/R2/R3 — progressionEvaluations excludes Preparation/Cooldown exerc
     $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
     WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id, 'exercise_id' => $warmupExercise->id, 'exercise_snapshot' => $warmupExercise->toSnapshot(),
-        'order' => 1, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
+        'order' => 1, 'phase' => WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
     ]);
     WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id, 'exercise_id' => $mainExercise->id, 'exercise_snapshot' => $mainExercise->toSnapshot(),
-        'order' => 2, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Main,
+        'order' => 2, 'phase' => WorkoutExercisePhase::Main,
     ]);
 
     $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000010'))->data;
@@ -181,13 +190,13 @@ it('Hito R1/R2/R3 — historicalOutcome() drives CoachExerciseSnapshot->outcome:
     $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
     WorkoutExercise::factory()->create([
         'workout_session_id' => $session->id, 'exercise_id' => $warmupExercise->id, 'exercise_snapshot' => $warmupExercise->toSnapshot(),
-        'order' => 1, 'phase' => \App\Training\Enums\WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
+        'order' => 1, 'phase' => WorkoutExercisePhase::Preparation, 'delivered_at' => now(),
     ]);
 
     $context = coachContextProvider()->provide(executionContextFor($tenant, '5730000011'))->data;
 
     expect($context->currentSession->exercises[0]->outcome)->toBe(HistoryExerciseOutcome::Delivered);
-    expect($context->currentSession->exercises[0]->phase)->toBe(\App\Training\Enums\WorkoutExercisePhase::Preparation);
+    expect($context->currentSession->exercises[0]->phase)->toBe(WorkoutExercisePhase::Preparation);
 });
 
 it('trackingType comes from Exercise::tracking_type, never inferred from prescribedDurationSeconds (correction after Bloque 9 review)', function () {
