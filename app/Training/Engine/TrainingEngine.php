@@ -1579,12 +1579,30 @@ class TrainingEngine
             fn (Exercise $exercise) => $this->isExcludedByPreference($exercise, $excludedByPreference)
         );
 
-        // Excluye TODO exercise_id actualmente activo en la sesión
-        // (Preparation+Main+Cooldown) — incluye estructuralmente al propio
-        // $target, ver docblock arriba.
-        $activeSessionExerciseIds = $session->workoutExercises->pluck('exercise_id')->filter()->unique();
+        // Fix post-deploy (auditoría de reutilización intra-sesión, E2E
+        // real) — excluye TODO exercise_id que haya aparecido ALGUNA VEZ en
+        // esta sesión (Preparation+Main+Cooldown), esté activo o ya
+        // `superseded_by_id`. Consulta DIRECTA sobre `workout_session_id`
+        // (nunca `$session->workoutExercises`, que `WorkoutSession` filtra
+        // por diseño con `whereNull('superseded_by_id')` — correcto para
+        // frontExercise()/entrega/progresión, pero INCORRECTO aquí: usarlo
+        // dejaba que cada sustitución "liberara" el exercise_id recién
+        // superseded para la siguiente sustitución de la misma sesión,
+        // permitiendo reintroducir un ejercicio que el usuario ya había
+        // descartado). Sigue incluyendo estructuralmente al propio $target
+        // (su fila existe con este workout_session_id sin importar si ya
+        // está marcada superseded en el momento de esta llamada). Scope
+        // estrictamente por $session->id — nunca afecta a otra sesión
+        // (pasada o futura): la variedad entre sesiones sigue siendo
+        // responsabilidad exclusiva de varietyScore()/$recentSessions, sin
+        // cambios.
+        $historicalSessionExerciseIds = WorkoutExercise::query()
+            ->where('workout_session_id', $session->id)
+            ->pluck('exercise_id')
+            ->filter()
+            ->unique();
         $candidatePool = $preferenceFilteredPool->reject(
-            fn (Exercise $exercise) => $activeSessionExerciseIds->contains($exercise->id)
+            fn (Exercise $exercise) => $historicalSessionExerciseIds->contains($exercise->id)
         );
 
         $recentSessions = $contact->workoutSessions()

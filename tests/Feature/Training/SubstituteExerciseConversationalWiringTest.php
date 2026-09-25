@@ -748,3 +748,65 @@ it('HYBRID-1: "no me gusta este ejercicio, cámbiamelo" with a valid substitute_
     // Nunca una TrainingPreference nueva — B3 nunca se ejecutó para este turno.
     expect(\App\Models\TrainingPreference::where('contact_id', $contact->id)->count())->toBe(0);
 });
+
+// ============================================================
+// C-REUSE (fix post-deploy, auditoría de reutilización intra-sesión, E2E
+// real) — patrón real observado: sustituciones ENCADENADAS dentro de la
+// MISMA sesión no deben poder reintroducir un ejercicio ya superseded en
+// una sustitución anterior de esa sesión.
+// ============================================================
+
+it('C-REUSE-E2E: a second substitution never reuses an exercise superseded earlier in the same session', function () {
+    $contact = subReadyContact();
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+
+    $exerciseA = Exercise::factory()->create(['name' => 'Ejercicio A', 'name_es' => 'Ejercicio A', 'muscle_group' => 'legs']);
+    $weA = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseA->id, 'order' => 1,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseA->toSnapshot(), 'delivered_at' => now(),
+    ]);
+    $exerciseB = Exercise::factory()->create(['name' => 'Ejercicio B', 'name_es' => 'Ejercicio B', 'muscle_group' => 'legs']);
+    WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseB->id, 'order' => 2,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseB->toSnapshot(), 'delivered_at' => now(),
+    ]);
+    $exerciseC = Exercise::factory()->create(['name' => 'Ejercicio C', 'name_es' => 'Ejercicio C', 'muscle_group' => 'legs']);
+    $weC = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseC->id, 'order' => 3,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseC->toSnapshot(), 'delivered_at' => now(),
+    ]);
+
+    // Único candidato real disponible para la PRIMERA sustitución.
+    $exerciseD = Exercise::factory()->create(['name' => 'Ejercicio D', 'name_es' => 'Ejercicio D', 'muscle_group' => 'legs']);
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    // Primera sustitución: A -> D.
+    sendSubMessage($contact, 'Cámbiame el primero');
+
+    expect($weA->fresh()->superseded_by_id)->not->toBeNull();
+    $weD = WorkoutExercise::find($weA->fresh()->superseded_by_id);
+    expect($weD->exercise_id)->toBe($exerciseD->id);
+
+    // Único candidato REALMENTE NUEVO disponible para la SEGUNDA
+    // sustitución. exerciseA (id menor, creado antes -> ganaría el
+    // desempate por id si el bug de reutilización intra-sesión reapareciera)
+    // NUNCA debe volver a aparecer como candidato, pese a que su fila
+    // original ya no está activa (superseded).
+    $exerciseE = Exercise::factory()->create(['name' => 'Ejercicio E', 'name_es' => 'Ejercicio E', 'muscle_group' => 'legs']);
+
+    // Segunda sustitución: C -> ? (nunca A, el histórico superseded de esta
+    // misma sesión).
+    sendSubMessage($contact, 'Cámbiame el tercero');
+
+    expect($weC->fresh()->superseded_by_id)->not->toBeNull();
+    $replacementOfC = WorkoutExercise::find($weC->fresh()->superseded_by_id);
+    expect($replacementOfC->exercise_id)->toBe($exerciseE->id);
+    expect($replacementOfC->exercise_id)->not->toBe($exerciseA->id);
+});
