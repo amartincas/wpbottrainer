@@ -50,11 +50,13 @@ use App\Training\Support\ExecutionReportOutcome;
 use App\Training\Support\ExecutionReportRecorder;
 use App\Training\Support\ExecutionReportService;
 use App\Training\Support\ExerciseMessageFormatter;
+use App\Training\Support\ExerciseSubstitutionOutcome;
 use App\Training\Support\MultipleActiveWorkoutSessionsException;
 use App\Training\Support\OnboardingConversationService;
 use App\Training\Support\PendingPreferenceClarificationResolver;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
+use App\Training\Support\ReplaceWorkoutExerciseService;
 use App\Training\Support\ReplaceWorkoutSessionService;
 use App\Training\Support\RequestedFocusGroup;
 use App\Training\Support\RequestedFocusTermMapper;
@@ -73,6 +75,7 @@ use App\Training\Support\TrainingPreferenceIdentityResolver;
 use App\Training\Support\TrainingPreferenceMessageClassifier;
 use App\Training\Support\TrainingPreferenceRecorder;
 use App\Training\Support\TrialEndedMessageComposer;
+use App\Training\Support\WorkoutExerciseTargetResolver;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Collection;
@@ -176,6 +179,21 @@ class TrainingHandler implements HandlerInterface
      */
     private const NEW_WORKOUT_REQUEST_INCONSISTENT_MESSAGE = 'Encontré un problema técnico con tu sesión actual. Ya '
         .'avisé a nuestro equipo — escríbeme en un momento y seguimos. 🙏';
+
+    /**
+     * Hito C (Sustitución de un ejercicio) — mismo criterio de tono que el
+     * resto de confirmaciones fijas de este archivo, texto breve y factual
+     * (Parte 12 del encargo aprobado): sin variantes, sin redacción de IA.
+     */
+    private const SUBSTITUTE_SUCCESS_MESSAGE = 'Listo — cambié %s por %s.';
+
+    private const SUBSTITUTE_TARGET_NOT_FOUND_MESSAGE = 'No estoy segura de a cuál ejercicio te refieres — ¿me dices el nombre exacto?';
+
+    private const SUBSTITUTE_AMBIGUOUS_TARGET_MESSAGE = 'Encontré varios ejercicios que podrían ser ese: %s. ¿Cuál de ellos?';
+
+    private const SUBSTITUTE_ALREADY_RESOLVED_MESSAGE = 'Ya registraste ese ejercicio, así que no puedo cambiarlo ahora.';
+
+    private const SUBSTITUTE_NO_ACTIVE_SESSION_MESSAGE = 'No tienes ningún ejercicio activo para cambiar en este momento.';
 
     /**
      * Hito B3 (diseño v3 FINAL) — confirmaciones/clarificaciones
@@ -389,6 +407,8 @@ class TrainingHandler implements HandlerInterface
         private readonly DeclaredHealthConditionRecorder $healthConditionRecorder,
         private readonly PendingPreferenceClarificationResolver $pendingClarificationResolver,
         private readonly TrainingPreferenceClarificationRecorder $clarificationRecorder,
+        private readonly ReplaceWorkoutExerciseService $replaceExerciseService,
+        private readonly WorkoutExerciseTargetResolver $targetResolver,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -692,7 +712,23 @@ class TrainingHandler implements HandlerInterface
             // preferencia después", mismo orden que B2 report+reemplazo).
             // Clasificador 100% determinista sobre $body crudo — nunca sobre
             // $result (que ya viene del LLM), ver docblock de la clase.
-            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
+            //
+            // Fix pre-commit (Hito C, auditoría Fase 2) — EXCEPCIÓN: si este
+            // turno ya produjo una acción `SubstituteExercise` válida
+            // (`$resolved`, ya calculado arriba), B3 NUNCA vuelve a procesar
+            // el mismo `$body` — evita la respuesta contradictoria real
+            // detectada en auditoría ("no me gusta este ejercicio,
+            // cámbiamelo" → C ya respondió "Listo, cambié X por Y", B3
+            // encima respondía "No estoy segura de a qué ejercicio te
+            // refieres" sobre un candidateTerm que ya no tenía sentido).
+            // Punto mínimo elegido deliberadamente: ni toca
+            // `TrainingPreferenceMessageClassifier` ni sus reglas, ni crea
+            // estado nuevo — solo una guarda de coordinación en el
+            // orquestador, basada en una señal que `ConversationTurnResolver`
+            // YA calculó.
+            if (! $this->turnConsumedBySubstitution($resolved)) {
+                $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
+            }
 
             return;
         }
@@ -795,7 +831,13 @@ class TrainingHandler implements HandlerInterface
             // declarada en el mismo mensaje ("no me gustan las sentadillas,
             // dame mi rutina") ya aplique a la sesión que está a punto de
             // crearse.
-            $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
+            //
+            // Fix pre-commit (Hito C, auditoría Fase 2) — mismo criterio
+            // exacto que el paso 4: nunca se procesa B3 si este turno ya
+            // produjo una acción `SubstituteExercise` válida.
+            if (! $this->turnConsumedBySubstitution($resolved)) {
+                $this->handleTrainingPreferenceMessage($body, $freshContact, $frontExercise, $from, $tenant, $classification);
+            }
 
             if (! $shouldDeliverSession) {
                 return;
@@ -1211,6 +1253,12 @@ class TrainingHandler implements HandlerInterface
 
                 continue;
             }
+
+            if ($action->type === ConversationActionType::SubstituteExercise) {
+                $this->handleSubstituteExercise($action->requestedFocusTerms, $body, $from, $tenant, $contact);
+
+                continue;
+            }
         }
 
         return $shouldDeliverSession;
@@ -1279,6 +1327,124 @@ class TrainingHandler implements HandlerInterface
         ]);
 
         $this->deliverNewSession($result['session'], $from, $tenant, $contact);
+    }
+
+    /**
+     * Fix pre-commit (Hito C, auditoría Fase 2) — único punto de verdad para
+     * "¿este turno ya produjo una acción `SubstituteExercise` válida?",
+     * usado por AMBOS call sites (paso 4 y paso 5) para decidir si B3 debe
+     * omitirse. Basado ÚNICAMENTE en `$resolved` (ya calculado por
+     * `ConversationTurnResolver`, sin ninguna llamada adicional) — nunca en
+     * el resultado de ejecutar la sustitución (que puede resolver, ser
+     * ambigua, o no encontrar el objetivo: en CUALQUIERA de esos casos la
+     * intención YA era de dominio C, nunca de B3, así que B3 se omite
+     * igual — evita que B3 responda una segunda vez, potencialmente
+     * contradictoria, sobre el mismo `$body`).
+     */
+    private function turnConsumedBySubstitution(ConversationTurnResolved $resolved): bool
+    {
+        return collect($resolved->actions)->contains(
+            fn (ConversationAction $action) => $action->type === ConversationActionType::SubstituteExercise
+        );
+    }
+
+    /**
+     * Hito C (Sustitución de un ejercicio, diseño formal aprobado) — única
+     * entrada de `ReplaceWorkoutExerciseService` en todo el sistema.
+     * `TrainingHandler` NUNCA selecciona ejercicios ni consulta
+     * `Exercise::query()` — solo resuelve la IDENTIDAD del objetivo
+     * (`WorkoutExerciseTargetResolver`, determinista sobre `$body` crudo) y
+     * delega toda decisión de selección/persistencia en el Service.
+     *
+     * Precondición: se llega aquí exclusivamente cuando
+     * `ConversationActionType::SubstituteExercise` está presente en
+     * `$resolved` — que, por construcción de `ConversationTurnResolver`, ya
+     * excluye el caso `NewWorkoutRequest` simultáneo (mutuamente
+     * excluyentes, `NewWorkoutRequest` gana siempre).
+     */
+    private function handleSubstituteExercise(array $requestedFocusTerms, string $body, string $from, Tenant $tenant, Contact $contact): void
+    {
+        $session = $contact->workoutSessions()->where('status', WorkoutSessionStatus::Scheduled)->first();
+
+        if ($session === null) {
+            $this->reply($from, self::SUBSTITUTE_NO_ACTIVE_SESSION_MESSAGE, $tenant);
+
+            return;
+        }
+
+        $resolution = $this->targetResolver->resolve($session, $body);
+
+        if ($resolution->status === 'unresolved') {
+            $this->reply($from, self::SUBSTITUTE_TARGET_NOT_FOUND_MESSAGE, $tenant);
+
+            return;
+        }
+
+        if ($resolution->status === 'ambiguous') {
+            $labels = collect($resolution->candidates)
+                ->map(fn (WorkoutExercise $workoutExercise) => $workoutExercise->exercise_snapshot['name'] ?? '?')
+                ->implode(', ');
+
+            $this->reply($from, sprintf(self::SUBSTITUTE_AMBIGUOUS_TARGET_MESSAGE, $labels), $tenant);
+
+            return;
+        }
+
+        // Hito B1 (Requested Focus) — UN solo grupo, nunca un array: C
+        // llena un único slot, a diferencia de B1/B2 que reparten entre
+        // varios grupos para una sesión completa. Mismo mapeador exacto,
+        // sin ninguna traducción propia.
+        $mappedFocus = $requestedFocusTerms !== [] ? $this->requestedFocusTermMapper->mapMany($requestedFocusTerms) : null;
+        $focusGroup = $mappedFocus[0] ?? null;
+
+        try {
+            $outcome = $this->replaceExerciseService->replace($resolution->target, $focusGroup);
+        } catch (TrainingCatalogInsufficientException) {
+            Log::warning('TRAINING_SUBSTITUTE_EXERCISE_CATALOG_INSUFFICIENT', [
+                'contact_id' => $contact->id,
+                'workout_exercise_id' => $resolution->target->id,
+            ]);
+
+            $this->reply($from, self::CATALOG_INSUFFICIENT_MESSAGE, $tenant);
+
+            return;
+        }
+
+        match ($outcome->status) {
+            'replaced' => $this->deliverSubstitution($outcome, $from, $tenant),
+            'target_already_resolved' => $this->reply($from, self::SUBSTITUTE_ALREADY_RESOLVED_MESSAGE, $tenant),
+            // 'target_not_found'/'ambiguous_target'/'invalid_target_state':
+            // defensivo — `$resolution->target` ya identificó una fila
+            // ACTIVA concreta justo antes de esta llamada, así que estos
+            // desenlaces no deberían ocurrir en la práctica (solo si la fila
+            // cambió de estado entre la resolución y el lock del Service,
+            // ej. una carrera real) — mismo mensaje que "no encontrado",
+            // nunca un error sin respuesta.
+            default => $this->reply($from, self::SUBSTITUTE_TARGET_NOT_FOUND_MESSAGE, $tenant),
+        };
+    }
+
+    /**
+     * Hito C — entrega el reemplazo reutilizando EXACTAMENTE
+     * `deliverExercise()` existente (texto de técnica + video vía
+     * `MediaResolver`, `delivered_at` marcado) — nunca una segunda
+     * implementación de entrega. El mensaje original del ejercicio
+     * sustituido permanece intacto en el hilo de WhatsApp (no existe
+     * mecanismo de edición/retracción, ver diseño formal Fase 8) — el
+     * acuse de recibo es lo único que da contexto al usuario.
+     */
+    private function deliverSubstitution(ExerciseSubstitutionOutcome $outcome, string $from, Tenant $tenant): void
+    {
+        $originalName = $outcome->original->exercise_snapshot['name'] ?? 'el ejercicio anterior';
+        $newName = $outcome->replacement->exercise_snapshot['name'] ?? 'el nuevo ejercicio';
+
+        Log::info('TRAINING_SUBSTITUTE_EXERCISE_REPLACED', [
+            'original_workout_exercise_id' => $outcome->original->id,
+            'replacement_workout_exercise_id' => $outcome->replacement->id,
+        ]);
+
+        $this->reply($from, sprintf(self::SUBSTITUTE_SUCCESS_MESSAGE, $originalName, $newName), $tenant);
+        $this->deliverExercise($outcome->replacement, $from, $tenant);
     }
 
     /**

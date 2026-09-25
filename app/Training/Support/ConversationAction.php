@@ -74,6 +74,22 @@ final readonly class ConversationAction
     }
 
     /**
+     * Hito C (Sustitución de un ejercicio) — mismo criterio EXACTO que
+     * `newWorkoutRequest()`: `$requestedFocusTerms` son términos CRUDOS del
+     * foco puntual para el REEMPLAZO ("quiero otro ejercicio de pecho"),
+     * `[]` si no se pidió ninguno. Esta clase y `ConversationTurnResolver`
+     * NUNCA identifican CUÁL `WorkoutExercise` es el objetivo — eso es
+     * responsabilidad exclusiva de `WorkoutExerciseTargetResolver`, sobre el
+     * `$body` crudo, en `TrainingHandler`.
+     *
+     * @param  array<int, string>  $requestedFocusTerms
+     */
+    public static function substituteExercise(array $requestedFocusTerms = []): self
+    {
+        return new self(ConversationActionType::SubstituteExercise, requestedFocusTerms: $requestedFocusTerms);
+    }
+
+    /**
      * Hito 10 — datos CRUDOS (día/hora/recurrencia ya extraídos, todavía no
      * resueltos) de una petición de recordatorio. `TrainingHandler` es
      * quien resuelve con `ReminderTimeResolver`/`TimezoneResolver` y

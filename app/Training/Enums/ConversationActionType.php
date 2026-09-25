@@ -43,4 +43,14 @@ enum ConversationActionType: string
      * explícita del usuario.
      */
     case NewWorkoutRequest = 'new_workout_request';
+
+    /**
+     * Hito C (Sustitución de un ejercicio) — sustituye UN `WorkoutExercise`
+     * puntual de la sesión activa, vía `ReplaceWorkoutExerciseService`.
+     * Mutuamente excluyente con `NewWorkoutRequest` (ver
+     * `ConversationTurnResolver`) — nunca ambos a la vez en el mismo turno.
+     * Nunca se confunde con `DeliverSession`: esa acción nunca sustituye
+     * nada, solo entrega/continúa.
+     */
+    case SubstituteExercise = 'substitute_exercise';
 }

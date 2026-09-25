@@ -27,6 +27,10 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
     'rest_seconds',
     'exercise_snapshot',
     'delivered_at',
+    // Hito C (Sustitución de un ejercicio) — escrito EXCLUSIVAMENTE por
+    // ReplaceWorkoutExerciseService, nunca en la prescripción normal de
+    // TrainingEngine::decideNextSession().
+    'superseded_by_id',
 ])]
 class WorkoutExercise extends Model
 {
@@ -122,5 +126,29 @@ class WorkoutExercise extends Model
     public function exerciseLog(): HasOne
     {
         return $this->hasOne(ExerciseLog::class);
+    }
+
+    /**
+     * Hito C (Sustitución de un ejercicio) — el `WorkoutExercise` NUEVO que
+     * sustituyó a este (`superseded_by_id`), si este fue sustituido por
+     * `ReplaceWorkoutExerciseService`. `null` en cualquier otro caso
+     * (incluido cualquier ejercicio creado antes de este hito). Mismo
+     * criterio exacto que `WorkoutSession::supersededBy()`.
+     */
+    public function supersededBy(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'superseded_by_id');
+    }
+
+    /**
+     * Hito C — inversa de `supersededBy()`: el `WorkoutExercise` VIEJO que
+     * este sustituyó, si este fue creado por `ReplaceWorkoutExerciseService`
+     * como reemplazo de otro. `null` para cualquier ejercicio creado por el
+     * flujo normal de `TrainingEngine::decideNextSession()` sin sustitución.
+     * Mismo criterio exacto que `WorkoutSession::supersededSession()`.
+     */
+    public function supersededExercise(): HasOne
+    {
+        return $this->hasOne(self::class, 'superseded_by_id');
     }
 }

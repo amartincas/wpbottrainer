@@ -56,9 +56,22 @@ class WorkoutSession extends Model
         return $this->belongsTo(Contact::class);
     }
 
+    /**
+     * Hito C (Sustitución de un ejercicio) — excluye deliberadamente
+     * cualquier `WorkoutExercise` ya sustituido (`superseded_by_id !== null`,
+     * ver `ReplaceWorkoutExerciseService`): esta es la ÚNICA relación que
+     * usan `frontExercise()`/`nextUndeliveredExercise()` y todos los
+     * consumidores existentes (entrega, cierre de sesión,
+     * `TrainingHistoryContextProvider`, `CoachContextProvider`, etc.) —
+     * excluir aquí, en un solo punto, hace que TODOS ellos trabajen
+     * automáticamente con el ejercicio ACTIVO, sin necesitar ningún cambio
+     * individual. 100% aditivo y retrocompatible: ninguna fila existente
+     * antes de este hito tiene `superseded_by_id` poblado, así que el
+     * comportamiento de cualquier sesión ya creada es idéntico.
+     */
     public function workoutExercises(): HasMany
     {
-        return $this->hasMany(WorkoutExercise::class)->orderBy('order');
+        return $this->hasMany(WorkoutExercise::class)->whereNull('superseded_by_id')->orderBy('order');
     }
 
     /**

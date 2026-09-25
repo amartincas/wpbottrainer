@@ -81,8 +81,8 @@ enum DetectedIntentType: string
      * EXPLÍCITAMENTE reemplazar la rutina/sesión COMPLETA actual por una
      * distinta ("quiero otra rutina", "cámbiame la rutina", "no quiero esta
      * rutina, dame otra") — nunca sustituir UN ejercicio individual dentro
-     * de la sesión (eso pertenece al futuro Hito C, no implementado; ver
-     * ejemplos negativos en el prompt de `CoachService`/`ExecutionReportService`).
+     * de la sesión (eso es `SubstituteExercise`, Hito C; ver ejemplos
+     * negativos en el prompt de `CoachService`/`ExecutionReportService`).
      * Deliberadamente distinto de `ContinueTraining`: ese intent nunca
      * genera una rutina nueva mientras hay una activa (ver
      * `ConversationActionType::DeliverSession`) — comportamiento opuesto al
@@ -93,6 +93,25 @@ enum DetectedIntentType: string
      * foco puntual para la nueva rutina ("dame otra rutina de pecho").
      */
     case NewWorkoutRequest = 'new_workout_request';
+
+    /**
+     * Hito C (Sustitución de un ejercicio) — el usuario pide EXPLÍCITAMENTE
+     * sustituir UN ejercicio puntual de la sesión activa ("cámbiame este
+     * ejercicio", "quiero otro ejercicio", "cámbiame las sentadillas",
+     * "cámbiame el segundo ejercicio") — nunca la rutina/sesión completa
+     * (eso sigue siendo `NewWorkoutRequest`, B2). Mutuamente excluyente con
+     * `NewWorkoutRequest` (ver `ConversationTurnResolver`): si el mensaje
+     * combina ambos, `NewWorkoutRequest` gana siempre, `SubstituteExercise`
+     * nunca se ejecuta ese turno.
+     *
+     * Puede combinarse con `requested_focus_terms` (mismo campo/criterio que
+     * B1/B2) cuando el usuario además pide un foco puntual para el
+     * reemplazo ("quiero otro ejercicio de pecho"). Este intent NUNCA
+     * identifica CUÁL ejercicio de la sesión es el objetivo — eso lo
+     * resuelve determinísticamente `WorkoutExerciseTargetResolver` sobre el
+     * `$body` crudo, nunca la IA.
+     */
+    case SubstituteExercise = 'substitute_exercise';
 
     /**
      * Valida una lista cruda (ej. del JSON de la IA) contra este vocabulario

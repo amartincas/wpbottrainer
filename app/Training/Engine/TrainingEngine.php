@@ -1433,15 +1433,32 @@ class TrainingEngine
 
     private function prescribeExercise(WorkoutSession $session, Exercise $exercise, int $order, TrainingHistoryContext $historyContext, TrainingProfile $profile): WorkoutExercise
     {
-        // Bloque 8 (D051): ProgressionEvaluator es la única autoridad sobre
-        // la DIRECCIÓN de progresión (progress/maintain/reduce/
-        // insufficient_data); TrainingEngine sigue siendo la única
-        // autoridad sobre la PRESCRIPCIÓN numérica concreta.
+        return WorkoutExercise::create(array_merge(
+            ['workout_session_id' => $session->id],
+            $this->mainExerciseAttributes($exercise, $order, $historyContext, $profile),
+        ));
+    }
+
+    /**
+     * Hito C (Sustitución de un ejercicio) — extraído SIN CAMBIO de
+     * comportamiento de `prescribeExercise()` (que ahora delega aquí) para
+     * que `selectReplacement()` pueda reutilizar EXACTAMENTE el mismo
+     * cálculo de progresión/prescripción sin duplicarlo y sin persistir por
+     * su cuenta (`selectReplacement()` nunca llama `WorkoutExercise::create()`
+     * — eso es responsabilidad exclusiva de `ReplaceWorkoutExerciseService`).
+     * Bloque 8 (D051): ProgressionEvaluator es la única autoridad sobre la
+     * DIRECCIÓN de progresión; TrainingEngine sigue siendo la única
+     * autoridad sobre la PRESCRIPCIÓN numérica concreta.
+     *
+     * @return array<string, mixed> atributos listos para `WorkoutExercise::create()`,
+     *         SIN `workout_session_id` (lo añade el llamador).
+     */
+    private function mainExerciseAttributes(Exercise $exercise, int $order, TrainingHistoryContext $historyContext, TrainingProfile $profile): array
+    {
         $evaluation = $this->progressionEvaluator->evaluate($historyContext, $exercise->id, $exercise->tracking_type);
         $progression = $this->numericPrescriptionFor($exercise, $evaluation, $historyContext, $profile);
 
-        return WorkoutExercise::create([
-            'workout_session_id' => $session->id,
+        return [
             'exercise_id' => $exercise->id,
             'order' => $order,
             'phase' => WorkoutExercisePhase::Main,
@@ -1451,7 +1468,7 @@ class TrainingEngine
             'prescribed_duration_seconds' => $progression['duration_seconds'],
             'rest_seconds' => $progression['rest_seconds'],
             'exercise_snapshot' => $exercise->toSnapshot(),
-        ]);
+        ];
     }
 
     /**
@@ -1469,8 +1486,23 @@ class TrainingEngine
      */
     private function prescribeSupportExercise(WorkoutSession $session, Exercise $exercise, int $order, WorkoutExercisePhase $phase): WorkoutExercise
     {
-        return WorkoutExercise::create([
-            'workout_session_id' => $session->id,
+        return WorkoutExercise::create(array_merge(
+            ['workout_session_id' => $session->id],
+            $this->supportExerciseAttributes($exercise, $order, $phase),
+        ));
+    }
+
+    /**
+     * Hito C — extraído SIN CAMBIO de comportamiento de
+     * `prescribeSupportExercise()`, mismo motivo exacto que
+     * `mainExerciseAttributes()`.
+     *
+     * @return array<string, mixed> atributos listos para `WorkoutExercise::create()`,
+     *         SIN `workout_session_id` (lo añade el llamador).
+     */
+    private function supportExerciseAttributes(Exercise $exercise, int $order, WorkoutExercisePhase $phase): array
+    {
+        return [
             'exercise_id' => $exercise->id,
             'order' => $order,
             'phase' => $phase,
@@ -1480,7 +1512,117 @@ class TrainingEngine
             'prescribed_duration_seconds' => self::SUPPORT_EXERCISE_DURATION_SECONDS,
             'rest_seconds' => 0,
             'exercise_snapshot' => $exercise->toSnapshot(),
-        ]);
+        ];
+    }
+
+    /**
+     * Hito C (Sustitución de un ejercicio, diseño formal aprobado) — ÚNICA
+     * operación de selección para sustituir UN `WorkoutExercise` dentro de
+     * una sesión que sigue viva. REGLA ABSOLUTA: este método NUNCA persiste
+     * — no abre transacción, no hace `lockForUpdate()`, no crea ni modifica
+     * ningún `WorkoutExercise`/`WorkoutSession`. Devuelve únicamente los
+     * atributos de la prescripción elegida; `ReplaceWorkoutExerciseService`
+     * es quien crea la fila real y marca `superseded_by_id` del original,
+     * dentro de su propia transacción con lock.
+     *
+     * Reutiliza, SIN DUPLICAR, exactamente las mismas piezas que
+     * `decideNextSession()`: `isEligible()` (Safety/Location/Equipment),
+     * `isExcludedByPreference()` (B3), `sortCandidates()`/`varietyScore()`
+     * (mismo criterio de fase — Main: dificultad→variedad→id; Preparation/
+     * Cooldown: variedad→foco→id), y `mainExerciseAttributes()`/
+     * `supportExerciseAttributes()` para la prescripción final.
+     *
+     * Exclusión (cierra el gap ya documentado en la auditoría previa,
+     * Sección K): se excluye TODO `exercise_id` actualmente ACTIVO en la
+     * MISMA sesión — `$target->workoutSession->workoutExercises` ya usa la
+     * relación filtrada por `superseded_by_id IS NULL` (ver
+     * `WorkoutSession::workoutExercises()`), y como `$target` en sí sigue
+     * activo en el momento de esta llamada (el Service revalida
+     * `superseded_by_id === null` bajo lock ANTES de invocar este método,
+     * nunca lo escribe antes), su propio `exercise_id` queda EXCLUIDO de
+     * forma estructural, sin necesitar un caso especial — nunca puede
+     * proponerse a sí mismo como su propio reemplazo.
+     *
+     * `$requestedFocus`: UN solo grupo (nunca un array — a diferencia de
+     * B1, que reparte slots entre múltiples grupos para una sesión
+     * COMPLETA, aquí solo hay 1 slot que llenar). Si el foco pedido no
+     * tiene ningún candidato tras Safety/Preference/exclusión de sesión, se
+     * hace fallback silencioso-pero-honesto al pool general (mismo
+     * principio que B1: nunca bloquea por un foco insatisfacible) — el
+     * candidato real elegido queda disponible en el resultado para que el
+     * llamador informe honestamente cuál fue.
+     *
+     * @return array<string, mixed> atributos listos para `WorkoutExercise::create()`,
+     *         SIN `workout_session_id` (el Service lo añade al persistir).
+     *
+     * @throws TrainingCatalogInsufficientException si, tras Safety/Location/
+     *         Equipment/Preference/exclusión de sesión (y el fallback de
+     *         foco si aplica), no queda ningún candidato — mismo criterio y
+     *         MISMA excepción que ya usa `decideNextSession()` para
+     *         "catálogo insuficiente", nunca una excepción nueva.
+     */
+    public function selectReplacement(Contact $contact, WorkoutExercise $target, ?RequestedFocusGroup $requestedFocus = null): array
+    {
+        $profile = $contact->trainingProfile;
+
+        if ($profile === null) {
+            throw new \RuntimeException('Cannot select a replacement without a TrainingProfile.');
+        }
+
+        $session = $target->workoutSession;
+
+        $activePool = Exercise::query()->where('is_active', true)->get();
+        $eligiblePool = $activePool->filter(fn (Exercise $exercise) => $this->isEligible($exercise, $profile));
+
+        $excludedByPreference = $this->preferenceResolver->excludedIdentifiersFor($contact);
+        $preferenceFilteredPool = $eligiblePool->reject(
+            fn (Exercise $exercise) => $this->isExcludedByPreference($exercise, $excludedByPreference)
+        );
+
+        // Excluye TODO exercise_id actualmente activo en la sesión
+        // (Preparation+Main+Cooldown) — incluye estructuralmente al propio
+        // $target, ver docblock arriba.
+        $activeSessionExerciseIds = $session->workoutExercises->pluck('exercise_id')->filter()->unique();
+        $candidatePool = $preferenceFilteredPool->reject(
+            fn (Exercise $exercise) => $activeSessionExerciseIds->contains($exercise->id)
+        );
+
+        $recentSessions = $contact->workoutSessions()
+            ->whereIn('status', [
+                WorkoutSessionStatus::Completed,
+                WorkoutSessionStatus::Skipped,
+                WorkoutSessionStatus::Superseded,
+            ])
+            ->with('workoutExercises')
+            ->orderByDesc('scheduled_at')
+            ->limit(self::RECENT_SESSIONS_LOOKBACK)
+            ->get();
+
+        $pool = $candidatePool;
+
+        if ($requestedFocus !== null) {
+            $focusedPool = $candidatePool->filter(
+                fn (Exercise $exercise) => array_intersect($this->exerciseMuscles($exercise), $requestedFocus->muscles) !== []
+            );
+
+            if ($focusedPool->isNotEmpty()) {
+                $pool = $focusedPool;
+            }
+        }
+
+        $chosen = $this->sortCandidates($pool, $profile, $recentSessions, $target->phase)->first();
+
+        if ($chosen === null) {
+            throw new TrainingCatalogInsufficientException;
+        }
+
+        if ($target->phase === WorkoutExercisePhase::Main) {
+            $historyContext = $this->historyProvider->build($contact);
+
+            return $this->mainExerciseAttributes($chosen, $target->order, $historyContext, $profile);
+        }
+
+        return $this->supportExerciseAttributes($chosen, $target->order, $target->phase);
     }
 
     /**

@@ -118,9 +118,22 @@ class ConversationTurnResolver
         // regla es intencionalmente unidireccional (reemplazo gana, nunca
         // al revés) — coherente con la semántica de B2: pedir una rutina
         // distinta siempre debe ganarle a "continúa la actual".
+        //
+        // Hito C (fix pre-commit, auditoría Fase 2) — MISMO criterio se
+        // extiende a `SubstituteExercise`: calculado ANTES de decidir
+        // `DeliverSession`, para que una sustitución puntual de UN ejercicio
+        // también impida que se agregue una acción de "continuar"
+        // contradictoria en el mismo turno (ej. "sigue con mi rutina, pero
+        // cámbiame este ejercicio" — sin esta guarda, `DeliverSession`
+        // podía reenviar/recordar la sesión pendiente Y `SubstituteExercise`
+        // sustituir a la vez, produciendo dos respuestas incoherentes
+        // seguidas — hallazgo real de la auditoría pre-commit). Precedencia
+        // final: `NewWorkoutRequest` > `SubstituteExercise` > `DeliverSession`
+        // — nunca al revés, mismo principio unidireccional de siempre.
         $hasNewWorkoutRequest = in_array(DetectedIntentType::NewWorkoutRequest->value, $intents, true);
+        $hasSubstituteExercise = in_array(DetectedIntentType::SubstituteExercise->value, $intents, true) && ! $hasNewWorkoutRequest;
 
-        if (in_array(DetectedIntentType::ContinueTraining->value, $intents, true) && ! $hasNewWorkoutRequest) {
+        if (in_array(DetectedIntentType::ContinueTraining->value, $intents, true) && ! $hasNewWorkoutRequest && ! $hasSubstituteExercise) {
             // Hito B1.3 — términos crudos de foco puntual (si el usuario los
             // dio), transportados SIN interpretar (mismo criterio que
             // reminder_day/reminder_time arriba): este resolver sigue sin
@@ -152,6 +165,18 @@ class ConversationTurnResolver
         // resultado, solo reacciona a la forma ya validada.
         if ($hasNewWorkoutRequest) {
             $actions[] = ConversationAction::newWorkoutRequest($result['requested_focus_terms'] ?? []);
+        }
+
+        // Hito C (Sustitución de un ejercicio) — mismo criterio exacto que
+        // ContinueTraining/NewWorkoutRequest arriba: términos crudos de foco
+        // puntual para el REEMPLAZO, transportados sin interpretar. Se añade
+        // DESPUÉS de RecordExecutionReport (mismo motivo exacto que
+        // NewWorkoutRequest: "hice las tres series, pero cámbiame el
+        // siguiente" registra el reporte primero, sustituye después).
+        // `$hasSubstituteExercise` ya descarta el caso `NewWorkoutRequest`
+        // simultáneo (calculado arriba) — nunca ambos a la vez.
+        if ($hasSubstituteExercise) {
+            $actions[] = ConversationAction::substituteExercise($result['requested_focus_terms'] ?? []);
         }
 
         // Hito 10 — datos CRUDOS únicamente: ni resueltos ni validados aquí
