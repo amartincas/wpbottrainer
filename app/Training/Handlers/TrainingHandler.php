@@ -53,6 +53,7 @@ use App\Training\Support\ExerciseMessageFormatter;
 use App\Training\Support\ExerciseSubstitutionOutcome;
 use App\Training\Support\MultipleActiveWorkoutSessionsException;
 use App\Training\Support\OnboardingConversationService;
+use App\Training\Support\OnboardingEvidenceDetector;
 use App\Training\Support\PendingPreferenceClarificationResolver;
 use App\Training\Support\ReminderProactivityGate;
 use App\Training\Support\ReminderTimeResolver;
@@ -409,6 +410,7 @@ class TrainingHandler implements HandlerInterface
         private readonly TrainingPreferenceClarificationRecorder $clarificationRecorder,
         private readonly ReplaceWorkoutExerciseService $replaceExerciseService,
         private readonly WorkoutExerciseTargetResolver $targetResolver,
+        private readonly OnboardingEvidenceDetector $evidenceDetector,
     ) {}
 
     public function handle(ExecutionContext $context): void
@@ -530,6 +532,19 @@ class TrainingHandler implements HandlerInterface
                     return;
                 }
             }
+
+            // Hito O2 (Onboarding sticky state / deterministic backstop,
+            // Fase 1 — exclusivamente training_location) — se invoca DESPUÉS
+            // del chequeo de seguridad de arriba (nunca antes: si Safety
+            // escala, el turno ya retornó y este backstop ni se alcanza,
+            // preservando la precedencia de Safety sin ningún cambio) y
+            // ANTES de applyExtracted(), para que un valor detectado
+            // determinísticamente se persista exactamente por el mismo
+            // camino que un valor extraído por el LLM. Precedencia LLM >
+            // Profile > Backstop aplicada dentro de fillGaps() — ver su
+            // docblock: nunca sobrescribe un valor ya extraído este turno
+            // ni uno ya persistido en el perfil.
+            $extracted = $this->evidenceDetector->fillGaps($extracted, $body, $profile);
 
             $this->requirementRegistry->applyExtracted($contact, $profile, $extracted);
 
