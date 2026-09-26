@@ -43,4 +43,25 @@ final class RequestedFocusGroup
             throw new \InvalidArgumentException("RequestedFocusGroup '{$key}' must not contain duplicate muscles.");
         }
     }
+
+    /**
+     * Hito C (fix contexto de foco en sustitución) — reconstruye
+     * `RequestedFocusGroup[]` desde la forma serializada `{key, muscles}`
+     * que `TrainingEngine::decideNextSession()` ya escribe en
+     * `WorkoutSession.prescription_context_snapshot.requested_focus`.
+     * Única fuente de verdad de este shape de deserialización — evita que
+     * `ReplaceWorkoutSessionService` (B2) y `ReplaceWorkoutExerciseService`
+     * (C) mantengan cada una su propia copia de este parsing, con riesgo de
+     * que diverjan si el shape cambia. Mismo criterio EXACTO que ya usa
+     * `ReplaceWorkoutSessionService::inheritedRequestedFocus()` (B2, no
+     * modificado por este cambio — se deja intacto para no tocar código de
+     * B2 fuera de lo estrictamente necesario).
+     *
+     * @param  array<int, array{key: string, muscles: array<int,string>}>  $serialized
+     * @return array<int, self>
+     */
+    public static function manyFromArray(array $serialized): array
+    {
+        return array_map(fn (array $group) => new self($group['key'], $group['muscles']), $serialized);
+    }
 }

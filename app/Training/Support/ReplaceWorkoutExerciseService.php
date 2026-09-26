@@ -3,6 +3,7 @@
 namespace App\Training\Support;
 
 use App\Models\WorkoutExercise;
+use App\Models\WorkoutSession;
 use App\Training\Engine\TrainingEngine;
 use App\Training\Enums\WorkoutSessionStatus;
 use Illuminate\Support\Facades\DB;
@@ -87,10 +88,20 @@ class ReplaceWorkoutExerciseService
                 return ExerciseSubstitutionOutcome::invalidTargetState();
             }
 
+            // Hito C (fix contexto de foco, auditoría post-D6) — precedencia
+            // aprobada, MISMO criterio exacto que
+            // ReplaceWorkoutSessionService::resolve() ya usa para B2:
+            // explícito del mensaje actual > heredado de ESTA sesión > null
+            // (autónomo). `$requestedFocus` explícito SIEMPRE gana cuando el
+            // propio mensaje de sustitución pidió un foco puntual ("cámbiame
+            // este por uno de pecho") — solo se hereda cuando el mensaje no
+            // pidió ninguno.
+            $effectiveRequestedFocus = $requestedFocus ?? $this->inheritedRequestedFocus($session);
+
             // Única fuente de selección — TrainingEngine nunca persiste
             // (ver docblock de selectReplacement()): devuelve solo los
             // atributos listos para crear la fila.
-            $attributes = $this->engine->selectReplacement($session->contact, $locked, $requestedFocus);
+            $attributes = $this->engine->selectReplacement($session->contact, $locked, $effectiveRequestedFocus);
 
             $replacement = WorkoutExercise::create(array_merge(
                 ['workout_session_id' => $session->id],
@@ -104,5 +115,45 @@ class ReplaceWorkoutExerciseService
 
             return ExerciseSubstitutionOutcome::replaced($locked->fresh(), $replacement);
         });
+    }
+
+    /**
+     * Hito C (fix contexto de foco en sustitución, hallazgo de auditoría
+     * post-D6 E2E) — hereda el `requested_focus` de ESTA sesión cuando el
+     * mensaje de sustitución no pidió uno explícito ("Quiero otro
+     * ejercicio" sin foco, en una sesión creada con "Quiero una rutina de
+     * pecho"). Mismo mecanismo y misma fuente EXACTOS que
+     * `ReplaceWorkoutSessionService::inheritedRequestedFocus()` (B2) —
+     * reconstrucción directa desde `prescription_context_snapshot`, sin
+     * volver a analizar texto ni invocar `RequestedFocusTermMapper`, sin
+     * modificar el snapshot (solo lectura). NUNCA usa `decided_focus`
+     * (rotación autónoma del motor) como respaldo — ese concepto es ajeno a
+     * la intención explícita del usuario y el diseño aprobado lo prohíbe
+     * expresamente.
+     *
+     * Devuelve como MÁXIMO un grupo (a diferencia de B2, que reparte slots
+     * entre varios grupos para una sesión COMPLETA): C llena un único slot
+     * de reemplazo, mismo criterio EXACTO que ya usa
+     * `TrainingHandler::handleSubstituteExercise()` para el foco explícito
+     * EN EL MENSAJE actual (`$mappedFocus[0] ?? null`) — si la sesión pidió
+     * varios grupos ("pecho y brazos"), se usa el PRIMERO en el orden
+     * original de la petición, nunca una fusión de músculos de ambos
+     * grupos (esa semántica no existe en ningún otro punto del sistema y no
+     * se introduce aquí).
+     *
+     * `[]`/ausencia de la clave (sesión sin requested_focus, o snapshot
+     * anterior a B1) produce `null` — comportamiento autónomo sin cambios,
+     * idéntico al actual.
+     */
+    private function inheritedRequestedFocus(WorkoutSession $session): ?RequestedFocusGroup
+    {
+        $snapshot = $session->prescription_context_snapshot ?? [];
+        $requestedFocus = $snapshot['requested_focus'] ?? [];
+
+        if (! is_array($requestedFocus) || $requestedFocus === []) {
+            return null;
+        }
+
+        return RequestedFocusGroup::manyFromArray($requestedFocus)[0] ?? null;
     }
 }

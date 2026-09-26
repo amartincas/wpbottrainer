@@ -1149,7 +1149,14 @@ class TrainingHandler implements HandlerInterface
             }
 
             if ($action->type === ConversationActionType::RecordExecutionReport && $activeSessionData !== null) {
-                $this->recordExecutionReport($action->report, $activeSessionData, $from, $tenant, $contact, $startedAt, $frontExerciseId);
+                // Hito C (fix conflicto SubstituteExercise + RecordExecutionReport,
+                // hallazgo real de auditoría E2E post-D6, sesión #48 de
+                // staging) — ver stripSubstitutionConflictFromReport().
+                $report = $this->stripSubstitutionConflictFromReport($action->report, $resolved, $activeSessionData, $body, $frontExerciseId);
+
+                if ($report !== null) {
+                    $this->recordExecutionReport($report, $activeSessionData, $from, $tenant, $contact, $startedAt, $frontExerciseId);
+                }
 
                 continue;
             }
@@ -1262,6 +1269,108 @@ class TrainingHandler implements HandlerInterface
         }
 
         return $shouldDeliverSession;
+    }
+
+    /**
+     * Hito C (fix conflicto de acciones, hallazgo real de auditoría E2E
+     * post-D6 — sesión #48 de staging) — cuando el MISMO turno produce
+     * `RecordExecutionReport` Y `SubstituteExercise`, un reporte
+     * `not_performed=true` SIN nombre explícito (`exercise_name===null`,
+     * atribuido al frente vía `$frontExerciseId` — mismo criterio EXACTO
+     * que usa `ExecutionReportRecorder::resolveExercise()`) puede ser un
+     * efecto colateral de la MISMA intención de sustitución: la IA extrajo
+     * "no lo hice"/"no quiero" y "sustitúyelo" de un único "dame otro
+     * ejercicio", cuando la intención real es UNA sola — sustituir. Sin
+     * este filtro, `RecordExecutionReport` se ejecuta primero (orden fijo
+     * de `ConversationTurnResolver`), crea un `ExerciseLog` real y avanza el
+     * frente al SIGUIENTE ejercicio ANTES de que `handleSubstituteExercise()`
+     * resuelva su objetivo (Vía 4, ancla implícita -> `frontExercise()`) —
+     * la sustitución termina recayendo sobre el ejercicio siguiente, nunca
+     * el original, y un solo mensaje del usuario consume/muta DOS
+     * ejercicios. Este es exactamente el bug reproducido en staging.
+     *
+     * Preserva intacto el caso legítimo (Regla 16 del diseño aprobado, ver
+     * test `PRECEDENCE-4`): un reporte REAL (`not_performed=false`, con
+     * datos cuantificables — ej. "ya hice este ejercicio, pero cámbiame el
+     * siguiente") o un reporte con `exercise_name` explícito NUNCA se toca
+     * aquí — sigue registrándose normalmente, avanzando el frente, y
+     * `SubstituteExercise` sigue sustituyendo el ejercicio que resulta ser
+     * el frente DESPUÉS de ese avance real, exactamente como hoy.
+     *
+     * El objetivo de la sustitución se resuelve aquí ÚNICAMENTE como sonda
+     * (mismo `WorkoutExerciseTargetResolver` que `handleSubstituteExercise()`
+     * volverá a invocar más abajo en este mismo bucle, en su momento
+     * habitual) — nunca se reutiliza como el target real de la sustitución,
+     * y nunca muta nada por sí sola: nunca escribe, nunca marca
+     * `superseded_by_id`, nunca crea `ExerciseLog`. Contra el estado de la
+     * sesión TODAVÍA sin mutar por este turno (`RecordExecutionReport`
+     * corre después de esta sonda, nunca antes).
+     *
+     * @param  array{reports: array, session_finished: bool}  $report
+     * @param  array{workout_session_id: int, ...}  $activeSessionData
+     * @return ?array{reports: array, session_finished: bool} `null` cuando,
+     *         tras el filtro, no queda nada real que reportar y el turno no
+     *         cerraba explícitamente la sesión — señal para que el
+     *         llamador omita `recordExecutionReport()` por completo (nunca
+     *         un mensaje vacío/incoherente además del acuse de la
+     *         sustitución: el único mensaje de este turno debe ser el de
+     *         `deliverSubstitution()`).
+     *
+     * Micro-auditoría pre-commit (hallazgo real, corregido aquí) — cuando el
+     * filtro elimina el ÚNICO reporte que había (el conflictivo), un
+     * `session_finished=true` que venía adjunto a ESE MISMO reporte NUNCA
+     * es una segunda señal independiente — es parte de la misma extracción
+     * mal interpretada por la IA sobre "dame otro ejercicio" (nunca "ya
+     * terminé todo, y de paso cámbiame este"). Suprimirlo junto con el
+     * reporte evita el doble mensaje real detectado (acuse de "pendientes"
+     * de `sessionCloseComposer` + acuse de la sustitución) sin introducir
+     * una regla genérica "SubstituteExercise siempre ignora
+     * session_finished" — ver `$conflictRemovedSomething` abajo: la
+     * supresión SOLO ocurre cuando el filtro realmente quitó algo Y no
+     * queda ningún reporte sustantivo. Un turno donde `session_finished`
+     * llega SOLO (sin ningún reporte que el filtro pudiera tocar) sigue
+     * procesándose exactamente como siempre — esa es una señal legítima e
+     * independiente, nunca un efecto colateral del conflicto.
+     */
+    private function stripSubstitutionConflictFromReport(array $report, ConversationTurnResolved $resolved, array $activeSessionData, string $body, ?int $frontExerciseId): ?array
+    {
+        $hasSubstitute = collect($resolved->actions)->contains(
+            fn (ConversationAction $action) => $action->type === ConversationActionType::SubstituteExercise
+        );
+
+        $conflictRemovedSomething = false;
+
+        if ($hasSubstitute && $frontExerciseId !== null && $report['reports'] !== []) {
+            $session = WorkoutSession::find($activeSessionData['workout_session_id']);
+            $probe = $session !== null ? $this->targetResolver->resolve($session, $body) : null;
+
+            if ($probe !== null && $probe->status === 'resolved' && $probe->target->id === $frontExerciseId) {
+                $filteredReports = array_values(array_filter(
+                    $report['reports'],
+                    fn (array $entry) => ! (($entry['exercise_name'] ?? null) === null && ($entry['not_performed'] ?? false) === true)
+                ));
+
+                $conflictRemovedSomething = count($filteredReports) < count($report['reports']);
+                $report['reports'] = $filteredReports;
+            }
+        }
+
+        // El filtro se quedó sin ningún reporte sustantivo que justifique
+        // ejecutar RecordExecutionReport — incluido cualquier
+        // `session_finished` que viniera adjunto al mismo reporte
+        // eliminado (nunca una acción independiente, ver docblock arriba).
+        // Un `reports` con OTRAS entradas reales sobrevivientes (caso
+        // "conflicto + reporte real") NUNCA entra aquí — sigue su curso
+        // normal más abajo.
+        if ($conflictRemovedSomething && $report['reports'] === []) {
+            return null;
+        }
+
+        if ($report['reports'] === [] && ($report['session_finished'] ?? false) === false) {
+            return null;
+        }
+
+        return $report;
     }
 
     /**

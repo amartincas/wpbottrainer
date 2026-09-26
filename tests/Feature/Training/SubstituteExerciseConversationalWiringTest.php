@@ -810,3 +810,316 @@ it('C-REUSE-E2E: a second substitution never reuses an exercise superseded earli
     expect($replacementOfC->exercise_id)->toBe($exerciseE->id);
     expect($replacementOfC->exercise_id)->not->toBe($exerciseA->id);
 });
+
+// ============================================================
+// C-ACTION-CONFLICT (fix conflicto de acciones, hallazgo real de auditoría
+// E2E post-D6 — sesión #48 de staging): un mismo turno con
+// RecordExecutionReport + SubstituteExercise NUNCA debe crear un
+// ExerciseLog "de paso" para el ejercicio objetivo ni dejar que la
+// sustitución recaiga sobre el ejercicio SIGUIENTE en vez del original.
+// ============================================================
+
+it('C-ACTION-1: "Dame otro ejercicio" con un reporte "dont_want" accidental del LLM sobre el ejercicio actual — solo se sustituye, sin ExerciseLog', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Ejercicio A', muscleGroup: 'legs');
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'dont_want',
+            'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Dame otro ejercicio');
+
+    // Sustitución real, sobre el ejercicio ORIGINAL (el frente cuando
+    // comenzó el turno) — nunca sobre "el siguiente".
+    expect($target->fresh()->superseded_by_id)->not->toBeNull();
+    $replacement = WorkoutExercise::find($target->fresh()->superseded_by_id);
+    expect($replacement)->not->toBeNull();
+
+    // El reporte "dont_want" NUNCA se persiste — es el mismo hallazgo que la
+    // sustitución, no un hecho adicional.
+    expect(ExerciseLog::where('workout_exercise_id', $target->id)->exists())->toBeFalse();
+});
+
+it('C-ACTION-2: exactamente UNA sustitución — el replacement nunca es sustituido de nuevo en el mismo turno', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Ejercicio A', muscleGroup: 'legs');
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'dont_want',
+            'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Dame otro ejercicio');
+
+    expect(WorkoutExercise::whereNotNull('superseded_by_id')->count())->toBe(1);
+    $replacement = WorkoutExercise::find($target->fresh()->superseded_by_id);
+    expect($replacement->superseded_by_id)->toBeNull();
+});
+
+it('C-ACTION-3: "Quiero otro ejercicio" sin ningún reporte en absoluto — comportamiento idéntico (regresión de INTENT-2)', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact);
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Quiero otro ejercicio');
+
+    expect($target->fresh()->superseded_by_id)->not->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $target->id)->exists())->toBeFalse();
+});
+
+it('C-ACTION-4: "Hice 3 series de 10 con 8kg" — reporte real normal, sin sustitución', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Ejercicio A', muscleGroup: 'legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => false, 'skip_reason' => null,
+            'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null], ['reps' => 10, 'load' => 8, 'duration_seconds' => null], ['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+            'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+        'intents' => [], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Hice 3 series de 10 con 8kg');
+
+    $log = ExerciseLog::where('workout_exercise_id', $target->id)->first();
+    expect($log)->not->toBeNull();
+    expect($log->exerciseSets)->toHaveCount(3);
+    expect($target->fresh()->superseded_by_id)->toBeNull();
+});
+
+it('C-ACTION-5: "Cámbiame este ejercicio" — sustitución sin ExerciseLog automático (regresión de INTENT-1)', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact);
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Cámbiame este ejercicio');
+
+    expect($target->fresh()->superseded_by_id)->not->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $target->id)->exists())->toBeFalse();
+});
+
+it('C-ACTION-6: "No me gusta este ejercicio" — B3 Preference, nunca SubstituteExercise (regresión de PRECEDENCE-2)', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Sentadilla', muscleGroup: 'legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null, 'reports' => [], 'session_finished' => false,
+        'intents' => [], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'No me gusta este ejercicio');
+
+    expect($target->fresh()->superseded_by_id)->toBeNull();
+    expect(WorkoutExercise::whereNotNull('superseded_by_id')->count())->toBe(0);
+});
+
+it('C-ACTION-7: "No puedo hacer este ejercicio" (cant_do, sin substitute_exercise) — reporte real, nunca sustitución automática', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Ejercicio A', muscleGroup: 'legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'cant_do',
+            'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+        'intents' => [], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'No puedo hacer este ejercicio');
+
+    // Sin SubstituteExercise en el turno, el filtro de conflicto NUNCA se
+    // activa — el reporte "cant_do" se persiste normalmente, como siempre.
+    $log = ExerciseLog::where('workout_exercise_id', $target->id)->first();
+    expect($log)->not->toBeNull();
+    expect($log->skip_reason->value)->toBe('cant_do');
+    expect($target->fresh()->superseded_by_id)->toBeNull();
+});
+
+it('C-ACTION-8: mensaje de seguridad ("...me duele la rodilla") — Safety intacta, ni reporte ni sustitución (regresión de PRECEDENCE-1)', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact);
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => 'dolor de rodilla', 'reports' => [], 'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'No puedo hacer este ejercicio porque me duele la rodilla');
+
+    expect($target->fresh()->superseded_by_id)->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $target->id)->exists())->toBeFalse();
+});
+
+it('C-ACTION-9: conflicto puro + session_finished=true — NUNCA se dispara el mensaje de "pendientes", solo la sustitución', function () {
+    $contact = subReadyContact();
+    [$session, $target] = subPendingMainSession($contact, exerciseName: 'Ejercicio A', muscleGroup: 'legs');
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'dont_want',
+            'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        // Hallazgo real de la micro-auditoría pre-commit: session_finished=true
+        // viaja adjunto al MISMO reporte conflictivo (nunca una segunda
+        // señal independiente en este escenario).
+        'session_finished' => true,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Dame otro ejercicio');
+
+    // Sustitución real, sin ExerciseLog, sin cierre de sesión.
+    expect($target->fresh()->superseded_by_id)->not->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $target->id)->exists())->toBeFalse();
+    expect($session->fresh()->status)->not->toBe(WorkoutSessionStatus::Completed);
+
+    // Exactamente 2 mensajes de texto reales en todo el turno (acuse de
+    // sustitución + técnica del reemplazo) — NUNCA un tercero de
+    // sessionCloseComposer ("aún tienes pendientes"/cierre).
+    $nonEmptyBodies = subOutboundBodies()->filter(fn ($b) => $b !== '');
+    expect($nonEmptyBodies)->toHaveCount(2);
+    expect($nonEmptyBodies->contains(fn ($b) => str_contains($b, 'Listo — cambié')))->toBeTrue();
+});
+
+it('C-ACTION-MULTI-REPORT: conflicto + reporte real de OTRO ejercicio en el mismo turno — se elimina solo el conflictivo, el real se conserva', function () {
+    $contact = subReadyContact();
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+
+    // Frente real: "Ejercicio A" — el reporte anónimo (exercise_name=null)
+    // se le atribuye a él vía $frontExerciseId.
+    $exerciseA = Exercise::factory()->create(['name' => 'Ejercicio A', 'name_es' => 'Ejercicio A', 'muscle_group' => 'legs', 'tracking_type' => TrackingType::RepsAndLoad]);
+    $weA = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseA->id, 'order' => 1,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseA->toSnapshot(), 'delivered_at' => now(),
+    ]);
+    // Un SEGUNDO ejercicio, nombrado explícitamente en el reporte real —
+    // nunca el objetivo de la sustitución, ajeno al conflicto.
+    $exercisePress = Exercise::factory()->create(['name' => 'Press de banca', 'name_es' => 'Press de banca', 'muscle_group' => 'chest', 'tracking_type' => TrackingType::RepsAndLoad]);
+    $wePress = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exercisePress->id, 'order' => 2,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exercisePress->toSnapshot(),
+    ]);
+    subSeedCatalog('legs');
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [
+            [
+                'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'dont_want',
+                'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ],
+            [
+                'exercise_name' => 'Press de banca', 'not_performed' => false, 'skip_reason' => null,
+                'sets' => [['reps' => 10, 'load' => 8, 'duration_seconds' => null], ['reps' => 10, 'load' => 8, 'duration_seconds' => null], ['reps' => 10, 'load' => 8, 'duration_seconds' => null]],
+                'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+            ],
+        ],
+        'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Dame otro ejercicio');
+
+    // El conflictivo (Ejercicio A, anónimo) nunca se persiste.
+    expect(ExerciseLog::where('workout_exercise_id', $weA->id)->exists())->toBeFalse();
+    // A queda sustituido (nunca reportado).
+    expect($weA->fresh()->superseded_by_id)->not->toBeNull();
+
+    // El reporte REAL (Press de banca, nombrado) SÍ se conserva y se persiste.
+    $logPress = ExerciseLog::where('workout_exercise_id', $wePress->id)->first();
+    expect($logPress)->not->toBeNull();
+    expect($logPress->exerciseSets)->toHaveCount(3);
+    expect($logPress->exerciseSets->first()->actual_load)->toEqual(8.0);
+
+    // Press de banca nunca fue sustituido — el conflicto solo afectó a A.
+    expect($wePress->fresh()->superseded_by_id)->toBeNull();
+
+    // Exactamente 1 sustitución en toda la sesión.
+    expect(WorkoutExercise::where('workout_session_id', $session->id)->whereNotNull('superseded_by_id')->count())->toBe(1);
+});
+
+it('REGRESSION (incidente real, sesión #48 de staging): A=front con "dont_want" accidental + substitute_exercise -> A superseded, B intacto, nunca A logged + B substituted', function () {
+    $contact = subReadyContact();
+    $session = WorkoutSession::factory()->create(['contact_id' => $contact->id, 'status' => WorkoutSessionStatus::Scheduled]);
+
+    // Nombres concretos (nunca "Ejercicio A/B") — "Dame otro ejercicio"
+    // contiene literalmente la palabra "ejercicio", que colisionaría con
+    // AMBOS nombres genéricos vía la Vía 3 (match por nombre/token) del
+    // target resolver, produciendo "ambiguous" en vez de resolver por
+    // frente (Vía 4) — el propio punto que este test necesita ejercitar.
+    $exerciseA = Exercise::factory()->create(['name' => 'Sentadilla', 'name_es' => 'Sentadilla', 'muscle_group' => 'legs', 'tracking_type' => TrackingType::RepsAndLoad]);
+    $weA = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseA->id, 'order' => 1,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseA->toSnapshot(), 'delivered_at' => now(),
+    ]);
+    $exerciseB = Exercise::factory()->create(['name' => 'Press de banca', 'name_es' => 'Press de banca', 'muscle_group' => 'legs', 'tracking_type' => TrackingType::RepsAndLoad]);
+    $weB = WorkoutExercise::create([
+        'workout_session_id' => $session->id, 'exercise_id' => $exerciseB->id, 'order' => 2,
+        'phase' => WorkoutExercisePhase::Main, 'prescribed_sets' => 3, 'prescribed_reps' => 10,
+        'exercise_snapshot' => $exerciseB->toSnapshot(),
+    ]);
+    subSeedCatalog('legs'); // candidatos de reemplazo para A
+
+    subFakeHttp(subChatBody([
+        'safety_signal_text' => null,
+        'reports' => [[
+            'exercise_name' => null, 'not_performed' => true, 'skip_reason' => 'dont_want',
+            'sets' => [], 'rpe_number' => null, 'rpe_category' => null, 'note' => null, 'uncertain' => false,
+        ]],
+        'session_finished' => false,
+        'intents' => ['substitute_exercise'], 'training_reply' => null, 'requested_focus_terms' => [],
+    ]));
+
+    sendSubMessage($contact, 'Dame otro ejercicio');
+
+    // A -> superseded, con un replacement activo.
+    expect($weA->fresh()->superseded_by_id)->not->toBeNull();
+    $replacementOfA = WorkoutExercise::find($weA->fresh()->superseded_by_id);
+    expect($replacementOfA)->not->toBeNull();
+    expect($replacementOfA->superseded_by_id)->toBeNull();
+
+    // B completamente intacto: nunca entregado, nunca sustituido, nunca reportado.
+    expect($weB->fresh()->superseded_by_id)->toBeNull();
+    expect($weB->fresh()->delivered_at)->toBeNull();
+    expect(ExerciseLog::where('workout_exercise_id', $weB->id)->exists())->toBeFalse();
+
+    // A nunca quedó "logged" (dont_want) — el único efecto de este turno es
+    // la sustitución.
+    expect(ExerciseLog::where('workout_exercise_id', $weA->id)->exists())->toBeFalse();
+
+    // Exactamente 1 sustitución en toda la sesión.
+    expect(WorkoutExercise::where('workout_session_id', $session->id)->whereNotNull('superseded_by_id')->count())->toBe(1);
+});
