@@ -13,6 +13,7 @@ use App\Training\Enums\HealthConditionStatus;
 use App\Training\Enums\RestrictionSource;
 use App\Training\Enums\RestrictionStatus;
 use App\Training\Enums\RestrictionType;
+use App\Training\Events\DeclaredHealthConditionResolved;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 
@@ -102,6 +103,26 @@ class DeclaredHealthConditionRecorder
      * `$source` es SIEMPRE explícito — nunca se deriva de
      * `$condition->category`. `$reviewer` es obligatorio: no existe una
      * variante de este método sin revisor humano en este bloque.
+     *
+     * Hito O1 (Notificación proactiva de revisión de salud, hallazgo de
+     * doble-resolución) — revalida bajo `lockForUpdate()` que la condición
+     * SIGA `pending_review` en el instante de escribir: un doble-click del
+     * admin, un retry de Filament, o dos revisores concurrentes sobre la
+     * misma declaración nunca deben crear una segunda `TrainingRestriction`
+     * ni volver a escribir el estado — mismo mecanismo EXACTO ya usado por
+     * `ReplaceWorkoutExerciseService::replace()` (relee por ID bajo lock,
+     * nunca confía en el `$condition` recibido como parámetro, que pudo
+     * quedar obsoleto entre que el llamador lo obtuvo y esta invocación).
+     * Un segundo intento sobre una condición ya resuelta es un no-op
+     * silencioso — devuelve `null`, nunca lanza, nunca despacha el evento
+     * de abajo — consistente con que la UI de Filament (sin cambios en este
+     * hito) no distingue este caso de un éxito real.
+     *
+     * `DeclaredHealthConditionResolved` se despacha DESPUÉS de que la
+     * transacción retorna (nunca dentro de la clausura) — el evento implica
+     * `ShouldDispatchAfterCommit`, pero además aquí se dispara fuera de la
+     * transacción por construcción: nunca se envía una notificación sobre
+     * una escritura que la transacción pueda todavía revertir.
      */
     public function resolveWithRestriction(
         DeclaredHealthCondition $condition,
@@ -109,12 +130,18 @@ class DeclaredHealthConditionRecorder
         RestrictionSource $source,
         User $reviewer,
         ?string $note = null,
-    ): TrainingRestriction {
+    ): ?TrainingRestriction {
         // Ambas escrituras (crear la restricción + actualizar la
         // declaración con el enlace bidireccional) deben ser atómicas: si
         // la segunda falla, la primera no debe quedar persistida — nunca
         // una TrainingRestriction "huérfana" ni un enlace unidireccional.
-        return DB::transaction(function () use ($condition, $bodyRegion, $source, $reviewer, $note) {
+        $restriction = DB::transaction(function () use ($condition, $bodyRegion, $source, $reviewer, $note) {
+            $locked = DeclaredHealthCondition::query()->whereKey($condition->id)->lockForUpdate()->first();
+
+            if ($locked === null || $locked->status !== HealthConditionStatus::PendingReview) {
+                return null;
+            }
+
             $restriction = TrainingRestriction::create([
                 'contact_id' => $condition->contact_id,
                 'body_region' => $bodyRegion,
@@ -127,7 +154,7 @@ class DeclaredHealthConditionRecorder
                 'reviewed_at' => now(),
             ]);
 
-            $condition->update([
+            $locked->update([
                 'status' => HealthConditionStatus::ResolvedRestrictionCreated,
                 'related_restriction_id' => $restriction->id,
                 'reviewed_by' => $reviewer->id,
@@ -137,20 +164,48 @@ class DeclaredHealthConditionRecorder
 
             return $restriction;
         });
+
+        if ($restriction !== null) {
+            DeclaredHealthConditionResolved::dispatch($condition->fresh());
+        }
+
+        return $restriction;
     }
 
     /**
      * Un humano revisó la declaración y determinó que no corresponde
      * ninguna restricción. Nunca crea ni toca ninguna TrainingRestriction.
+     *
+     * Hito O1 — mismo criterio de revalidación bajo lock que
+     * `resolveWithRestriction()` (ver su docblock): un segundo intento
+     * sobre una condición ya resuelta es un no-op silencioso, nunca vuelve
+     * a escribir el estado ni despacha `DeclaredHealthConditionResolved`.
+     * Se envuelve en `DB::transaction()` únicamente para poder usar
+     * `lockForUpdate()` de forma segura (antes no tenía transacción propia
+     * — un solo `update()` no la necesitaba; la revalidación sí).
      */
     public function resolveWithoutRestriction(DeclaredHealthCondition $condition, User $reviewer, string $note): void
     {
-        $condition->update([
-            'status' => HealthConditionStatus::ResolvedNoRestriction,
-            'reviewed_by' => $reviewer->id,
-            'reviewed_at' => now(),
-            'review_note' => $note,
-        ]);
+        $resolved = DB::transaction(function () use ($condition, $reviewer, $note) {
+            $locked = DeclaredHealthCondition::query()->whereKey($condition->id)->lockForUpdate()->first();
+
+            if ($locked === null || $locked->status !== HealthConditionStatus::PendingReview) {
+                return false;
+            }
+
+            $locked->update([
+                'status' => HealthConditionStatus::ResolvedNoRestriction,
+                'reviewed_by' => $reviewer->id,
+                'reviewed_at' => now(),
+                'review_note' => $note,
+            ]);
+
+            return true;
+        });
+
+        if ($resolved) {
+            DeclaredHealthConditionResolved::dispatch($condition->fresh());
+        }
     }
 
     /**

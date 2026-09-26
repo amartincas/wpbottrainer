@@ -8,6 +8,8 @@ use App\Training\Enums\Sex;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
+use App\Training\Events\TrainingProfileSafetyFlagCleared;
+use Illuminate\Support\Facades\Event;
 
 it('belongs to a contact', function () {
     $contact = Contact::factory()->create();
@@ -48,6 +50,12 @@ it('flags a profile for safety review deterministically', function () {
 });
 
 it('only clears a safety flag via an explicit human review, never automatically', function () {
+    // Hito O1 — clearSafetyFlag() ahora despacha TrainingProfileSafetyFlagCleared
+    // en toda limpieza real; se fake-ea aquí porque este test prueba
+    // exclusivamente el estado persistido de TrainingProfile, no la
+    // notificación (cubierta en TrainingProfileSafetyFlagClearedNotificationTest.php).
+    Event::fake([TrainingProfileSafetyFlagCleared::class]);
+
     $profile = TrainingProfile::factory()->flaggedForSafetyReview('recent_surgery')->create();
     $reviewer = \App\Models\User::factory()->create();
 

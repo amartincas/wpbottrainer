@@ -27,8 +27,12 @@ use App\Referrals\Listeners\SendReferralIntroductionOnWorkoutCompleted;
 use App\Referrals\Support\ReferralAttributionPreRoutingScreen;
 use App\Referrals\Support\ReferralIntentClassifier;
 use App\Training\Context\CoachContextProvider;
+use App\Training\Events\DeclaredHealthConditionResolved;
+use App\Training\Events\TrainingProfileSafetyFlagCleared;
 use App\Training\Events\WorkoutSessionCompleted;
 use App\Training\Handlers\TrainingHandler;
+use App\Training\Listeners\SendHealthReviewResolutionNotification;
+use App\Training\Listeners\SendSafetyReviewResolutionNotification;
 use App\Training\Memory\ActiveWorkoutSessionContextProvider;
 use App\Training\Memory\TrainingProfileContextProvider;
 use App\Training\Onboarding\OnboardingRequirementRegistry;
@@ -294,6 +298,13 @@ class AppServiceProvider extends ServiceProvider
         // existe (el evento es genérico, del dominio Training; el listener
         // vive en App\Referrals y decide qué hacer con él).
         Event::listen(WorkoutSessionCompleted::class, SendReferralIntroductionOnWorkoutCompleted::class);
+
+        // Hito O1 (Notificación proactiva de revisión de salud) — mismo
+        // patrón exacto que WorkoutSessionCompleted -> SendReferralIntroductionOnWorkoutCompleted
+        // arriba: un evento de dominio por hecho ocurrido, un listener
+        // síncrono dedicado por evento, sin mecanismo alternativo.
+        Event::listen(DeclaredHealthConditionResolved::class, SendHealthReviewResolutionNotification::class);
+        Event::listen(TrainingProfileSafetyFlagCleared::class, SendSafetyReviewResolutionNotification::class);
 
         // Register Livewire components
         Livewire::component('whats-app-chat-center', \App\Livewire\WhatsAppChatCenter::class);

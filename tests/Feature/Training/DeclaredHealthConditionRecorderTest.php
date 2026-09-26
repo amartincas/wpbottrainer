@@ -10,14 +10,27 @@ use App\Training\Enums\HealthConditionCategory;
 use App\Training\Enums\HealthConditionStatus;
 use App\Training\Enums\RestrictionSource;
 use App\Training\Enums\RestrictionStatus;
+use App\Training\Events\DeclaredHealthConditionResolved;
 use App\Training\Support\BodyRegionCanonicalMapper;
 use App\Training\Support\DeclaredHealthConditionRecorder;
 use App\Training\Support\FunctionalLimitationCanonicalMapper;
+use Illuminate\Support\Facades\Event;
 
 function recorder(): DeclaredHealthConditionRecorder
 {
     return new DeclaredHealthConditionRecorder(new BodyRegionCanonicalMapper, new FunctionalLimitationCanonicalMapper);
 }
+
+// Hito O1 — resolveWithRestriction()/resolveWithoutRestriction() ahora
+// despachan DeclaredHealthConditionResolved en toda resolución real. Este
+// archivo prueba exclusivamente el comportamiento de PERSISTENCIA del
+// Recorder (no la notificación, cubierta en
+// DeclaredHealthConditionResolutionNotificationTest.php) — se fake-ea el
+// evento para que ningún listener real (que sí llamaría a CustomerNotifier)
+// se ejecute durante estos tests.
+beforeEach(function () {
+    Event::fake([DeclaredHealthConditionResolved::class]);
+});
 
 // ── A: registro básico + invariante de que declare() nunca crea restricciones ──
 
@@ -244,19 +257,32 @@ it('resolveWithRestriction() is atomic: if updating the condition fails, no Trai
     $reviewer = User::factory()->create(['is_super_admin' => true]);
     $realCondition = DeclaredHealthCondition::factory()->create(['contact_id' => $contact->id]);
 
-    // Mock de instancia: preserva el estado real del modelo (id, atributos
-    // ya persistidos) pero fuerza que su update() falle — simulando
-    // cualquier fallo posterior a la creación de la TrainingRestriction
-    // (violación de constraint, excepción de la capa de dominio, etc.).
-    $failingCondition = Mockery::mock($realCondition)->makePartial();
-    $failingCondition->shouldReceive('update')->once()->andThrow(new RuntimeException('simulated failure after restriction creation'));
+    // Hito O1 — resolveWithRestriction() ahora relee la condición por ID
+    // bajo lockForUpdate() (nunca confía en la instancia recibida como
+    // parámetro, ver docblock del método), así que ya no es posible
+    // inyectar un mock de instancia parcial para forzar el fallo de la
+    // segunda escritura (esa instancia interna nunca es la que el llamador
+    // tiene en la mano). Se simula el fallo con un listener de modelo
+    // `saving` — dispara para CUALQUIER instancia de DeclaredHealthCondition
+    // (incluida la releída internamente), exactamente en el momento de la
+    // segunda escritura (la que marca `ResolvedRestrictionCreated`), sin
+    // afectar la primera escritura de `declare()` en el factory de arriba.
+    DeclaredHealthCondition::saving(function (DeclaredHealthCondition $model) use ($realCondition) {
+        if ((int) $model->id === $realCondition->id && $model->status === HealthConditionStatus::ResolvedRestrictionCreated) {
+            throw new RuntimeException('simulated failure after restriction creation');
+        }
+    });
 
-    expect(fn () => recorder()->resolveWithRestriction(
-        $failingCondition,
-        BodyRegion::Knee,
-        RestrictionSource::UserExplicit,
-        $reviewer,
-    ))->toThrow(RuntimeException::class);
+    try {
+        expect(fn () => recorder()->resolveWithRestriction(
+            $realCondition,
+            BodyRegion::Knee,
+            RestrictionSource::UserExplicit,
+            $reviewer,
+        ))->toThrow(RuntimeException::class);
+    } finally {
+        DeclaredHealthCondition::flushEventListeners();
+    }
 
     // Ninguna TrainingRestriction debe sobrevivir a la transacción revertida.
     expect(TrainingRestriction::count())->toBe(0);

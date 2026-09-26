@@ -8,6 +8,7 @@ use App\Training\Enums\Sex;
 use App\Training\Enums\SplitType;
 use App\Training\Enums\TrainingGoal;
 use App\Training\Enums\TrainingLocation;
+use App\Training\Events\TrainingProfileSafetyFlagCleared;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -127,9 +128,24 @@ class TrainingProfile extends Model
      * (is_super_admin, ver App\Filament\Resources\Contacts), nunca
      * automática ni por el LLM. $note es obligatoria (App\Filament valida
      * esto en la UI; el modelo no impone longitud mínima).
+     *
+     * Hito O1 (Notificación proactiva de revisión de salud) — despacha
+     * `TrainingProfileSafetyFlagCleared` DESPUÉS de la escritura, y
+     * ÚNICAMENTE cuando el perfil realmente estaba `FlaggedForReview` antes
+     * de limpiarlo (nunca para una llamada repetida sobre un perfil ya
+     * `Normal` — evita una notificación espuria ante un doble-click). El
+     * modelo nunca conoce `CustomerNotifier`/WhatsApp directamente — ese
+     * envío vive exclusivamente en
+     * `App\Training\Listeners\SendSafetyReviewResolutionNotification`.
+     * `$previousFlaggedAt` se captura ANTES del `update()` (que lo pone en
+     * `null`) — ver docblock de `TrainingProfileSafetyFlagCleared` para por
+     * qué es necesario para la idempotencia de la notificación.
      */
     public function clearSafetyFlag(User $reviewer, string $note): void
     {
+        $wasFlagged = $this->safety_status === SafetyStatus::FlaggedForReview;
+        $previousFlaggedAt = $this->safety_flagged_at;
+
         $this->update([
             'safety_status' => SafetyStatus::Normal,
             'safety_flag_reason' => null,
@@ -138,6 +154,10 @@ class TrainingProfile extends Model
             'safety_reviewed_at' => now(),
             'safety_review_note' => $note,
         ]);
+
+        if ($wasFlagged) {
+            TrainingProfileSafetyFlagCleared::dispatch($this, $previousFlaggedAt);
+        }
     }
 
     public function isFlaggedForSafetyReview(): bool
