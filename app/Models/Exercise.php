@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Training\Enums\LoadModality;
 use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
 use App\Training\Enums\TrackingType;
@@ -32,6 +33,11 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'difficulty_level',
     'contraindications',
     'tracking_type',
+    // Hito D (diseño formal v2 aprobado, fase D1) — nullable, sin default:
+    // NULL significa exclusivamente "sin clasificar todavía", nunca "None"
+    // ni "Required". Ver App\Training\Enums\LoadModality y la migración
+    // que agrega esta columna.
+    'load_modality',
     'is_active',
     'provider',
     'provider_exercise_id',
@@ -62,6 +68,12 @@ class Exercise extends Model
             'equipment_needed' => 'array',
             'contraindications' => 'array',
             'tracking_type' => TrackingType::class,
+            // Hito D (fase D1) — cast nativo de Eloquent a enum respaldado:
+            // preserva `NULL` tal cual (nunca lo convierte a un caso del
+            // enum) — el fallback "NULL se comporta como Required" es
+            // responsabilidad exclusiva de la validación de D3, jamás de
+            // este cast ni de ningún accessor/mutator de este modelo.
+            'load_modality' => LoadModality::class,
             'is_active' => 'boolean',
             'provider_metadata' => 'array',
             'provider_has_video' => 'boolean',
@@ -250,6 +262,28 @@ class Exercise extends Model
      * `ExerciseMessageFormatter`/`TrainingEngine`/`TrainingHandler` no
      * cambian ni saben que esto ocurre — siguen leyendo el snapshot ya
      * congelado como siempre.
+     *
+     * Hito D (diseño formal v2 aprobado, fase D4) — incluye además
+     * `tracking_type`/`load_modality`, ambos tomados del `Exercise` EN VIVO
+     * en el momento exacto de esta llamada (nunca de un snapshot anterior
+     * ni de ningún valor por defecto). Responde retrospectivamente "¿cómo
+     * estaba clasificado este ejercicio cuando se prescribió/ejecutó?" —
+     * ninguno de los dos era parte del snapshot antes de este hito.
+     *
+     * `load_modality`: se persiste EXACTAMENTE lo que el `Exercise` tiene
+     * en este instante, incluido `null` tal cual — este método NUNCA
+     * aplica el fallback de compatibilidad "`null` se comporta como
+     * `Required`" (eso es responsabilidad exclusiva de
+     * `ExerciseSetValidator`, fase D3, y solo durante la validación de un
+     * reporte — nunca al congelar un snapshot). Un `Exercise` sin clasificar
+     * en el momento de esta llamada congela `load_modality: null`,
+     * reflejando honestamente que todavía no había sido curado — nunca se
+     * infiere ni se inventa un valor.
+     *
+     * Aditivo puro: ningún `WorkoutExercise` creado ANTES de este hito
+     * tiene estas 2 claves en su `exercise_snapshot` ya persistido (esa
+     * columna es inmutable desde su creación, nunca se reescribe
+     * retroactivamente) — ver docs/DECISIONS.md, inmutabilidad histórica.
      */
     public function toSnapshot(): array
     {
@@ -265,6 +299,8 @@ class Exercise extends Model
             'secondary_muscles' => $this->secondary_muscles,
             'provider' => $this->provider,
             'provider_exercise_id' => $this->provider_exercise_id,
+            'tracking_type' => $this->tracking_type->value,
+            'load_modality' => $this->load_modality?->value,
         ];
     }
 }

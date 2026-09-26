@@ -72,6 +72,42 @@ it('stores important_points from the provider, but never touches a curated commo
     expect($exercise->breathing_cue)->toBe('Curado a mano'); // preservado
 });
 
+// ── Hito D (diseño formal v2 aprobado, fase D5) ──────────────────────────
+// `load_modality` NUNCA se infiere ni se sobrescribe por sincronización de
+// proveedor — mismo criterio exacto que common_mistakes/breathing_cue
+// (nunca en el array de atributos de ExerciseImporter::upsert(), ver esa
+// clase). Ningún campo del payload del proveedor (equipment/muscleGroup/
+// título) participa en absoluto en la decisión.
+it('never infers or overwrites load_modality on import/re-sync, even when equipment/muscleGroup/title would superficially suggest a classification', function () {
+    Http::fake(['exercise-api.ymove.app/*' => Http::sequence()
+        // "bodyweight" + "Bodyweight Squat" invitarían a inferir None si
+        // existiera cualquier heurística — el importador nunca lo hace.
+        ->push(['data' => [[
+            'id' => 'abc-123', 'title' => 'Bodyweight Squat', 'muscleGroup' => 'quads', 'equipment' => 'bodyweight',
+        ]]], 200)
+        // Re-sync con datos actualizados — sigue sin tocar load_modality,
+        // incluso si el nombre/equipo del proveedor cambiara de sentido.
+        ->push(['data' => [[
+            'id' => 'abc-123', 'title' => 'Barbell Back Squat', 'muscleGroup' => 'quads', 'equipment' => 'barbell',
+        ]]], 200),
+    ]);
+
+    $importer = new ExerciseImporter(new ProviderRegistry);
+    $importer->importSearch('ymove', new ProviderSearchCriteria);
+
+    $exercise = Exercise::where('provider_exercise_id', 'abc-123')->first();
+    expect($exercise->load_modality)->toBeNull(); // nunca inferido a None pese a "bodyweight"
+
+    // Curación humana manual, fuera del importer.
+    $exercise->update(['load_modality' => \App\Training\Enums\LoadModality::None]);
+
+    $importer->importSearch('ymove', new ProviderSearchCriteria);
+    $exercise = $exercise->fresh();
+
+    expect($exercise->equipment_needed)->toBe(['barbell']); // sí se refrescó (equipo real)
+    expect($exercise->load_modality)->toBe(\App\Training\Enums\LoadModality::None); // preservado, pese a que ahora requiere barra
+});
+
 it('re-syncing an already-imported exercise updates its metadata but never touches is_active or contraindications', function () {
     // Http::fake() llamado dos veces en el mismo test no reemplaza de forma
     // confiable la respuesta anterior — Http::sequence() es la forma

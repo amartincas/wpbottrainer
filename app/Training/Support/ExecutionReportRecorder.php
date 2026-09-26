@@ -27,6 +27,17 @@ use Illuminate\Support\Facades\Log;
 class ExecutionReportRecorder
 {
     /**
+     * Hito D (fase D3) — `ExerciseSetValidator` con default vía "new en el
+     * inicializador" (PHP 8.1+): preserva exactamente `new
+     * ExecutionReportRecorder()` (bare, sin argumentos) en los llamadores
+     * existentes (ver FrontExerciseCorrectionTest.php) sin necesitar
+     * tocarlos — `ExerciseSetValidator` no tiene dependencias propias, así
+     * que el contenedor de Laravel lo resuelve igual cuando se construye
+     * vía `app(ExecutionReportRecorder::class)`.
+     */
+    public function __construct(private readonly ExerciseSetValidator $setValidator = new ExerciseSetValidator) {}
+
+    /**
      * @param  ?int  $frontExerciseId  Corrección post-incidente de staging
      *         (#33, hito R1/R2/R3) — el `WorkoutExercise` id que el
      *         CONTEXTO DE EJECUCIÓN (`TrainingHandler`, vía
@@ -85,9 +96,25 @@ class ExecutionReportRecorder
                 continue;
             }
 
-            $this->persist($resolved, $report);
+            $sanitizedSets = $this->persist($resolved, $report);
+
+            // Hito D (fase D3, ajuste de coherencia post-validación) — TODO
+            // lo que describe/cuenta lo reportado a partir de aquí debe leer
+            // la representación YA sanitizada por `ExerciseSetValidator`
+            // (la MISMA que `persist()` acaba de escribir), nunca
+            // `$report['sets']` crudo. Sin esto, el resumen al usuario
+            // (`summaryOf()`) o el conteo de "reporte parcial"
+            // (`isPartialReport()`/`partialSetsClarification()`) podían
+            // describir un dato (típicamente una carga) que en realidad fue
+            // descartado semánticamente por D3 y nunca llegó a
+            // `ExerciseSet` — ej. confirmar "...con 20kg" en un ejercicio
+            // bodyweight cuyo `actual_load` real quedó en `null`. Solo
+            // `sets` cambia; el resto de `$report` (nombre, not_performed,
+            // rpe, note, uncertain) es ajeno a esta sanitización.
+            $sanitizedReport = [...$report, 'sets' => $sanitizedSets];
+
             $unreported = $unreported->reject(fn (WorkoutExercise $we) => $we->is($resolved))->values();
-            $logged[] = $this->summaryOf($resolved, $report);
+            $logged[] = $this->summaryOf($resolved, $sanitizedReport);
 
             // H16.2 Fase 1.3 (auditoría de flujo conversacional, Caso 1B) —
             // el usuario reportó MENOS series de las prescritas: se persiste
@@ -98,14 +125,17 @@ class ExecutionReportRecorder
             // decisiones de este mismo turno (avance/cierre) — ver
             // maybeCompleteSession() y TrainingHandler::recordExecutionReport().
             // Nunca cambia qué significa "Unreported" (exerciseLog === null)
-            // para ningún otro consumidor del sistema.
-            if ($this->isPartialReport($resolved, $report)) {
-                $clarifications[] = $this->partialSetsClarification($resolved, $report);
+            // para ningún otro consumidor del sistema. Usa `$sanitizedReport`
+            // por el mismo motivo de arriba: un set que la sanitización
+            // vació por completo nunca debe contarse como "serie
+            // efectivamente reportada" para esta decisión.
+            if ($this->isPartialReport($resolved, $sanitizedReport)) {
+                $clarifications[] = $this->partialSetsClarification($resolved, $sanitizedReport);
                 $partialIds[] = $resolved->id;
 
                 Log::info('TRAINING_REPORT_PARTIAL_SETS', [
                     'workout_exercise_id' => $resolved->id,
-                    'reported_sets' => count($report['sets']),
+                    'reported_sets' => count($sanitizedReport['sets']),
                     'prescribed_sets' => $resolved->prescribed_sets,
                 ]);
             }
@@ -178,7 +208,18 @@ class ExecutionReportRecorder
         return $unreported->first(fn (WorkoutExercise $we) => $we->id === $frontExerciseId);
     }
 
-    private function persist(WorkoutExercise $workoutExercise, array $report): void
+    /**
+     * @return array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>
+     *         Hito D (fase D3, ajuste de coherencia) — los sets REALMENTE
+     *         persistidos (ya sanitizados por `ExerciseSetValidator`), para
+     *         que el llamador (`record()`) use exactamente esta misma
+     *         representación al describir/contar lo reportado
+     *         (`summaryOf()`/`isPartialReport()`), nunca `$report['sets']`
+     *         crudo. Nunca se recalcula la sanitización dos veces — esta es
+     *         la única llamada a `ExerciseSetValidator::sanitize()` en todo
+     *         el flujo.
+     */
+    private function persist(WorkoutExercise $workoutExercise, array $report): array
     {
         $note = $report['note'];
 
@@ -198,7 +239,19 @@ class ExecutionReportRecorder
             'logged_at' => now(),
         ]);
 
-        foreach ($report['sets'] as $index => $set) {
+        // Hito D (fase D3) — ÚNICO punto del flujo donde ya se conoce con
+        // certeza el `Exercise` real del reporte (vía la relación en vivo,
+        // nunca el `exercise_snapshot` histórico): aquí y solo aquí se
+        // decide si el `load` reportado es semánticamente válido para este
+        // ejercicio concreto. `ExerciseSetValidator` es puro/determinista
+        // — nunca escribe, nunca conoce esta sesión ni este contacto.
+        $sanitizedSets = $this->setValidator->sanitize(
+            $workoutExercise->exercise?->tracking_type,
+            $workoutExercise->exercise?->load_modality,
+            $report['sets'],
+        );
+
+        foreach ($sanitizedSets as $index => $set) {
             ExerciseSet::create([
                 'exercise_log_id' => $log->id,
                 'set_number' => $index + 1,
@@ -207,6 +260,8 @@ class ExecutionReportRecorder
                 'actual_duration_seconds' => $set['duration_seconds'],
             ]);
         }
+
+        return $sanitizedSets;
     }
 
     /**

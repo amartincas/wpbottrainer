@@ -9,6 +9,7 @@ use App\Models\Tenant;
 use App\Models\User;
 use App\Training\Enums\Equipment;
 use App\Training\Enums\ExperienceLevel;
+use App\Training\Enums\LoadModality;
 use App\Training\Enums\MovementPattern;
 use App\Training\Enums\MuscleFocus;
 use Filament\Actions\Action;
@@ -74,6 +75,24 @@ class ExercisesTable
                     ->label('Movement')
                     ->formatStateUsing(fn (?MovementPattern $state) => $state?->value)
                     ->placeholder('—'),
+                // Hito D (fase D5) — 3 estados, presentación inequívoca:
+                // `null` es "Sin clasificar" (nunca se muestra como
+                // equivalente a Required, ni con el mismo color) — el
+                // fallback de compatibilidad de D3 es exclusivo de
+                // ExerciseSetValidator, esta columna nunca lo aplica.
+                TextColumn::make('load_modality')
+                    ->label('Carga')
+                    ->badge()
+                    ->color(fn (?LoadModality $state) => match ($state) {
+                        LoadModality::None => 'gray',
+                        LoadModality::Required => 'success',
+                        null => 'warning',
+                    })
+                    ->formatStateUsing(fn (?LoadModality $state) => match ($state) {
+                        LoadModality::None => 'Sin carga externa',
+                        LoadModality::Required => 'Requiere carga',
+                        null => 'Sin clasificar',
+                    }),
                 IconColumn::make('provider_has_video')
                     ->label('Has video')
                     // Tri-estado explícito, nunca ->boolean() a secas: null

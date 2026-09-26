@@ -105,11 +105,23 @@ class ExecutionReportService
      *                                       comportamiento exacto de antes del Bloque 9.
      * @return array{reports: array<int, array{
      *     exercise_name: ?string, not_performed: bool, skip_reason: ?string,
-     *     sets: array<int, array{reps: ?int, load: ?float, duration_seconds: ?int}>,
+     *     sets: array<int, array{reps: ?int, load: ?float, unit: ?string, duration_seconds: ?int, no_external_load: bool}>,
      *     rpe: ?int, note: ?string, uncertain: bool,
      * }>, session_finished: bool, safety_signal_text: ?string,
      *     intents: array<int, string>, training_reply: ?string,
      *     requested_focus_terms: array<int, string>}
+     *
+     * Hito D (fase D2) — cada elemento de `sets` gana `unit`
+     * (`"kg"|"lb"|"unrecognized"|null`, ya normalizado — nunca el string
+     * crudo del LLM sin pasar por `validateUnit()`) y `no_external_load`
+     * (`bool`, señal lingüística cruda, preservada intacta hasta D3 — este
+     * servicio NUNCA la convierte a `0`/`null`, esa decisión depende de
+     * `LoadModality` y es responsabilidad exclusiva de D3). `load` ya
+     * llega en kg canónico cuando `unit==="lb"` (convertido aquí); sigue
+     * siendo `null` cuando no hay dato cuantificable o la unidad fue
+     * `"unrecognized"`. Este servicio sigue sin conocer `Exercise`/
+     * `WorkoutExercise`/`TrackingType`/`LoadModality` — nunca decide si el
+     * `load` resultante es semánticamente válido para el ejercicio.
      */
     public function extractReport(string $messageBody, array $reportableExercises, Tenant $tenant, ?CoachContext $coachContext = null, ?string $frontExerciseName = null): array
     {
@@ -162,7 +174,7 @@ Responde EXCLUSIVAMENTE con un JSON (sin texto adicional, sin markdown) con esta
       "exercise_name": "<uno de los nombres de la lista>" | null,
       "not_performed": true | false,
       "skip_reason": "cant_do"|"dont_want"|"no_time"|"other" (SOLO si not_performed=true y el usuario dio o insinuó una razón, ej. "no pude" → cant_do, "no quiero" → dont_want, "no me dio tiempo" → no_time) | null,
-      "sets": [{"reps": <entero>|null, "load": <número>|null, "duration_seconds": <entero>|null}, ...],
+      "sets": [{"reps": <entero>|null, "load": <número>|null, "unit": "kg"|"lb"|"unrecognized"|null, "duration_seconds": <entero>|null, "no_external_load": true|false}, ...],
       "rpe_number": <entero 1-10 si el usuario dio un número explícito de esfuerzo> | null,
       "rpe_category": "very_easy"|"easy"|"moderate"|"hard"|"very_hard" (SOLO si el usuario describió el esfuerzo con palabras, ej. "fácil", "pesado", "muy difícil") | null,
       "note": "<observación textual relevante no cubierta arriba>" | null,
@@ -189,6 +201,10 @@ Reglas del reporte:
 - Si el mensaje genuinamente no tiene ninguna relación con el entrenamiento (ej. cambia de tema por completo), "reports" debe ser [].
 - CRÍTICO (Hito B3): "no me gusta(n) X"/"no soy fan de X"/"prefiero no hacer X" en TÉRMINOS GENERALES (sin decir que no lo hizo AHORA) NUNCA es un reporte de que no realizó el ejercicio actual — es una declaración de preferencia a futuro, un dominio distinto que el sistema procesa por su cuenta. Genera un reporte para esa frase SOLO si el usuario ADEMÁS indica explícitamente que no lo hizo esta vez (ej. "no me gustan las sentadillas, no las hice hoy").
 - CRÍTICO: "listo", "hecho", "ya está" o expresiones equivalentes referidas al ejercicio que se le acaba de mostrar (ver más arriba) NUNCA significan por sí solas que el usuario terminó TODA la sesión — son un reporte de ESE ejercicio, "session_finished" debe quedar en false. Marca "session_finished" en true ÚNICAMENTE cuando el usuario comunique de forma inequívoca que terminó todos los ejercicios o toda la sesión (ver ejemplos arriba) — nunca lo infieras de una confirmación corta de un solo ejercicio.
+
+Reglas de unidad y ausencia de carga (Hito D) — SOLO extraes la señal lingüística, NUNCA decides si es válida ni conviertes nada:
+- "unit": "kg" si el usuario dice kg/kilo/kilos/kilogramo/kilogramos; "lb" si dice lb/lbs/libra/libras/pound/pounds; "unrecognized" si menciona explícitamente CUALQUIER OTRA unidad de peso (ej. onzas, stone) que no sea kg ni lb; null si NO mencionó ninguna unidad en absoluto. NUNCA emitas "kg" solo porque no se especificó otra unidad — en ese caso es null.
+- "no_external_load": true ÚNICAMENTE cuando el usuario declaró EXPLÍCITAMENTE, para ESA serie/reporte, que no usó carga externa — ej. "sin peso", "sin carga", "sin mancuernas", "solo peso corporal", "no usé peso", "no usé carga". NUNCA lo pongas en true solo porque el usuario no mencionó ninguna carga (eso es simplemente "load": null, sin relación con este campo), ni por "menos peso"/"poco peso" (cantidad reducida pero no ausente), ni por "me costó"/"fue fácil" (esfuerzo percibido, ver RPE). Por defecto false.
 
 Reglas de intents (Bloque 9 — un mensaje puede tener MÁS DE UNO a la vez, ej. un reporte real Y una pregunta de membresía juntos):
 - "exercise_question": preguntas sobre un ejercicio, carga, reps, RPE, técnica, o el motivo de una decisión ya tomada.
@@ -288,19 +304,115 @@ PROMPT;
             }
 
             $reps = $this->validateIntRange($set['reps'] ?? null, 0, 999);
-            $load = $this->validateNumericRange($set['load'] ?? null, 0, 999);
+            $unit = $this->validateUnit($set['unit'] ?? null);
+            $load = $this->resolveLoad($set['load'] ?? null, $unit);
             $duration = $this->validateIntRange($set['duration_seconds'] ?? null, 0, 7200);
+            // Hito D (fase D2) — señal cruda, preservada intacta hasta D3.
+            // Nunca se resuelve aquí la precedencia frente a un `load`
+            // numérico simultáneo (número explícito > no_external_load) —
+            // esa regla depende de LoadModality y es responsabilidad
+            // exclusiva de D3; este servicio solo extrae y conserva ambos
+            // valores tal cual llegaron.
+            $noExternalLoad = (bool) ($set['no_external_load'] ?? false);
 
-            // Una serie sin ningún dato cuantificable no aporta nada — se
-            // descarta en vez de guardarse vacía.
-            if ($reps === null && $load === null && $duration === null) {
+            // Una serie sin ningún dato cuantificable NI ninguna señal
+            // lingüística real no aporta nada — se descarta en vez de
+            // guardarse vacía. `no_external_load=true` cuenta como señal
+            // real (ej. "hice 3 series sin peso", sin repeticiones
+            // explícitas) — sin este ajuste la propia señal que Hito D
+            // existe para preservar se perdería aquí, antes de llegar a
+            // D3. La SEGUNDA comprobación de vacío (después de la
+            // validación semántica de tracking_type/load_modality)
+            // pertenece exclusivamente a D3, no se implementa aquí.
+            if ($reps === null && $load === null && $duration === null && ! $noExternalLoad) {
                 continue;
             }
 
-            $validated[] = ['reps' => $reps, 'load' => $load, 'duration_seconds' => $duration];
+            $validated[] = [
+                'reps' => $reps,
+                'load' => $load,
+                'unit' => $unit,
+                'duration_seconds' => $duration,
+                'no_external_load' => $noExternalLoad,
+            ];
         }
 
         return $validated;
+    }
+
+    /**
+     * Hito D (fase D2) — vocabulario cerrado de 3 estados reales + `null`.
+     * Cualquier string que el LLM entregue y que NO sea exactamente `"kg"`
+     * o `"lb"` se trata como `"unrecognized"` — incluye tanto el literal
+     * `"unrecognized"` que el prompt ya instruye emitir, como cualquier
+     * otro valor crudo que el LLM pudiera alucinar (ej. `"oz"`) pese a la
+     * instrucción, o cualquier valor presente pero no-string. Nunca se
+     * interpreta silenciosamente como kg: la única forma de llegar a
+     * `null` (comportamiento legacy, asumir kg) es que el campo esté
+     * genuinamente ausente o sea `null`.
+     */
+    private function validateUnit(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        if (! is_string($value)) {
+            return 'unrecognized';
+        }
+
+        return match ($value) {
+            'kg', 'lb' => $value,
+            default => 'unrecognized',
+        };
+    }
+
+    /**
+     * Hito D (fase D2) — normaliza la carga numérica a kg canónico ANTES
+     * de validar el rango final `[0,999]`, nunca después: una carga en
+     * libras fuera de ese rango en kg debe descartarse igual que
+     * cualquier otra, pero el número crudo en libras nunca debe
+     * compararse directamente contra ese rango (representa una magnitud
+     * distinta). `unit==="unrecognized"` descarta la carga por completo,
+     * sin intentar ninguna conversión — nunca se asume kg para un valor
+     * cuya unidad se declaró explícitamente y no se reconoció.
+     *
+     * Redondeo `HALF_UP` a 2 decimales (precisión de almacenamiento ya
+     * existente) — si el redondeo altera el valor, se loguea
+     * `TRAINING_LOAD_PRECISION_ROUNDED` con el valor/unidad originales y
+     * el valor normalizado. Deliberadamente SIN contexto de
+     * `workout_session_id`/`workout_exercise_id`/`exercise_id` — este
+     * servicio todavía no conoce el ejercicio resuelto; ese contexto se
+     * añade en D3, nunca aquí.
+     *
+     * D2 NO decide si el resultado final es semánticamente válido para el
+     * ejercicio (bodyweight/weighted) — eso es exclusivo de D3. Este
+     * método solo convierte unidades y aplica el mismo rango `[0,999]` ya
+     * existente (reutilizando `validateNumericRange()` sin modificarlo).
+     */
+    private function resolveLoad(mixed $rawLoad, ?string $unit): ?float
+    {
+        if ($unit === 'unrecognized' || ! is_numeric($rawLoad)) {
+            return null;
+        }
+
+        $kg = (float) $rawLoad;
+
+        if ($unit === 'lb') {
+            $kg *= 0.453592;
+        }
+
+        $rounded = round($kg, 2, PHP_ROUND_HALF_UP);
+
+        if (abs($rounded - $kg) > 0.0001) {
+            Log::info('TRAINING_LOAD_PRECISION_ROUNDED', [
+                'original_value' => (float) $rawLoad,
+                'original_unit' => $unit,
+                'normalized_value' => $rounded,
+            ]);
+        }
+
+        return $this->validateNumericRange($rounded, 0, 999);
     }
 
     private function validateSkipReason(mixed $value): ?string

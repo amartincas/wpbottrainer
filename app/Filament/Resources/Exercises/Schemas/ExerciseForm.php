@@ -2,6 +2,7 @@
 
 namespace App\Filament\Resources\Exercises\Schemas;
 
+use App\Training\Enums\LoadModality;
 use App\Training\Enums\MovementPattern;
 use App\Training\Enums\TrackingType;
 use Filament\Forms\Components\Select;
@@ -100,6 +101,37 @@ class ExerciseForm
                     Textarea::make('breathing_cue')
                         ->label('Indicación de respiración')
                         ->helperText('Preservado en cada re-sincronización.'),
+                ]),
+
+            // Hito D (diseño formal v2 aprobado, fase D5) — SECCIÓN PROPIA,
+            // deliberadamente separada de "Clasificación editable" de abajo:
+            // a diferencia de tracking_type/movement_pattern,
+            // ExerciseImporter::upsert() NUNCA incluye `load_modality` en su
+            // array de atributos (ver docblock de esa clase) — igual que
+            // contraindications/common_mistakes/breathing_cue, sobrevive
+            // intacta a cualquier re-sincronización. Mostrar aquí la
+            // advertencia de "se sobreescribe" habría sido falso.
+            //
+            // `null` (Select sin seleccionar, `placeholder`) es un estado
+            // REAL y distinto de los otros dos — nunca se etiqueta como
+            // "Required" ni ningún otro valor: el fallback de compatibilidad
+            // "null se comporta como Required" es EXCLUSIVO de
+            // `ExerciseSetValidator` durante la validación de un reporte
+            // (fase D3) — esta UI nunca lo aplica, nunca lo sugiere, nunca
+            // preselecciona nada. Un administrador debe decidir
+            // explícitamente; dejarlo vacío es una decisión válida
+            // ("todavía sin curar"), no un error de formulario.
+            Section::make('Carga externa (curación manual — nunca se sobrescribe en sincronización)')
+                ->description('Clasificación explícita y humana: ¿este ejercicio espera que el usuario reporte una carga externa (mancuernas, barra, máquina, chaleco lastrado...) o es bodyweight puro? El sistema NUNCA infiere esto automáticamente desde equipment/tracking_type/nombre/proveedor — déjalo en "Sin clasificar" hasta decidirlo conscientemente.')
+                ->schema([
+                    Select::make('load_modality')
+                        ->label('Clasificación de carga')
+                        ->options([
+                            LoadModality::None->value => 'Sin carga externa (bodyweight)',
+                            LoadModality::Required->value => 'Requiere carga externa',
+                        ])
+                        ->placeholder('Sin clasificar')
+                        ->native(false),
                 ]),
 
             Section::make('Clasificación editable — ADVERTENCIA: se sobreescribe en el próximo sync')
