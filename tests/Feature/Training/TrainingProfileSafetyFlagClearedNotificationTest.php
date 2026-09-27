@@ -2,11 +2,13 @@
 
 use App\Models\Contact;
 use App\Models\Conversation;
+use App\Models\TrainingAccess;
 use App\Models\TrainingProfile;
 use App\Models\User;
 use App\Training\Enums\SafetyStatus;
 use App\Training\Events\TrainingProfileSafetyFlagCleared;
 use App\Training\Listeners\SendSafetyReviewResolutionNotification;
+use App\Training\Support\TrainingAccessGate;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 
@@ -111,4 +113,42 @@ it('SendSafetyReviewResolutionNotification is really registered as a listener of
     $rawListeners = app('events')->getRawListeners()[TrainingProfileSafetyFlagCleared::class] ?? [];
 
     expect(collect($rawListeners))->toContain(SendSafetyReviewResolutionNotification::class);
+});
+
+// ── G. TrainingAccessGate: bloquea antes, permite después, independiente de la notificación ──
+// Hito O3 — mismo patrón EXACTO que el test "G" de
+// DeclaredHealthConditionResolutionNotificationTest.php, extendido para
+// demostrar también el estado "antes" (bloqueado) y que un fallo real de
+// entrega (sin ventana de WhatsApp abierta, sin WhatsAppTemplate
+// configurado para 'safety_review_resolved') nunca revierte ni vuelve a
+// bloquear la resolución ya persistida — el Gate y el Notifier son
+// responsabilidades independientes, tal como documenta TrainingAccessGate.
+
+it('G: TrainingAccessGate blocks by safety_flagged before resolution and allows access right after clearSafetyFlag(), even when the notification delivery fails', function () {
+    $contact = Contact::factory()->create();
+    TrainingAccess::factory()->create(['contact_id' => $contact->id]);
+    $profile = TrainingProfile::factory()->flaggedForSafetyReview('chest_pain')->create(['contact_id' => $contact->id]);
+    $reviewer = User::factory()->create(['is_super_admin' => true]);
+
+    // 1-2. Perfil marcado para revisión — el Gate bloquea explícitamente
+    // por 'safety_flagged', antes de cualquier resolución.
+    $before = app(TrainingAccessGate::class)->authorize($contact->fresh());
+    expect($before->allowed)->toBeFalse();
+    expect($before->reason)->toBe('safety_flagged');
+
+    // 3. Se resuelve el estado — deliberadamente SIN abrir ventana de
+    // WhatsApp (sin Conversation) y SIN ningún WhatsAppTemplate configurado
+    // para 'safety_review_resolved': CustomerNotifier::sendViaTemplate() no
+    // encuentra plantilla y nunca intenta un envío real (mismo escenario
+    // que el test "F" de DeclaredHealthConditionResolutionNotificationTest.php).
+    $profile->clearSafetyFlag($reviewer, 'Consultó con su médico, autorizado a continuar.');
+
+    // 5. La notificación realmente falló — nunca se intentó ningún envío.
+    Http::assertNothingSent();
+
+    // 4. El Gate ya permite el acceso, independiente del fallo de entrega —
+    // la resolución persistida es la única fuente de verdad para el Gate.
+    $after = app(TrainingAccessGate::class)->authorize($contact->fresh());
+    expect($after->allowed)->toBeTrue();
+    expect($profile->fresh()->isFlaggedForSafetyReview())->toBeFalse();
 });

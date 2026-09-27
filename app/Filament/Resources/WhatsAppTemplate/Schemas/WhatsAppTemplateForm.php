@@ -47,6 +47,9 @@ class WhatsAppTemplateForm
                     'training_invite'   => 'Invitación a entrenar (tras pago confirmado)',
                     'training_reminder' => 'Recordatorio de entrenamiento',
                     'exercise_nudge'    => 'Nudge por ejercicio no reportado',
+                    'health_review_resolved_no_restriction'   => 'Revisión de salud resuelta (sin restricción)',
+                    'health_review_resolved_with_restriction' => 'Revisión de salud resuelta (con restricción)',
+                    'safety_review_resolved'                  => 'Revisión de seguridad resuelta',
                 ])
                 ->native(false)
                 ->nullable()
